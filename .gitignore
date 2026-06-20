@@ -43,3 +43,8 @@ tmp/models
 /.claude
 /.codex
 skills-lock.json
+*.bak
+*.bak.*
+*.bak_*
+*.orig
+*.log
