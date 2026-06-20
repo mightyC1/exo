@@ -94,6 +94,39 @@ def entrypoint(
             f"Runner {bound_instance.bound_runner_id} crashed with critical exception {e}"
         )
         event_sender.send(RunnerTerminationError.from_exception(e))
+        # Crash-path teardown: the exception traceback pins the whole frame
+        # stack (locals in mlx/generator frames keep the JACCL group alive),
+        # so refcounts never fall before the supervisor kills the process and
+        # the kernel is left with an un-destroyed RDMA context (node wedge).
+        # Best effort: close the generator, drop the pins, collect, and only
+        # then exit. If the Group destructor hangs on in-flight collectives,
+        # the supervisor kill remains the backstop (no worse than today).
+        try:
+            _r = None
+            try:
+                _r = runner  # may be unbound if crash predates Runner()
+            except NameError:
+                pass
+            if _r is not None and getattr(_r, "generator", None) is not None:
+                try:
+                    _r.generator.close()
+                except Exception:
+                    logger.warning("crash-path generator.close() failed")
+                _r.generator = None  # type: ignore[assignment]
+            try:
+                from exo.worker.engines.mlx.auto_parallel import (
+                    clear_prefill_sends,
+                )
+
+                clear_prefill_sends()
+            except Exception:
+                pass
+            e.__traceback__ = None  # release frame pins
+            import gc
+
+            gc.collect()
+        except Exception:
+            logger.warning("crash-path teardown failed")
         raise SystemExit(1) from e
     finally:
         try:

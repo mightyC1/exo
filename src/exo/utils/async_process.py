@@ -29,7 +29,7 @@ from exo.utils import STDERR_FD, STDIO_FDS, STDOUT_FD
 from exo.utils.channels import Receiver, Sender, channel
 
 _READ_CHUNK_SIZE = 64 * 1024
-_JOIN_GRACE_SECONDS = 3.0
+_JOIN_GRACE_SECONDS = 15.0  # v5: > drain(5s) + finalization
 _TERMINATE_GRACE_SECONDS = 5.0
 _TERMINATE_RETRY_GRACE_SECONDS = 2.0
 _TERMINATE_ATTEMPTS = 10
