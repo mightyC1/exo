@@ -1,0 +1,29 @@
+# EXO model card for self-quantized MiniMax-M3 standard-int8 (text backbone).
+# Place at: resources/inference_model_cards/local--MiniMax-M3-8bit.toml
+# Backup to $FIXES (untracked, like your MiMo card).
+# All architecture numbers below are from the REAL config.json
+# (MiniMaxAI/MiniMax-M3 @ 3a41b31) — no placeholders left except storage size.
+
+model_id = "local/MiniMax-M3-8bit"
+n_layers = 60
+hidden_size = 6144
+num_key_value_heads = 4          # ⚠ TP hard cap: ≤4 ranks (N must divide H_kv)
+supports_tensor = true            # verified: sharded≡dense on 2 and 4 ranks (ring)
+tasks = ["TextGeneration"]
+family = "minimax"
+quantization = "8bit"
+base_model = "MiniMax M3"
+capabilities = ["text", "thinking"]
+reasoning_dialect = "post_last_user"   # family default; verify chat_template.jinja
+context_length = 1048576
+
+backends = ["MlxMetal"]
+
+[storage_size]
+in_bytes = 453079485010   # FIXME after convert: du -sb (≈430-460 GB expected for int8 gs64)
+
+# temp/top_p/top_k from the official model card (matches your build/plan temp=1.0)
+[sampling_defaults]
+temperature = 1.0
+top_p = 0.95
+top_k = 40
