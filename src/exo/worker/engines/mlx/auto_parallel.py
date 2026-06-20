@@ -4,6 +4,7 @@ from functools import partial
 from inspect import signature
 from typing import TYPE_CHECKING, Literal, Protocol, cast
 
+import os
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn.layers.distributed import (
@@ -21,6 +22,11 @@ from mlx_lm.models.deepseek_v4 import DeepseekV4MoE, V4Attention
 from mlx_lm.models.deepseek_v4 import Model as DeepseekV4Model
 from mlx_lm.models.deepseek_v32 import DeepseekV32MLP
 from mlx_lm.models.deepseek_v32 import Model as DeepseekV32Model
+
+try:
+    from mlx_lm.models.glm_moe_dsa import Model as GlmMoeDsaModel
+except ImportError:
+    GlmMoeDsaModel = None
 from mlx_lm.models.gemma4 import Model as Gemma4Model
 from mlx_lm.models.glm4_moe import Model as Glm4MoeModel
 from mlx_lm.models.glm4_moe import MoE
@@ -30,8 +36,14 @@ from mlx_lm.models.gpt_oss import GptOssMoeModel
 from mlx_lm.models.gpt_oss import Model as GptOssModel
 from mlx_lm.models.kimi_k25 import Model as KimiK25Model
 from mlx_lm.models.llama import Model as LlamaModel
+from mlx_lm.models.mimo_v2 import Model as MiMoModel
+from mlx_lm.models.mimo_v2 import MoE as MiMoMoE
 from mlx_lm.models.minimax import MiniMaxAttention
 from mlx_lm.models.minimax import Model as MiniMaxModel
+try:
+    from mlx_lm.models.minimax_m3_vl import Model as MiniMaxM3Model
+except Exception:
+    MiniMaxM3Model = ()  # isinstance(x, ()) is always False; missing model file won't crash runners
 from mlx_lm.models.ministral3 import Model as Ministral3Model
 from mlx_lm.models.nemotron_h import Model as NemotronHModel
 from mlx_lm.models.nemotron_h import (
@@ -70,6 +82,42 @@ if TYPE_CHECKING:
 
 
 _pending_prefill_sends: list[tuple[mx.array, int, mx.distributed.Group]] = []
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        logger.warning(f"[EXO][TP] invalid integer for {name}={value!r}; using {default}")
+        return default
+
+
+def _model_type(model: nn.Module) -> str | None:
+    for obj in (model, getattr(model, "args", None), getattr(model, "config", None)):
+        model_type = getattr(obj, "model_type", None)
+        if isinstance(model_type, str):
+            return model_type
+    return None
+
+
+def _is_optional_instance(model: nn.Module, cls: object) -> bool:
+    return isinstance(cls, type) and isinstance(model, cls)
+
+
+def _is_glm_moe_dsa_model(model: nn.Module) -> bool:
+    return _model_type(model) == "glm_moe_dsa" or _is_optional_instance(
+        model, GlmMoeDsaModel
+    )
 
 
 def flush_prefill_sends() -> None:
@@ -505,6 +553,14 @@ def tensor_auto_parallel(
             all_to_sharded_linear_in_place,
             sharded_to_all_linear_in_place,
         )
+    elif _is_glm_moe_dsa_model(model):
+        tensor_parallel_sharding_strategy = GlmMoeDsaShardingStrategy(
+            group,
+            all_to_sharded_linear,
+            sharded_to_all_linear,
+            all_to_sharded_linear_in_place,
+            sharded_to_all_linear_in_place,
+        )
     elif isinstance(model, (DeepseekV3Model, DeepseekV32Model, KimiK25Model)):
         tensor_parallel_sharding_strategy = DeepSeekShardingStrategy(
             group,
@@ -595,6 +651,22 @@ def tensor_auto_parallel(
             all_to_sharded_linear_in_place,
             sharded_to_all_linear_in_place,
         )
+    elif isinstance(model, MiMoModel):
+        tensor_parallel_sharding_strategy = MiMoShardingStrategy(
+            group,
+            all_to_sharded_linear,
+            sharded_to_all_linear,
+            all_to_sharded_linear_in_place,
+            sharded_to_all_linear_in_place,
+        )
+    elif isinstance(model, MiniMaxM3Model):
+        tensor_parallel_sharding_strategy = MiniMaxM3ShardingStrategy(
+            group,
+            all_to_sharded_linear,
+            sharded_to_all_linear,
+            all_to_sharded_linear_in_place,
+            sharded_to_all_linear_in_place,
+        )
     else:
         raise ValueError(f"Unsupported model type: {type(model)}")
 
@@ -658,15 +730,18 @@ def _set_layers(model: nn.Module, layers: list[_LayerCallable]) -> None:
         inner_model_instance.layers = layers
 
         # Update DeepSeek V3 specific parameters when layers are shrunk
-        if isinstance(
-            model,
-            (
-                DeepseekV3Model,
-                DeepseekV32Model,
-                DeepseekV4Model,
-                Glm4MoeModel,
-                KimiK25Model,
-            ),
+        if (
+            _is_glm_moe_dsa_model(model)
+            or isinstance(
+                model,
+                (
+                    DeepseekV3Model,
+                    DeepseekV32Model,
+                    DeepseekV4Model,
+                    Glm4MoeModel,
+                    KimiK25Model,
+                ),
+            )
         ) and hasattr(inner_model_instance, "num_layers"):
             logger.info(
                 f"Setting num_layers to {len(layers)} for model {model.model.__class__.__name__}"
@@ -1327,6 +1402,278 @@ class Glm4MoeShardingStrategy(TensorParallelShardingStrategy):
 
             yield ModelLoadingResponse(layers_loaded=i, total=total)
         return model
+
+
+class MiMoShardingStrategy(TensorParallelShardingStrategy):
+    def shard_model(
+        self,
+        model: nn.Module,
+    ) -> Generator[ModelLoadingResponse, None, nn.Module]:
+        model = cast(MiMoModel, model)
+        layers = (
+            model.model.layers
+        )  # полный список из 70 слоёв (TP: start=0..total на каждой ноде)
+        total = len(layers)
+        R = self.group.rank()
+        for i, layer in enumerate(layers):
+            if layer is None:  # на всякий: pipeline_layers может содержать None
+                yield ModelLoadingResponse(layers_loaded=i, total=total)
+                continue
+            mx.eval(
+                layer.parameters()
+            )  # форс-загрузка lazy-весов до шардинга — против FAST_SYNCH-дедлока
+
+            attn = layer.self_attn
+            attn.q_proj = self.all_to_sharded_linear(attn.q_proj)
+            attn.k_proj = self.all_to_sharded_linear(attn.k_proj)
+            attn.v_proj = self.all_to_sharded_linear(attn.v_proj)
+            attn.o_proj = self.sharded_to_all_linear(attn.o_proj)
+            attn.n_heads //= self.N
+            attn.n_kv_heads //= self.N
+            if (
+                attn.attention_sink_bias is not None
+            ):  # MiMo-специфика: sink-bias пер-голова
+                attn.attention_sink_bias = attn.attention_sink_bias[
+                    R * attn.n_heads : (R + 1) * attn.n_heads
+                ]
+
+            if isinstance(layer.mlp, MiMoMoE):
+                self.all_to_sharded_linear_in_place(layer.mlp.switch_mlp.gate_proj)
+                self.all_to_sharded_linear_in_place(layer.mlp.switch_mlp.up_proj)
+                self.sharded_to_all_linear_in_place(layer.mlp.switch_mlp.down_proj)
+                layer.mlp.sharding_group = (
+                    self.group
+                )  # MoE.__call__ сам делает all_sum — НЕ оборачивать в ShardedMoE
+            else:  # плотный MLP (слой 0)
+                layer.mlp.gate_proj = self.all_to_sharded_linear(layer.mlp.gate_proj)
+                layer.mlp.up_proj = self.all_to_sharded_linear(layer.mlp.up_proj)
+                layer.mlp.down_proj = self.sharded_to_all_linear(layer.mlp.down_proj)
+
+            mx.eval(layer)
+            mx.clear_cache()
+            yield ModelLoadingResponse(layers_loaded=i, total=total)
+        return model
+
+class MiniMaxM3ShardingStrategy(TensorParallelShardingStrategy):
+    """MiniMax-M3 (minimax_m3_vl): hybrid (layers 0-2 full-attn + dense MLP,
+    3-59 MSA + MoE + shared expert). Mirrors minimax_m3_vl.Model.shard(),
+    verified in distributed (sharded == dense, 2/4 ranks).
+
+    M3-specific vs MiMo/MiniMax templates:
+      - MSA indexer FULLY REPLICATED (q_idx_proj/k_idx_proj/q_norm/k_norm all
+        untouched): official block selection does a GLOBAL amax over ALL index-heads
+        -> one [B,L,K] set; every rank needs all index-heads. Inputs replicated, so
+        all ranks compute the identical selection (no collective).
+      - shared expert: in-place sharding (NO own reduce). MoE.__call__ does ONE
+        all_sum covering routed+shared. Do NOT wrap in ShardedMoE (double reduce
+        = garbage without crash).
+      - per-head qk-norm (head_dim,) weights REPLICATED; no ShardedRMSNorm, no
+        attention wrapper.
+    """
+
+    def shard_model(
+        self,
+        model: nn.Module,
+    ) -> Generator[ModelLoadingResponse, None, nn.Module]:
+        model = cast(MiniMaxM3Model, model)
+        layers = model.model.layers
+        total = len(layers)
+        for i, layer in enumerate(layers):
+            if layer is None:  # pipeline_layers may contain None
+                yield ModelLoadingResponse(layers_loaded=i, total=total)
+                continue
+            mx.eval(layer.parameters())  # force lazy weights before sharding (FAST_SYNCH)
+
+            attn = layer.self_attn
+            attn.q_proj = self.all_to_sharded_linear(attn.q_proj)
+            attn.k_proj = self.all_to_sharded_linear(attn.k_proj)
+            attn.v_proj = self.all_to_sharded_linear(attn.v_proj)
+            attn.o_proj = self.sharded_to_all_linear(attn.o_proj)  # internal all_sum
+
+            if attn.is_sparse:  # MSA layers (3-59)
+                # MSA indexer FULLY REPLICATED. Official block selection does a
+                # GLOBAL amax over ALL index-heads -> one [B,L,K] set shared by every
+                # attention head; each rank needs all index-heads to reproduce it.
+                # Inputs are replicated across ranks so every rank computes the same
+                # selection, then gathers tokens for its own kv-head shard.
+                # q_idx_proj/k_idx_proj/q_norm/k_norm all left untouched.
+                pass
+
+            attn.num_attention_heads //= self.N
+            attn.num_key_value_heads //= self.N
+
+            if layer.is_moe:
+                moe = layer.block_sparse_moe
+                self.all_to_sharded_linear_in_place(moe.switch_mlp.gate_proj)
+                self.all_to_sharded_linear_in_place(moe.switch_mlp.up_proj)
+                self.sharded_to_all_linear_in_place(moe.switch_mlp.down_proj)
+                if moe.shared_experts is not None:
+                    # in-place (no own reduce) -> single all_sum in MoE.__call__
+                    self.all_to_sharded_linear_in_place(moe.shared_experts.gate_proj)
+                    self.all_to_sharded_linear_in_place(moe.shared_experts.up_proj)
+                    self.sharded_to_all_linear_in_place(moe.shared_experts.down_proj)
+                moe.sharding_group = self.group  # do NOT wrap in ShardedMoE!
+            else:
+                mlp = layer.mlp  # dense MLP, layers 0-2
+                mlp.gate_proj = self.all_to_sharded_linear(mlp.gate_proj)
+                mlp.up_proj = self.all_to_sharded_linear(mlp.up_proj)
+                mlp.down_proj = self.sharded_to_all_linear(mlp.down_proj)
+
+            mx.eval(layer)
+            mx.clear_cache()
+            yield ModelLoadingResponse(layers_loaded=i, total=total)
+        return model
+
+class ShardedDsaIndexer(CustomMlxLayer):
+    """Tensor-sharded GLM/DeepSeek DSA indexer.
+
+    The upstream DSA indexer sums scores across indexer heads before top-k.
+    When heads are tensor-sharded, each rank computes a partial head sum and
+    this wrapper restores the original math with an all_sum before argpartition.
+
+    It is disabled by default because long-prefill score all_sum can be costly.
+    Enable with EXO_GLM_DSA_SHARD_INDEXER=1 for decode-heavy benchmarking.
+    """
+
+    def __init__(
+        self,
+        original_layer: _LayerCallable,
+        group: mx.distributed.Group,
+        global_n_heads: int,
+    ):
+        super().__init__(original_layer)
+        self.group = group
+        self.global_n_heads = global_n_heads
+
+    def __call__(
+        self,
+        x: mx.array,
+        qr: mx.array,
+        mask: mx.array | None,
+        cache: object | None = None,
+    ) -> mx.array | None:
+        b, s, _ = x.shape
+        q = self.wq_b(qr)
+        q = q.reshape(b, s, self.n_heads, self.head_dim).swapaxes(1, 2)
+
+        k = self.wk(x)
+        k = self.k_norm(k)
+        k = mx.reshape(k, (b, 1, s, self.head_dim))
+
+        offset = cache.offset if cache is not None else 0  # type: ignore[union-attr]
+        q = self.rope(q, offset=offset)
+        k = self.rope(k, offset=offset)
+        if cache is not None:
+            k, _ = cache.update_and_fetch(k, mx.zeros([b, 1, s, 0]))  # type: ignore[union-attr]
+
+        if k.shape[2] <= self.index_topk:
+            return None
+
+        scores = q @ k.swapaxes(-1, -2)
+        scores = mx.maximum(scores, 0)
+
+        # weights_proj is sharded across the indexer-head dimension. Preserve
+        # the original global-n-head scale even though self.n_heads is now local.
+        weights = self.weights_proj(x) * (
+            self.global_n_heads**-0.5 * self.softmax_scale
+        )
+        weights = weights.swapaxes(-1, -2)[..., None]
+        scores = scores * weights
+        scores = scores.sum(axis=1, keepdims=True)
+        scores = mx.distributed.all_sum(scores, group=self.group)
+
+        if mask is not None:
+            scores = mx.where(mask, scores, -float("inf"))
+        return mx.argpartition(scores, kth=-self.index_topk, axis=-1)[
+            ..., -self.index_topk :
+        ]
+
+
+class GlmMoeDsaShardingStrategy(DeepSeekShardingStrategy):
+    """GLM-5/5.1 DSA strategy.
+
+    GLM-DSA currently inherits mlx-lm's DeepSeekV32 model path, so the safe
+    default is the same verified DeepSeekV32 tensor sharding plus explicit GLM
+    diagnostics. Optional DSA-indexer head sharding can be enabled with
+    EXO_GLM_DSA_SHARD_INDEXER=1.
+    """
+
+    def shard_model(
+        self,
+        model: nn.Module,
+    ) -> Generator[ModelLoadingResponse, None, nn.Module]:
+        logger.info(
+            "[EXO][GLM-DSA] using DeepSeekV32-compatible tensor sharding; "
+            f"indexer_sharding={_env_flag('EXO_GLM_DSA_SHARD_INDEXER', False)}"
+        )
+        model = yield from super().shard_model(model)
+
+        if _env_flag("EXO_GLM_DSA_SHARD_INDEXER", False):
+            self._shard_dsa_indexers(model)
+
+        return model
+
+    def _shard_dsa_indexers(self, model: nn.Module) -> None:
+        sharded = 0
+        skipped_shared = 0
+        layers = list(getattr(model, "layers", []))
+        has_indexshare_annotations = any(
+            getattr(getattr(layer, "self_attn", None), "_exo_glm52_indexer_type", None)
+            is not None
+            for layer in layers
+        )
+        if not has_indexshare_annotations and _env_flag(
+            "EXO_GLM_DSA_SHARD_INDEXER_REQUIRE_INDEXSHARE", True
+        ):
+            logger.warning(
+                "[EXO][GLM-DSA] refusing to shard DSA indexers because GLM-5.2 "
+                "IndexShare annotations are missing. This prevents accidentally "
+                "sharding all materialized shared-indexers. Ensure "
+                "EXO_GLM52_INDEXSHARE=1, or override with "
+                "EXO_GLM_DSA_SHARD_INDEXER_REQUIRE_INDEXSHARE=0."
+            )
+            return
+        for layer in layers:
+            attn = getattr(layer, "self_attn", None)
+            if getattr(attn, "_exo_glm52_indexer_type", None) == "shared":
+                skipped_shared += 1
+                continue
+            indexer = getattr(attn, "indexer", None)
+            if indexer is None:
+                continue
+
+            if not all(
+                hasattr(indexer, attr)
+                for attr in ("wq_b", "weights_proj", "n_heads", "head_dim")
+            ):
+                logger.warning(
+                    "[EXO][GLM-DSA] indexer found but required attributes are "
+                    f"missing on {indexer.__class__.__name__}; leaving unsharded"
+                )
+                continue
+
+            global_n_heads = int(indexer.n_heads)
+            if global_n_heads % self.N != 0:
+                logger.warning(
+                    "[EXO][GLM-DSA] cannot shard indexer heads: "
+                    f"n_heads={global_n_heads} is not divisible by world_size={self.N}"
+                )
+                continue
+
+            mx.eval(indexer.parameters())
+            indexer.wq_b = self.all_to_sharded_linear(indexer.wq_b)
+            indexer.weights_proj = self.all_to_sharded_linear(indexer.weights_proj)
+            indexer.n_heads = global_n_heads // self.N
+            attn.indexer = ShardedDsaIndexer(indexer, self.group, global_n_heads)
+            mx.eval(attn.indexer)
+            sharded += 1
+
+        logger.info(
+            f"[EXO][GLM-DSA] sharded {sharded} DSA indexers"
+            + (f"; skipped_shared={skipped_shared}" if skipped_shared else "")
+        )
+
+
 
 
 class GptOssShardingStrategy(TensorParallelShardingStrategy):
