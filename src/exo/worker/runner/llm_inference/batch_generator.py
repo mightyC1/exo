@@ -298,6 +298,12 @@ class SequentialGenerator(Engine):
         )
 
     def close(self) -> None:
+        from exo.worker.engines.mlx.auto_parallel import clear_prefill_sends
+
+        clear_prefill_sends()  # module-global holds (array, dst, group) refs
+        if self.kv_prefix_cache is not None:
+            self.kv_prefix_cache.close()
+        self.kv_prefix_cache = None
         del self.model, self.tokenizer, self.group
 
     def serve_prefill(self, request: PrefillRequest, wfile: BinaryIO) -> None:
@@ -552,7 +558,13 @@ class BatchGenerator(Engine):
         )
 
     def close(self) -> None:
+        from exo.worker.engines.mlx.auto_parallel import clear_prefill_sends
+
         self._gen.close()
+        clear_prefill_sends()  # module-global holds (array, dst, group) refs
+        if self.kv_prefix_cache is not None:
+            self.kv_prefix_cache.close()
+        self.kv_prefix_cache = None
         del self.model, self.tokenizer, self.group
 
     def serve_prefill(self, request: PrefillRequest, wfile: BinaryIO) -> None:

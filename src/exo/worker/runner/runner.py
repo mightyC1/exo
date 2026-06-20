@@ -225,6 +225,27 @@ class Runner:
             if self._prefill_server is not None:
                 self._prefill_server.stop()
                 self._prefill_server = None
+            # v3: graceful teardown on EVERY exit path. The _TaskStreamClosed
+            # break (supervisor closes the channel before the Shutdown task is
+            # consumed) previously exited without generator.close(), leaving
+            # the JACCL group alive past process death -> stale kernel paths
+            # on this node. Idempotent: the Shutdown-task path already nulls
+            # the generator, making this a no-op there.
+            try:
+                if getattr(self, "generator", None) is not None:
+                    self.generator.close()
+                    self.generator = None  # type: ignore[assignment]
+                    import gc
+
+                    gc.collect()
+                    import time
+
+                    time.sleep(5.0)  # v4: drain async path teardown (see shutdown)
+                    logger.info(
+                        "main-exit teardown: generator closed, group references dropped"
+                    )
+            except Exception:
+                logger.warning("main-exit teardown failed")
             self.task_receiver.close()
             if self._task_reader_thread is not None:
                 self._task_reader_thread.join(timeout=5)
@@ -315,9 +336,22 @@ class Runner:
         self.update_status(RunnerShuttingDown())
         self.acknowledge_task(task)
         self.generator.close()
+        # Drop the last strong reference chain to the distributed group so its
+        # destructor runs HERE (graceful ibv destroy) instead of relying on
+        # interpreter teardown, which the supervisor may pre-empt with a kill.
+        self.generator = None  # type: ignore[assignment]
         import gc
 
         gc.collect()
+        # v4: the JACCL wind-down issues path teardown asynchronously after the
+        # group destructor (observed ~25 ms cadence per path in the kernel
+        # log). If the process exits before the sequence completes, remaining
+        # paths are never deallocated and go stale. Keep the process alive
+        # long enough for 6 paths + margin.
+        import time
+
+        time.sleep(5.0)
+        logger.info("generator closed, group references dropped")
         self.send_task_status(task.task_id, TaskStatus.Complete)
         self.update_status(RunnerShutdown())
 
