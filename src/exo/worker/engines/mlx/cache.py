@@ -80,14 +80,14 @@ def copy_rotating_kv_cache(cache: RotatingKVCache) -> RotatingKVCache | None:
     if cache.keys is None or cache.values is None:
         return None
     n = min(cache.max_size, cache.keys.shape[2])
-    k_slice = _detached_copy(cache.keys[..., -n:, :])
-    v_slice = _detached_copy(cache.values[..., -n:, :])
+    k_slice = _detached_copy(cache.keys)
+    v_slice = _detached_copy(cache.values)
     mx.eval(k_slice, v_slice)
     snap = RotatingKVCache.__new__(RotatingKVCache)
     snap.keys = k_slice
     snap.values = v_slice
     snap.offset = cache.offset
-    snap._idx = n
+    snap._idx = cache._idx
     snap.keep = cache.keep
     snap.max_size = cache.max_size
     return snap
@@ -249,6 +249,16 @@ class KVPrefixCache:
         self._last_used.clear()
         self.prefill_tps.clear()
 
+    def close(self) -> None:
+        """Release all cached arrays and drop the distributed group reference.
+
+        Without this, the cache keeps the JACCL group alive past generator
+        close, so QPs are never destroyed gracefully and the node enters the
+        post-unload RDMA quiesce window.
+        """
+        self.clear()
+        self._group = None
+
     def add_kv_cache(
         self,
         prompt_tokens: mx.array,
@@ -373,7 +383,8 @@ class KVPrefixCache:
         restore_pos, restore_snap = self._get_snapshot(best_index, target)
 
         # No usable snapshot — need fresh cache
-        if restore_snap is None and has_ssm:
+        has_rot = any(isinstance(c, RotatingKVCache) for c in self.caches[best_index])
+        if restore_snap is None and (has_ssm or (has_rot and target < cached_length)):
             return make_kv_cache(model), prompt_tokens, None, False
 
         prompt_cache = deepcopy(self.caches[best_index])

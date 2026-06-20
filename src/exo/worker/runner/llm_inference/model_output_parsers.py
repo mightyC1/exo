@@ -458,10 +458,8 @@ def parse_tool_calls(
 
             if parsed is None:
                 logger.warning(f"tool call parsing failed for text {combined}")
-                yield response.model_copy(
-                    update={"text": combined, "token": 0, "finish_reason": "error"}
-                )
-                break
+                yield response.model_copy(update={"text": combined})
+                continue
 
             accumulated_tool_calls.extend(parsed)
             if accumulated_tool_calls and (
@@ -483,7 +481,6 @@ def parse_tool_calls(
                 update={
                     "text": "".join(tool_call_text_parts),
                     "token": 0,
-                    "finish_reason": "error",
                 }
             )
             yield response

@@ -1,0 +1,20 @@
+model_id = "kernelpool/MiMo-V2.5-Pro-6bit"
+n_layers = 70
+hidden_size = 6144
+supports_tensor = true
+num_key_value_heads = 8
+tasks = ["TextGeneration"]
+family = ""
+quantization = ""
+base_model = ""
+capabilities = []
+backends = ["MlxMetal", "MlxCpu", "MlxCuda", "Vllm"]
+reasoning_dialect = "none"
+context_length = 1048576
+uses_cfg = false
+trust_remote_code = false
+
+[storage_size]
+in_bytes = 835299199488
+
+[sampling_defaults]
