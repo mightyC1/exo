@@ -167,7 +167,7 @@ class ModelCard(FrozenModel):
     quantization: str = ""
     base_model: str = ""
     capabilities: list[str] = []
-    backends: list[Backend]
+    backends: list[Backend] = [Backend.MlxMetal, Backend.MlxCpu, Backend.MlxCuda, Backend.Vllm]
     reasoning_dialect: ReasoningDialect = "none"
     context_length: int = 0
     uses_cfg: bool = False
@@ -300,6 +300,7 @@ class ConfigData(BaseModel):
             ["Step3p5ForCausalLM"],
             ["NemotronHForCausalLM"],
             ["Gemma4ForConditionalGeneration"],
+            ["MiMoV2ForCausalLM"],
         ]
 
     @model_validator(mode="before")
