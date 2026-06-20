@@ -1,3 +1,4 @@
+import os
 from dataclasses import dataclass, field
 from typing import cast
 
@@ -5,6 +6,68 @@ import mlx.core as mx
 from mlx_lm.generate import GenerationBatch
 
 _PRECOMPUTE_TOP_K = 20
+
+
+_CACHE_DRAIN_DEFAULT_AUTO = "auto"
+
+
+def _bool_env(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _is_glm52_indexshare_model(model) -> bool:
+    inner = getattr(model, "model", model)
+    return bool(getattr(inner, "_exo_glm52_indexshare_enabled", False))
+
+
+def _cache_drain_every(batch: GenerationBatch) -> int:
+    """How often to force-materialize prompt cache state during decode.
+
+    ``EXO_CACHE_DRAIN_EVERY=auto`` drains every step only for GLM-5.2
+    IndexShare, where the sparse/shared-indexer path can otherwise leave a
+    large lazy graph alive across decode iterations. Other models default to 0
+    to avoid a silent global throughput regression.
+    """
+
+    raw = os.environ.get("EXO_CACHE_DRAIN_EVERY", _CACHE_DRAIN_DEFAULT_AUTO)
+    raw = raw.strip().lower()
+    if raw in {"", "auto"}:
+        return 1 if _is_glm52_indexshare_model(getattr(batch, "model", None)) else 0
+    if raw in {"off", "false", "no", "n"}:
+        return 0
+    if raw in {"on", "true", "yes", "y"}:
+        return 1
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 1 if _is_glm52_indexshare_model(getattr(batch, "model", None)) else 0
+
+
+def _drain_prompt_cache_if_needed(batch: GenerationBatch) -> None:
+    drain_every = _cache_drain_every(batch)
+    if drain_every <= 0:
+        return
+
+    count = int(getattr(batch, "_exo_cache_drain_count", 0)) + 1
+    batch._exo_cache_drain_count = count  # pyright: ignore[reportAttributeAccessIssue]
+    if count % drain_every != 0:
+        return
+
+    try:
+        mx.eval([cache.state for cache in batch.prompt_cache])
+    except Exception as exc:  # noqa: BLE001 - cache drain is a stability aid only
+        if _bool_env("EXO_CACHE_DRAIN_WARN", False):
+            try:
+                from exo.worker.runner.bootstrap import logger
+
+                logger.warning(f"[EXO][MLX] prompt cache drain failed: {exc!r}")
+            except Exception:
+                pass
+
+
 
 
 @dataclass
@@ -122,6 +185,12 @@ def _patched_step(self: GenerationBatch) -> tuple[list[int], list[mx.array]]:
         mx.eval(inputs, *current_lp)
     else:
         mx.eval(inputs)
+
+    # [EXO graph-bound fix] force-materialize the whole KV cache periodically so
+    # the lazy compute graph cannot accumulate across decode steps. By default
+    # this is enabled every step only for GLM-5.2 IndexShare, and disabled for
+    # other models to avoid an implicit global throughput regression.
+    _drain_prompt_cache_if_needed(self)
 
     token_list = cast(list[int], inputs.tolist())
     for sti, ti in zip(self.tokens, token_list, strict=True):

@@ -29,6 +29,7 @@ from mlx_lm.tokenizer_utils import TokenizerWrapper
 
 from exo.shared.models.model_cards import ModelId
 from exo.worker.engines.mlx.constants import TRUST_REMOTE_CODE
+from exo.worker.engines.mlx.patches.sparse_attention_dispatch import apply_sparse_attention_patches
 
 try:
     from mlx_lm.tokenizer_utils import load_tokenizer
@@ -173,6 +174,7 @@ def load_mlx_items(
         model_path = build_model_path(bound_instance.bound_shard.model_card.model_id)
         start_time = time.perf_counter()
         model, _ = load_model(model_path, lazy=True, strict=False)
+        apply_sparse_attention_patches(model, model_path, logger=logger)
         # Eval layers one by one for progress reporting
         try:
             inner = get_inner_model(model)
@@ -253,6 +255,8 @@ def shard_and_load(
         # model, config = quantize_model(
         #        model, config, group_size=KV_GROUP_SIZE, bits=ATTENTION_KV_BITS, quant_predicate=quant_predicate, mode=QUANTIZE_MODEL_MODE
         #    )
+
+    apply_sparse_attention_patches(model, model_path, logger=logger)
 
     assert isinstance(model, nn.Module)
 
@@ -626,6 +630,16 @@ def render_chat_template(
         extra_kwargs["thinking"] = task_params.enable_thinking
     if task_params.reasoning_effort is not None:
         extra_kwargs["reasoning_effort"] = task_params.reasoning_effort
+    # MiniMax-M3 gates thinking on `thinking_mode` ("enabled"/"disabled"/
+    # "adaptive"); EXO's enable_thinking/thinking/reasoning_effort are ignored by
+    # its template. Derive thinking_mode so the API can force M3 on/off. Other
+    # models ignore the unknown var. Unset -> M3 default "adaptive" (model decides).
+    if task_params.enable_thinking is True:
+        extra_kwargs["thinking_mode"] = "enabled"
+    elif task_params.enable_thinking is False:
+        extra_kwargs["thinking_mode"] = "disabled"
+    elif task_params.reasoning_effort == "none":
+        extra_kwargs["thinking_mode"] = "disabled"
 
     patched_template: str | None = None
     if task_params.tools:
