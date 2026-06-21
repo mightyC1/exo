@@ -36,8 +36,8 @@ from mlx_lm.models.gpt_oss import GptOssMoeModel
 from mlx_lm.models.gpt_oss import Model as GptOssModel
 from mlx_lm.models.kimi_k25 import Model as KimiK25Model
 from mlx_lm.models.llama import Model as LlamaModel
-from mlx_lm.models.mimo_v2 import Model as MiMoModel
-from mlx_lm.models.mimo_v2 import MoE as MiMoMoE
+from exo.worker.engines.mlx.vendor.mimo_v2 import Model as MiMoModel
+from exo.worker.engines.mlx.vendor.mimo_v2 import MoE as MiMoMoE
 from mlx_lm.models.minimax import MiniMaxAttention
 from mlx_lm.models.minimax import Model as MiniMaxModel
 from exo.worker.engines.mlx.vendor.minimax_m3_vl import Model as MiniMaxM3Model

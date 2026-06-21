@@ -28,6 +28,15 @@ def register_custom_models() -> None:
     sys.modules["mlx_lm.models.minimax_m3_vl"] = _m3
     setattr(_mlx_models, "minimax_m3_vl", _m3)
 
+    # MiMo-V2.5-Pro (model_type=mimo_v2): same pattern. The vendored copy has its
+    # relative imports rewritten to absolute (mlx_lm.models.*) so it imports
+    # cleanly from EXO. auto_parallel's mimo_v2 import is UNGUARDED -- a missing
+    # file would crash every runner -- so vendoring removes that risk entirely.
+    from exo.worker.engines.mlx.vendor import mimo_v2 as _mimo
+
+    sys.modules["mlx_lm.models.mimo_v2"] = _mimo
+    setattr(_mlx_models, "mimo_v2", _mimo)
+
     # 2) prefer <mm:think> over <think> for M3 (replaces the tokenizer_utils
     #    edit). M3 vocab has both pairs but emits <mm:think>; upstream picks
     #    <think> first. Other models fall through to the original detector.
