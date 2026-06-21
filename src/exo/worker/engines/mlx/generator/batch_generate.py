@@ -1,5 +1,4 @@
 import contextlib
-import os
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -43,12 +42,9 @@ from exo.worker.engines.mlx.generator.generate import (
 )
 from exo.worker.engines.mlx.generator.remote_prefill import remote_prefill
 from exo.worker.engines.mlx.patches.opt_batch_gen import (
-    set_hotpath_profile_context,
-    set_logprob_requirements,
     set_needs_topk,
     take_ready_topk,
 )
-from exo.worker.engines.mlx.patches.hotpath import attach_sampler_signature
 from exo.worker.engines.mlx.types import KVCacheType, Model
 from exo.worker.engines.mlx.utils_mlx import (
     fix_unmatched_think_end_tokens,
@@ -63,21 +59,6 @@ from exo.worker.engines.mlx.vision import (
 from exo.worker.runner.bootstrap import logger
 
 _MIN_PREFIX_HIT_RATIO_TO_UPDATE = 0.5
-
-
-def _hotpath_profile_enabled() -> bool:
-    return os.environ.get("EXO_HOTPATH_PROFILE", "").strip().lower() in {
-        "1", "true", "yes", "y", "on", "wall", "jsonl", "attribution"
-    }
-
-
-def _card_loaded(model_id: object) -> bool:
-    try:
-        from exo.shared.models.model_cards import get_card
-
-        return get_card(model_id) is not None  # type: ignore[arg-type]
-    except Exception:
-        return False
 REMOTE_PREFILL_MIN_TOKENS = 1000
 
 
@@ -209,7 +190,6 @@ class ExoBatchGenerator:
             min_p=task_params.min_p if task_params.min_p is not None else 0.05,
             top_k=task_params.top_k if task_params.top_k is not None else 0,
         )
-        attach_sampler_signature(sampler, task_params)
 
         vision_ctx = (
             patch_embed_tokens(
@@ -351,42 +331,10 @@ class ExoBatchGenerator:
             return []
 
         gb = self._mlx_gen._generation_batch
-        active_tasks = list(self._active_tasks.values())
-        need_response_logprobs = any(
-            t.task_params.logprobs or ((t.task_params.top_logprobs or 0) > 0)
-            for t in active_tasks
-        )
-        need_top_p_normalization = any(
-            t.task_params.top_p is not None and t.task_params.top_p < 1.0
-            for t in active_tasks
-        )
-        needs_topk = need_response_logprobs
-        set_logprob_requirements(
+        set_needs_topk(
             gb,
-            needs_topk=needs_topk,
-            need_normalized_logits=need_response_logprobs or need_top_p_normalization,
-            need_response_logprobs=need_response_logprobs,
+            any(t.task_params.logprobs for t in self._active_tasks.values()),
         )
-        if _hotpath_profile_enabled():
-            set_hotpath_profile_context(
-                gb,
-                {
-                    "active_task_count": len(active_tasks),
-                    "models": sorted({str(t.task_params.model) for t in active_tasks}),
-                    "card_loaded_all": all(
-                        _card_loaded(t.task_params.model) for t in active_tasks
-                    ) if active_tasks else None,
-                    "final_temperature": [t.task_params.temperature for t in active_tasks],
-                    "final_top_p": [t.task_params.top_p for t in active_tasks],
-                    "final_top_k": [t.task_params.top_k for t in active_tasks],
-                    "final_min_p": [t.task_params.min_p for t in active_tasks],
-                    "logprobs_requested": [t.task_params.logprobs for t in active_tasks],
-                    "top_logprobs": [t.task_params.top_logprobs for t in active_tasks],
-                    "need_top_p_normalization": need_top_p_normalization,
-                    "need_response_logprobs": need_response_logprobs,
-                    "needs_topk": needs_topk,
-                },
-            )
         _step_tic = time.perf_counter()
         _, responses = self._mlx_gen.next()
         _next_elapsed = time.perf_counter() - _step_tic
