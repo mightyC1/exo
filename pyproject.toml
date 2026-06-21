@@ -93,7 +93,7 @@ mlx-cuda-13 = [
   { url = "https://github.com/rltakashige/mlx-jaccl-fix-small-recv/releases/download/mlx_cuda/mlx_cuda_13-0.32.0-py3-none-manylinux_2_35_aarch64.whl", marker = "sys_platform == 'linux' and platform_machine == 'aarch64'" },
   { url = "https://github.com/rltakashige/mlx-jaccl-fix-small-recv/releases/download/mlx_cuda/mlx_cuda_13-0.32.0-py3-none-manylinux_2_35_x86_64.whl", marker = "sys_platform == 'linux' and platform_machine != 'aarch64'" },
 ]
-mlx-lm = { git = "https://github.com/rltakashige/mlx-lm", branch = "leo/deepseek-v4" }
+mlx-lm = { git = "https://github.com/rltakashige/mlx-lm", rev = "6a3df6cd6b00a347ee40f12d97a182aaf86ea599" }
 mflux = { git = "https://github.com/evanev7/mflux", branch = "exo2" }
 torch = [
   { index = "pytorch-cpu", marker = "sys_platform == 'linux' and extra == 'mlx-cpu' and extra != 'mlx-cuda13' and extra != 'mlx-cuda12'" },

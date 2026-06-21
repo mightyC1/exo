@@ -92,11 +92,6 @@ _PATCHES: dict[str, _PatchFn] = {
 # which are not yet loadable. Kept distinct from ``_PATCHES`` so any future
 # exact-match implementation always wins over a placeholder.
 _PLACEHOLDER_PREFIXES: dict[str, _PatchFn] = {
-    "minimax": _not_implemented(
-        "minimax",
-        "M3 uses MSA / block-sparse attention (a different mechanism from GLM "
-        "DSA top-k) and needs base MSA support in mlx-lm first.",
-    ),
     "mimo": _not_implemented(
         "mimo",
         "MiMo-V2.5-Pro uses an SWA/GA sliding-window+global hybrid over a "
