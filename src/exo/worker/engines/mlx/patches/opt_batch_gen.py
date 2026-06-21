@@ -1,6 +1,6 @@
 import os
 from dataclasses import dataclass, field
-from typing import cast
+from typing import Any, cast
 
 import mlx.core as mx
 from mlx_lm.generate import GenerationBatch
@@ -18,18 +18,17 @@ def _bool_env(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
-def _is_glm52_indexshare_model(model) -> bool:
+def _is_glm52_indexshare_model(model: Any) -> bool:
     inner = getattr(model, "model", model)
     return bool(getattr(inner, "_exo_glm52_indexshare_enabled", False))
 
 
 def _cache_drain_every(batch: GenerationBatch) -> int:
-    """How often to force-materialize prompt cache state during decode.
+    """Return prompt-cache drain period for decode.
 
-    ``EXO_CACHE_DRAIN_EVERY=auto`` drains every step only for GLM-5.2
-    IndexShare, where the sparse/shared-indexer path can otherwise leave a
-    large lazy graph alive across decode iterations. Other models default to 0
-    to avoid a silent global throughput regression.
+    EXO_CACHE_DRAIN_EVERY=auto drains every step only for GLM-5.2 IndexShare,
+    where the sparse/shared-indexer path can otherwise keep a large lazy graph
+    alive. Other models default to off to avoid hidden throughput regressions.
     """
 
     raw = os.environ.get("EXO_CACHE_DRAIN_EVERY", _CACHE_DRAIN_DEFAULT_AUTO)
@@ -57,8 +56,14 @@ def _drain_prompt_cache_if_needed(batch: GenerationBatch) -> None:
         return
 
     try:
-        mx.eval([cache.state for cache in batch.prompt_cache])
-    except Exception as exc:  # noqa: BLE001 - cache drain is a stability aid only
+        states = [cache.state for cache in batch.prompt_cache]
+        mx.eval(states)
+        batch._exo_cache_drain_last_ok = True  # pyright: ignore[reportAttributeAccessIssue]
+        batch._exo_cache_drain_last_count = count  # pyright: ignore[reportAttributeAccessIssue]
+    except Exception as exc:  # noqa: BLE001 - strict mode controls test failure
+        batch._exo_cache_drain_last_ok = False  # pyright: ignore[reportAttributeAccessIssue]
+        if _bool_env("EXO_CACHE_DRAIN_STRICT", False):
+            raise
         if _bool_env("EXO_CACHE_DRAIN_WARN", False):
             try:
                 from exo.worker.runner.bootstrap import logger
@@ -66,9 +71,6 @@ def _drain_prompt_cache_if_needed(batch: GenerationBatch) -> None:
                 logger.warning(f"[EXO][MLX] prompt cache drain failed: {exc!r}")
             except Exception:
                 pass
-
-
-
 
 @dataclass
 class BatchTopKLogprobs:
@@ -97,6 +99,9 @@ class BatchTopKLogprobs:
 @dataclass
 class _TopKBuffer:
     needs_topk: bool = False
+    need_normalized_logits: bool = True
+    need_response_logprobs: bool = True
+    profile_context: dict[str, Any] = field(default_factory=dict)
     pending: BatchTopKLogprobs = field(default_factory=BatchTopKLogprobs)
     ready: BatchTopKLogprobs = field(default_factory=BatchTopKLogprobs)
 
@@ -110,11 +115,38 @@ def _get_buffer(batch: GenerationBatch) -> _TopKBuffer:
 
 
 def set_needs_topk(batch: GenerationBatch, needed: bool) -> None:
-    _get_buffer(batch).needs_topk = needed
+    buf = _get_buffer(batch)
+    buf.needs_topk = needed
+    if needed:
+        buf.need_normalized_logits = True
+        buf.need_response_logprobs = True
 
 
 def take_ready_topk(batch: GenerationBatch) -> BatchTopKLogprobs:
     return _get_buffer(batch).ready
+
+
+
+def set_logprob_requirements(
+    batch: GenerationBatch,
+    *,
+    needs_topk: bool,
+    need_normalized_logits: bool,
+    need_response_logprobs: bool,
+) -> None:
+    """Side-channel from EXO wrapper to GenerationBatch._step.
+
+    _active_tasks/task_params are not visible inside GenerationBatch, so the
+    wrapper computes these requirements after model-card sampling defaults.
+    """
+    buf = _get_buffer(batch)
+    buf.needs_topk = bool(needs_topk)
+    buf.need_normalized_logits = bool(need_normalized_logits)
+    buf.need_response_logprobs = bool(need_response_logprobs)
+
+
+def set_hotpath_profile_context(batch: GenerationBatch, context: dict[str, Any]) -> None:
+    _get_buffer(batch).profile_context = context
 
 
 def _patched_step(self: GenerationBatch) -> tuple[list[int], list[mx.array]]:
