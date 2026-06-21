@@ -40,10 +40,7 @@ from mlx_lm.models.mimo_v2 import Model as MiMoModel
 from mlx_lm.models.mimo_v2 import MoE as MiMoMoE
 from mlx_lm.models.minimax import MiniMaxAttention
 from mlx_lm.models.minimax import Model as MiniMaxModel
-try:
-    from mlx_lm.models.minimax_m3_vl import Model as MiniMaxM3Model
-except Exception:
-    MiniMaxM3Model = ()  # isinstance(x, ()) is always False; missing model file won't crash runners
+from exo.worker.engines.mlx.vendor.minimax_m3_vl import Model as MiniMaxM3Model
 from mlx_lm.models.ministral3 import Model as Ministral3Model
 from mlx_lm.models.nemotron_h import Model as NemotronHModel
 from mlx_lm.models.nemotron_h import (

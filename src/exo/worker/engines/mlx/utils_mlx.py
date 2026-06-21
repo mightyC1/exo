@@ -30,6 +30,12 @@ from mlx_lm.tokenizer_utils import TokenizerWrapper
 from exo.shared.models.model_cards import ModelId
 from exo.worker.engines.mlx.constants import TRUST_REMOTE_CODE
 from exo.worker.engines.mlx.patches.sparse_attention_dispatch import apply_sparse_attention_patches
+from exo.worker.engines.mlx.vendor.custom_models import register_custom_models
+
+# Make M3 (and future vendored models) resolvable by mlx-lm's loader and fix
+# reasoning-tag detection -- without patching site-packages. Runs once, here,
+# before any load_model() below.
+register_custom_models()
 
 try:
     from mlx_lm.tokenizer_utils import load_tokenizer
