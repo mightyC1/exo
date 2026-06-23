@@ -637,7 +637,7 @@ def apply_glm52_indexshare_patch(
     fix_indexer_rope = _env_bool(
         "EXO_GLM52_INDEXER_HALF_SPLIT_ROPE",
         "EXO_GLM_INDEXER_HALF_SPLIT_ROPE",
-        default=True,
+        default=(config.get("indexer_rope_interleave") is False),
     )
     _rope_params = config.get("rope_parameters") or {}
     _rope_type = _rope_params.get("rope_type") or _rope_params.get("type") or "default"
