@@ -41,6 +41,10 @@ from exo.worker.engines.mlx.vendor.mimo_v2 import MoE as MiMoMoE
 from mlx_lm.models.minimax import MiniMaxAttention
 from mlx_lm.models.minimax import Model as MiniMaxModel
 from exo.worker.engines.mlx.vendor.minimax_m3_vl import Model as MiniMaxM3Model
+from exo.worker.engines.mlx.vendor.kimi_k3 import (
+    Model as KimiK3Model,
+    ShortConv1d as KimiK3ShortConv1d,
+)
 from mlx_lm.models.ministral3 import Model as Ministral3Model
 from mlx_lm.models.nemotron_h import Model as NemotronHModel
 from mlx_lm.models.nemotron_h import (
@@ -331,6 +335,12 @@ def pipeline_auto_parallel(
     Returns:
     The parallelized model
     """
+    if isinstance(model, KimiK3Model):
+        raise NotImplementedError(
+            "Kimi K3 v1 supports Tensor Parallel only (INV#5): AttnRes и hybrid "
+            "KDA/MLA cache-цепочки не портированы на pipeline; PP = P2."
+        )
+
     inner_model_instance: nn.Module = get_inner_model(model)
 
     layers = get_layers(inner_model_instance)
@@ -658,6 +668,14 @@ def tensor_auto_parallel(
         )
     elif isinstance(model, MiniMaxM3Model):
         tensor_parallel_sharding_strategy = MiniMaxM3ShardingStrategy(
+            group,
+            all_to_sharded_linear,
+            sharded_to_all_linear,
+            all_to_sharded_linear_in_place,
+            sharded_to_all_linear_in_place,
+        )
+    elif isinstance(model, KimiK3Model):
+        tensor_parallel_sharding_strategy = KimiK3ShardingStrategy(
             group,
             all_to_sharded_linear,
             sharded_to_all_linear,
@@ -1520,6 +1538,137 @@ class MiniMaxM3ShardingStrategy(TensorParallelShardingStrategy):
             mx.clear_cache()
             yield ModelLoadingResponse(layers_loaded=i, total=total)
         return model
+
+
+class KimiK3ShardingStrategy(TensorParallelShardingStrategy):
+    """Kimi K3 (kimi_k3): 93 слоя = 69 KDA + 24 Gated MLA (NoPE) + LatentMoE.
+
+    Ownership (план §8.2, ревью v2), 96 -> 96/N голов на rank:
+      KDA:  q/k/v_proj a2s; q/k/v conv channel-slice (головы rank'а);
+            f_a REPLICATED; f_b a2s; b_proj a2s (rows=heads); g_proj a2s
+            (full-rank, INV#2); A_log [128] REPLICATED (INV#1 — НИКОГДА не
+            режется, семантика per_head/per_channel решается в runtime модели);
+            dt_bias head-slice [12288 -> 12288/N]; o_norm REPLICATED;
+            o_proj s2a (internal all_sum).
+      MLA:  q_a/q_a_norm/kv_a/kv_a_norm REPLICATED; q_b a2s;
+            embed_q/unembed_out head-slice (.apply); g_proj (out gate) a2s;
+            o_proj s2a; num_heads //= N. NoPE — rope-веток нет.
+      MoE (KimiK3LatentMoE, INV#3/#11/#12): router+bias, latent down/norm/up —
+            REPLICATED (не трогаем); switch_mlp gate/up in-place a2s
+            (intermediate 3072 -> 3072/N, кратно quant-группе 32);
+            switch_mlp down in-place s2a (partial latent, БЕЗ collective);
+            shared gate/up in-place a2s, down in-place s2a (partial);
+            moe.sharding_group = group — ВСЕ all_sum живут в MoE.__call__
+            (fp32-cast, INV#12). Generic ShardedMoE ЗАПРЕЩЁН.
+      Dense (layer 0): gate/up a2s, down s2a.
+      embed_tokens / lm_head / norm / attn_res: REPLICATED (INV#4).
+    """
+
+    def shard_model(
+        self,
+        model: nn.Module,
+    ) -> Generator[ModelLoadingResponse, None, nn.Module]:
+        model = cast(KimiK3Model, model)
+        layers = model.model.layers
+        total = len(layers)
+        N = self.N
+        rank = self.group.rank()
+
+        for i, layer in enumerate(layers):
+            if layer is None:
+                yield ModelLoadingResponse(layers_loaded=i, total=total)
+                continue
+            mx.eval(layer.parameters())  # FAST_SYNCH: materialize before shard
+
+            attn = layer.self_attn
+            if getattr(layer, "is_linear", False):
+                # ---------------- KDA ----------------
+                H = attn.num_heads
+                D = attn.head_dim
+                assert H % N == 0, f"KDA heads {H} % world {N} != 0"
+                Hl = H // N
+                ch_s, ch_e = rank * Hl * D, (rank + 1) * Hl * D
+
+                # A_log: INV#1 — replicated, только assert формы
+                assert attn.A_log.shape == (D,), (
+                    f"A_log shape {attn.A_log.shape} != ({D},) — INV#1 violated"
+                )
+
+                attn.q_proj = self.all_to_sharded_linear(attn.q_proj)
+                attn.k_proj = self.all_to_sharded_linear(attn.k_proj)
+                attn.v_proj = self.all_to_sharded_linear(attn.v_proj)
+
+                # conv: пересоздаём depthwise ShortConv1d на локальные каналы
+                for conv_name in ("q_conv", "k_conv", "v_conv"):
+                    old = getattr(attn, conv_name)
+                    w = old.conv.weight[ch_s:ch_e]
+                    new = KimiK3ShortConv1d(Hl * D, attn.conv_kernel)
+                    new.conv.weight = mx.contiguous(w)
+                    setattr(attn, conv_name, new)
+
+                attn.f_b_proj = self.all_to_sharded_linear(attn.f_b_proj)
+                attn.b_proj = self.all_to_sharded_linear(attn.b_proj)
+                attn.g_proj = self.all_to_sharded_linear(attn.g_proj)
+                attn.dt_bias = mx.contiguous(attn.dt_bias[ch_s:ch_e])
+                attn.o_proj = self.sharded_to_all_linear(attn.o_proj)
+
+                attn.num_heads = Hl
+                attn.projection_dim = Hl * D
+                assert attn.dt_bias.shape == (Hl * D,), (
+                    f"dt_bias {attn.dt_bias.shape} != ({Hl * D},) per rank"
+                )
+            else:
+                # ---------------- Gated MLA (NoPE) ----------------
+                H = attn.num_heads
+                assert H % N == 0, f"MLA heads {H} % world {N} != 0"
+                attn.q_b_proj = self.all_to_sharded_linear(attn.q_b_proj)
+                attn.g_proj = self.all_to_sharded_linear(attn.g_proj)
+                attn.o_proj = self.sharded_to_all_linear(attn.o_proj)
+                attn.num_heads = H // N
+
+                num_heads = attn.num_heads
+                sh = rank * num_heads
+                eh = sh + num_heads
+
+                def shard_heads(w: mx.array, sh: int = sh, eh: int = eh) -> mx.array:
+                    return w[sh:eh]
+
+                attn.embed_q.apply(shard_heads)
+                attn.unembed_out.apply(shard_heads)
+
+            # ---------------- FFN ----------------
+            if getattr(layer, "is_moe", False):
+                moe = layer.block_sparse_moe
+                gate_mode_before = getattr(moe.switch_mlp.gate_proj, "mode", None)
+
+                self.all_to_sharded_linear_in_place(moe.switch_mlp.gate_proj)
+                self.all_to_sharded_linear_in_place(moe.switch_mlp.up_proj)
+                # partial latent, БЕЗ внутреннего collective (INV#11)
+                self.sharded_to_all_linear_in_place(moe.switch_mlp.down_proj)
+
+                if moe.shared_experts is not None:
+                    self.all_to_sharded_linear_in_place(moe.shared_experts.gate_proj)
+                    self.all_to_sharded_linear_in_place(moe.shared_experts.up_proj)
+                    self.sharded_to_all_linear_in_place(moe.shared_experts.down_proj)
+
+                # router / latent down / norm / up — replicated: НЕ трогаем.
+                moe.sharding_group = self.group  # collectives живут в MoE.__call__
+
+                gate_mode_after = getattr(moe.switch_mlp.gate_proj, "mode", None)
+                assert gate_mode_before == gate_mode_after, (
+                    f"quant mode lost in sharding: {gate_mode_before} -> "
+                    f"{gate_mode_after} (INV#7)"
+                )
+            elif layer.mlp is not None:
+                layer.mlp.gate_proj = self.all_to_sharded_linear(layer.mlp.gate_proj)
+                layer.mlp.up_proj = self.all_to_sharded_linear(layer.mlp.up_proj)
+                layer.mlp.down_proj = self.sharded_to_all_linear(layer.mlp.down_proj)
+
+            mx.eval(layer)
+            mx.clear_cache()
+            yield ModelLoadingResponse(layers_loaded=i, total=total)
+        return model
+
 
 class ShardedDsaIndexer(CustomMlxLayer):
     """Tensor-sharded GLM/DeepSeek DSA indexer.
