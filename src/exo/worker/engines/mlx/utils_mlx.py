@@ -319,7 +319,14 @@ def get_eos_token_ids_for_model(model_id: ModelId) -> list[int] | None:
         List of EOS token IDs, or None if the model uses standard tokenizer config
     """
     model_id_lower = model_id.lower()
-    if "kimi-k2" in model_id_lower:
+    if "kimi-k3" in model_id_lower:
+        # K3 vocab = 163840 (тот же токенайзер-род, что K2). 163586 = <|im_end|>
+        # семейства Kimi. ОБЯЗАТЕЛЬНО сверить с generation_config.json реального
+        # чекпоинта на A0 (P0-063) и поправить здесь при расхождении.
+        # model_id конвертированного репо ОБЯЗАН содержать "kimi-k3" —
+        # иначе эта ветка не сработает (грабля класса glm-5).
+        return [163586]
+    elif "kimi-k2" in model_id_lower:
         return [163586]
     elif "glm-5" in model_id_lower:
         # 154820: <|endoftext|>, 154827: <|user|>, 154829: <|observation|>
