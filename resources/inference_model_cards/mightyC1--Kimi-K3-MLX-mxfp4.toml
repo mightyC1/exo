@@ -1,0 +1,37 @@
+# Kimi K3 — конвертированный чекпоинт (native MXFP4 routed experts, bf16 rest).
+# model_id ОБЯЗАН содержать "kimi-k3" (EOS-ветка в utils_mlx матчит по подстроке).
+# ЗАПРЕЩЕНО грузить официальный moonshotai/Kimi-K3 напрямую (compressed-tensors
+# -> affine баг пина, план §6.2): только offline-конвертированный репозиторий
+# с mode="mxfp4"/gs32 в quant-конфиге.
+model_id = "mightyC1/Kimi-K3-MLX-mxfp4"
+n_layers = 93
+hidden_size = 7168
+# MLA: compressed-KV один на все головы; поле оставлено = числу attention-голов
+num_key_value_heads = 96
+supports_tensor = true
+tasks = ["TextGeneration"]
+family = "kimi"
+quantization = "mxfp4"
+base_model = "Kimi K3"
+# K3 ModelCard invariant (план §12): thinking always-on, БЕЗ thinking_toggle —
+# регулируется только reasoning_effort low/high/max (default max).
+capabilities = ["text", "thinking"]
+
+# v1 DoD = стабильные 128K (chunked prefill); 1M — P2. Поднять после P0-056.
+context_length = 131072
+backends = ["MlxMetal"]
+
+# ~1.561 TB официального чекпоинта; converted-размер уточнить после B2
+# (byte-preserving repack экспертов + bf16 остальное => близко к исходному).
+[storage_size]
+in_bytes = 1561000000000
+
+# Официальные рекомендации K3 (HF-карточка, подтверждено 28.07.2026):
+# temperature=1.0; top_p=0.95 single-step / 1.0 agentic. Дефолт карточки —
+# single-step профиль; agentic override — через API per-request (P0-065).
+[sampling_defaults]
+temperature = 1.0
+top_p = 0.95
+
+# reasoning_dialect: определить по фактическому chat_template + parser-тесту
+# (P0-060/P0-063); "suffix" из K2.6 НЕ копировать автоматически.
