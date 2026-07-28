@@ -37,6 +37,16 @@ def register_custom_models() -> None:
     sys.modules["mlx_lm.models.mimo_v2"] = _mimo
     setattr(_mlx_models, "mimo_v2", _mimo)
 
+    # Kimi K3 (model_type=kimi_k3): same vendor+register pattern. Официальный
+    # конфиг nested (kimi_k3 -> text_config) — обрабатывается в
+    # kimi_k3.ModelArgs.from_dict. auto_parallel импортирует ЭТОТ ЖЕ модуль
+    # (isinstance в selector'е совпадает). TP-контракт LatentMoE — в докстринге
+    # KimiK3LatentMoE; sharding-strategy: KimiK3ShardingStrategy.
+    from exo.worker.engines.mlx.vendor import kimi_k3 as _k3
+
+    sys.modules["mlx_lm.models.kimi_k3"] = _k3
+    setattr(_mlx_models, "kimi_k3", _k3)
+
     # 2) prefer <mm:think> over <think> for M3 (replaces the tokenizer_utils
     #    edit). M3 vocab has both pairs but emits <mm:think>; upstream picks
     #    <think> first. Other models fall through to the original detector.
