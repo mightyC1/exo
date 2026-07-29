@@ -122,9 +122,9 @@ def test_alog_semantics_paths_run(semantics, monkeypatch):
 
 def test_remap_roundtrip_from_hf_names(monkeypatch):
     """Синтетический чекпоинт с ОФИЦИАЛЬНЫМИ именами (language_model.*,
-    conv1d [C,1,K], A_log [head_dim] с паддингом, пер-экспертные w1/w2/w3,
-    fused kv_b, vision-мусор) -> remap -> strict load -> forward finite."""
-    monkeypatch.setenv("EXO_K3_ALOG_SEMANTICS", "per_head")
+    conv1d [C,1,K], A_log [head_dim] как в реальном K3, пер-экспертные
+    w1/w2/w3, fused kv_b, vision-мусор) -> remap -> strict load -> forward."""
+    monkeypatch.delenv("EXO_K3_ALOG_SEMANTICS", raising=False)  # auto
     k3 = _load_module()
     args, model = _build(k3)
 
@@ -158,8 +158,8 @@ def test_remap_roundtrip_from_hf_names(monkeypatch):
             ckpt[name] = w.moveaxis(1, 2)  # mlx [C,K,1] -> torch [C,1,K]
             continue
         if path.endswith("A_log"):
-            padded = mx.concatenate([w.reshape(-1), mx.zeros((D - H,), dtype=w.dtype)])
-            ckpt[name] = padded  # как в реальном чекпоинте: [head_dim] при H головах
+            assert w.size == D, "auto-режим: A_log должен строиться как [head_dim]"
+            ckpt[name] = w.reshape(-1)  # [head_dim], как в реальном K3
             continue
         ckpt[name] = w
 
@@ -197,3 +197,38 @@ def test_router_deterministic():
     i2, w2 = moe.gate(x)
     assert bool((i1 == i2).all())
     assert float(mx.abs(w1 - w2).max()) == 0.0
+
+
+def test_alog_shape_mismatch_is_loud(monkeypatch):
+    """Форма A_log, не равная ни [num_heads], ни [head_dim] — громкий отказ,
+    молчаливый срез запрещён (P0-008b)."""
+    monkeypatch.delenv("EXO_K3_ALOG_SEMANTICS", raising=False)
+    k3 = _load_module()
+    args, model = _build(k3)
+    with pytest.raises(ValueError):
+        model.sanitize({"model.layers.0.self_attn.A_log": mx.zeros((7,))})
+
+
+def test_kda_gate_matches_canonical_formula(monkeypatch):
+    """decay = exp(max(-exp(A_log)*softplus(a+dt_bias), lower_bound)):
+    сверка с независимо посчитанной формулой + границы (exp(lb), 1]."""
+    monkeypatch.delenv("EXO_K3_ALOG_SEMANTICS", raising=False)
+    k3 = _load_module()
+    H, D, lb = 4, 32, -5.0
+    a = mx.random.normal((2, 3, H, D)) * 3.0
+    A_log = mx.random.normal((D,)) * 0.5
+    dt = mx.random.normal((H * D,)) * 0.5
+
+    got = k3.compute_decay_k3(a, A_log, dt, lb, H, D)
+
+    x = a.astype(mx.float32) + dt.astype(mx.float32).reshape(H, D)
+    sp = mx.log(1.0 + mx.exp(x))
+    ref = mx.exp(mx.maximum(-mx.exp(A_log.astype(mx.float32)).reshape(1, D) * sp, lb))
+    assert float(mx.abs(got - ref).max()) < 1e-5
+    assert float(got.max()) <= 1.0 + 1e-6
+    assert float(got.min()) >= float(mx.exp(mx.array(lb))) - 1e-6
+
+    # без lower_bound форма сводится к kimi_linear compute_g
+    got2 = k3.compute_decay_k3(a, A_log, dt, None, H, D)
+    ref2 = mx.exp(-mx.exp(A_log.astype(mx.float32)).reshape(1, D) * sp)
+    assert float(mx.abs(got2 - ref2).max()) < 1e-5

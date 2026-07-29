@@ -1547,9 +1547,8 @@ class KimiK3ShardingStrategy(TensorParallelShardingStrategy):
     Ownership (план §8.2, ревью v2), 96 -> 96/N голов на rank:
       KDA:  q/k/v_proj a2s; q/k/v conv channel-slice (головы rank'а);
             f_a REPLICATED; f_b a2s; b_proj a2s (rows=heads); g_proj a2s
-            (full-rank, INV#2); A_log: per_head [96] -> head-slice [96/N]
-            (официальный код: Parameter([num_heads]); чекпоинтный [128]
-            режется до [96] в remap), per_channel [128] -> REPLICATED;
+            (full-rank, INV#2); A_log по форме: [96] (per-head) -> head-slice
+            [96/N]; [128] (per-channel, фактическая раскладка K3) -> REPLICATED;
             dt_bias head-slice [12288 -> 12288/N]; o_norm [128] REPLICATED;
             o_proj s2a (collective внутри враппера).
       MLA:  q_a/q_a_norm/kv_a/kv_a_norm REPLICATED; q_b a2s;
@@ -1593,17 +1592,17 @@ class KimiK3ShardingStrategy(TensorParallelShardingStrategy):
                 Hl = H // N
                 ch_s, ch_e = rank * Hl * D, (rank + 1) * Hl * D
 
-                # A_log: семантика решена по официальному коду (P0-008b):
-                # per_head (дефолт) — Parameter([num_heads]) => режем по головам;
-                # per_channel (контрольный эксперимент) — [head_dim] replicated.
-                if K3_ALOG_SEMANTICS == "per_head":
-                    assert attn.A_log.shape == (H,), (
-                        f"A_log {attn.A_log.shape} != ({H},) при per_head"
-                    )
+                # A_log: раскладка по ФОРМЕ (та же логика, что alog_broadcast
+                # в модели, P0-008b). per-head [H] -> head-slice; per-channel
+                # [D] -> replicated. Иные формы — стоп.
+                if attn.A_log.size == H and H != D:
                     attn.A_log = mx.contiguous(attn.A_log[rank * Hl : (rank + 1) * Hl])
+                elif attn.A_log.size == D:
+                    pass  # per-channel: реплицируем
                 else:
-                    assert attn.A_log.shape == (D,), (
-                        f"A_log {attn.A_log.shape} != ({D},) при per_channel"
+                    raise ValueError(
+                        f"A_log {attn.A_log.shape}: ни ({H},) ни ({D},) — "
+                        f"шардинг неопределён (P0-008b)"
                     )
 
                 attn.q_proj = self.all_to_sharded_linear(attn.q_proj)
