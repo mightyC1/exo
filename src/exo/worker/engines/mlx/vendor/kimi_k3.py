@@ -8,8 +8,8 @@
 # База реализации: mlx_lm.models.kimi_linear из пина (та же KDA-семья, parity-
 # проверенный порт) + K3-дельты:
 #   * KDA: full-rank выходной гейт g_proj (вместо g_a/g_b);
-#     decay = exp(lower_bound * sigmoid(exp(A_log) * (f(x) + dt_bias)))
-#     (safe_gate, lower_bound=-5.0) вместо softplus-формы kimi_linear;
+#     decay = exp(max(-exp(A_log)*softplus(f(x)+dt_bias), lower_bound))
+#     (safe_gate = clamp в лог-пространстве, lower_bound=-5.0);
 #     o_norm = RMSNorm(head_dim) с ВЕСОМ * sigmoid(g_proj) (FusedRMSNormGated).
 #   * MLA: q-LoRA (q_a/q_a_ln/q_b), 64-мерный MQA-хвост БЕЗ ротации
 #     (rotary_emb=None в официальном коде; mla_use_nope=True), scale=192^-0.5,
@@ -31,11 +31,11 @@
 #   INV#13 router matmul fp32.
 #   INV#14 SiTU и AttnRes-score в fp32.
 #
-# P0-008b (семантика A_log): чекпоинт хранит [128] при num_heads=96.
-# Официальный код объявляет Parameter([num_heads]) => per-head; llama.cpp
-# (A_log[:96]) прошёл logit-parity 6.7e-05 vs Moonshot. ДЕФОЛТ: per_head со
-# срезом [:96] в remap. EXO_K3_ALOG_SEMANTICS=per_channel оставлен для
-# контрольного parity-эксперимента (A3).
+# P0-008b (семантика A_log): канон fla/официального кода — Parameter([num_heads]),
+# но чекпоинт K3 хранит [head_dim]=[128] при 96 головах. Срез [:96] был бы
+# произвольным искажением, поэтому раскладка выбирается ПО ФОРМЕ (auto):
+# [96] -> per-head, [128] -> per-channel (broadcast по головам).
+# EXO_K3_ALOG_SEMANTICS форсирует режим для A3-эксперимента.
 
 from __future__ import annotations
 
@@ -57,7 +57,7 @@ from mlx_lm.models.gated_delta import gated_delta_ops
 from mlx_lm.models.mla import MultiLinear
 from mlx_lm.models.switch_layers import SwitchGLU
 
-ALOG_SEMANTICS = os.environ.get("EXO_K3_ALOG_SEMANTICS", "per_head")  # per_head|per_channel
+ALOG_SEMANTICS = os.environ.get("EXO_K3_ALOG_SEMANTICS", "auto")  # auto|per_head|per_channel
 DTBIAS_IN_GATE = os.environ.get("EXO_K3_DTBIAS_IN_GATE", "1") == "1"
 
 _logged = False
@@ -67,9 +67,9 @@ def _log_once() -> None:
     global _logged
     if not _logged:
         print(
-            f"[kimi_k3] A_log semantics = {ALOG_SEMANTICS} "
-            f"(per_head = официальный код + llama.cpp parity 6.7e-05), "
-            f"dt_bias_in_gate = {DTBIAS_IN_GATE}"
+            f"[kimi_k3] A_log semantics = {ALOG_SEMANTICS} (auto = по форме "
+            f"чекпоинта: [96]=per-head, [128]=per-channel), "
+            f"dt_bias_in_gate = {DTBIAS_IN_GATE}, gate = softplus+clamp(fla)"
         )
     _logged = True
 
@@ -341,24 +341,62 @@ class ShortConv1d(nn.Module):
         return out, new_state
 
 
+def alog_broadcast(A_log: mx.array, num_heads: int, head_dim: int) -> mx.array:
+    """Раскладка A_log по факту ФОРМЫ в чекпоинте (никаких срезов).
+
+    fla/KDA-канон: A_log = [num_v_heads] (per-head). Чекпоинт K3 хранит
+    [head_dim]=[128] при 96 головах — это НЕ per-head, поэтому форма и решает:
+      size == num_heads  -> [H,1]  (per-head, канон fla)
+      size == head_dim   -> [1,D]  (per-channel, фактическая раскладка K3)
+    EXO_K3_ALOG_SEMANTICS=per_head|per_channel форсирует выбор (A3-эксперимент);
+    при конфликте с формой — громкая ошибка, молча резать нельзя."""
+    n = A_log.size
+    if ALOG_SEMANTICS == "per_head":
+        if n != num_heads:
+            raise ValueError(
+                f"A_log size {n} != num_heads {num_heads}: форс per_head невозможен "
+                f"без произвольного среза (см. P0-008b)"
+            )
+        return A_log.reshape(num_heads, 1)
+    if ALOG_SEMANTICS == "per_channel":
+        if n != head_dim:
+            raise ValueError(f"A_log size {n} != head_dim {head_dim} при per_channel")
+        return A_log.reshape(1, head_dim)
+    # auto: по форме
+    if n == num_heads:
+        return A_log.reshape(num_heads, 1)
+    if n == head_dim:
+        return A_log.reshape(1, head_dim)
+    raise ValueError(
+        f"A_log size {n} не равен ни num_heads {num_heads}, ни head_dim {head_dim}"
+    )
+
+
 def compute_decay_k3(
     a_logits: mx.array,      # [B,T,H,D] = f_b(f_a(x))
-    A_log: mx.array,         # per_head: [H]; per_channel: [D]
+    A_log: mx.array,         # [H] (per-head) или [D] (per-channel)
     dt_bias: mx.array,       # [H*D]
-    lower_bound: float,
+    lower_bound: Optional[float],
     num_heads: int,
     head_dim: int,
 ) -> mx.array:
-    """K3 safe_gate: log_g = lower_bound * sigmoid(exp(A_log) * (a + dt_bias)),
-    decay = exp(log_g) in (exp(lb), 1). Всё в fp32."""
+    """KDA forget-gate, каноническая форма (fla KimiDeltaAttention + fused-кернел
+    пина mlx_lm.gated_delta):
+
+        log_g = -exp(A_log) * softplus(a + dt_bias)
+        log_g = max(log_g, lower_bound)      # safe_gate: clamp в лог-пространстве
+        decay = exp(log_g)
+
+    Всё в fp32. Источники: fla 0.5.2 fla/layers/kda.py (docstring гейта +
+    описание lower_bound как clamp) и Metal-кернел пина
+    (neg_exp_A * softplus(a + dt_bias))."""
     x = a_logits.astype(mx.float32)
     if DTBIAS_IN_GATE:
         x = x + dt_bias.astype(mx.float32).reshape(num_heads, head_dim)
-    if ALOG_SEMANTICS == "per_head":
-        A = mx.exp(A_log.astype(mx.float32)).reshape(num_heads, 1)
-    else:  # per_channel (контрольный эксперимент P0-008b)
-        A = mx.exp(A_log.astype(mx.float32)).reshape(1, head_dim)
-    log_g = lower_bound * mx.sigmoid(A * x)
+    A = mx.exp(alog_broadcast(A_log.astype(mx.float32), num_heads, head_dim))
+    log_g = -A * mx.logaddexp(x, mx.zeros_like(x))  # softplus, устойчивый
+    if lower_bound is not None:
+        log_g = mx.maximum(log_g, lower_bound)
     return mx.exp(log_g)
 
 
@@ -391,10 +429,12 @@ class KimiK3DeltaAttention(nn.Module):
         self.b_proj = nn.Linear(hidden, self.num_heads, bias=False)
         self.g_proj = nn.Linear(hidden, self.projection_dim, bias=False)  # INV#2
 
-        if ALOG_SEMANTICS == "per_head":
-            self.A_log = mx.zeros((self.num_heads,), dtype=mx.float32)
-        else:
-            self.A_log = mx.zeros((self.head_dim,), dtype=mx.float32)
+        # Форма инициализации = ожидаемая форма чекпоинта. auto/per_channel ->
+        # [head_dim] (раскладка K3), per_head -> [num_heads] (канон fla).
+        self.A_log = mx.zeros(
+            (self.num_heads,) if ALOG_SEMANTICS == "per_head" else (self.head_dim,),
+            dtype=mx.float32,
+        )
         self.dt_bias = mx.zeros((self.projection_dim,), dtype=mx.float32)
 
         self.o_norm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
@@ -752,22 +792,14 @@ def remap_checkpoint(
                     v = v.moveaxis(2, 1)  # torch [C,1,K] -> mlx [C,K,1]
                 break
         if k.endswith("A_log"):
-            n = v.reshape(-1).shape[0]
+            # НИКАКИХ срезов: форма чекпоинта — источник истины, раскладку
+            # решает alog_broadcast() в рантайме (P0-008b).
             H, D = args.kda_num_heads, args.kda_head_dim
-            if ALOG_SEMANTICS == "per_head":
-                if n == D and n != H:
-                    # Чекпоинт хранит [128] при 96 головах; официальный код
-                    # объявляет Parameter([num_heads]) => срез [:H]
-                    # (llama.cpp-parity 6.7e-05). P0-008b: контроль per_channel.
-                    v = v.reshape(-1)[:H]
-                elif n != H:
-                    raise ValueError(f"kimi_k3: неожиданная форма A_log {v.shape}")
-                else:
-                    v = v.reshape(-1)
-            else:
-                if n < D:
-                    raise ValueError(f"kimi_k3: A_log {v.shape} < head_dim при per_channel")
-                v = v.reshape(-1)[:D]
+            v = v.reshape(-1)
+            if v.shape[0] not in (H, D):
+                raise ValueError(
+                    f"kimi_k3: A_log {v.shape} не равен ни ({H},), ни ({D},)"
+                )
         if k.endswith("dt_bias") and v.ndim > 1:
             v = v.reshape(-1)
         out[k] = v
