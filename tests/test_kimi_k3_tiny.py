@@ -1,21 +1,10 @@
-"""Tiny Kimi K3 smoke (A3-подготовка, план §7.3).
-
-Запускается на ноде с mlx (НЕ в CI без Metal):
-  cd ~/Desktop/ai/exo && .venv/bin/python -m pytest tests/test_kimi_k3_tiny.py -x -q
-
-Проверяет на tiny-конфиге (13 слоёв, hidden 256, 4 головы — кратно TP4):
-  - модель строится из nested config (text_config), forward без NaN;
-  - prefill+decode с hybrid cache (ArraysCache для KDA / KVCache для MLA);
-  - chunked prefill == single-shot (INV#6/A4, tolerances bf16);
-  - AttnRes boundary на слое 12 (block 0 = 0..11, block 1 = 12) не ломает shapes;
-  - обе A_log-семантики выполняются (численный вердикт — P0-008b, не здесь);
-  - SwitchGLU top-2 роутинг детерминирован (fp32 router).
-
-Это smoke, НЕ parity: parity-референс (pure-torch KDA / llama.cpp CPU) — A3.
-"""
+# Tiny smoke для vendor/kimi_k3.py (K3-семантика по официальному modeling_kimi_linear).
+# Запуск на ноде: .venv/bin/python -m pytest tests/test_kimi_k3_tiny.py -x -q
+# (в контейнере/CI: из /tmp, мимо conftest exo_tools)
 
 from __future__ import annotations
 
+import importlib
 import os
 
 import pytest
@@ -23,134 +12,188 @@ import pytest
 mx = pytest.importorskip("mlx.core")
 
 import mlx.core as mx  # noqa: E402
+import mlx.utils as mu  # noqa: E402
 
 
-TINY_CFG = {
-    "model_type": "kimi_k3",
-    "text_config": {
-        "model_type": "kimi_k3",
-        "vocab_size": 512,
-        "hidden_size": 256,
-        "num_hidden_layers": 13,
-        "num_attention_heads": 4,
-        "head_dim": 64,
-        "intermediate_size": 512,
-        "rms_norm_eps": 1e-6,
-        "tie_word_embeddings": False,
-        # KDA на 1-based слоях: все, кроме MLA {4, 8, 12, 13}
-        "linear_attn_config": {
-            "kda_layers": [1, 2, 3, 5, 6, 7, 9, 10, 11],
-            "num_heads": 4,
-            "head_dim": 64,
-            "short_conv_kernel_size": 4,
-            "use_full_rank_gate": True,
-            "gate_lower_bound": -5.0,
-        },
-        "q_lora_rank": 64,
-        "kv_lora_rank": 64,
-        "qk_nope_head_dim": 64,
-        "qk_rope_head_dim": 0,
-        "v_head_dim": 64,
-        "num_experts": 8,
-        "num_experts_per_token": 2,
-        "num_shared_experts": 1,
-        "moe_intermediate_size": 64,
-        "moe_latent_dim": 128,
-        "first_k_dense_replace": 1,
-        "attn_res_block_size": 12,
-        "situ_beta": 4.0,
-        "situ_linear_beta": 25.0,
+TINY_TEXT = {
+    "model_type": "kimi_linear",
+    "vocab_size": 256,
+    "hidden_size": 128,
+    "num_hidden_layers": 13,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 4,
+    "intermediate_size": 192,
+    "hidden_act": "situ",
+    "rms_norm_eps": 1e-5,
+    "max_position_embeddings": 4096,
+    "q_lora_rank": 64,
+    "kv_lora_rank": 32,
+    "qk_nope_head_dim": 32,
+    "qk_rope_head_dim": 16,
+    "v_head_dim": 32,
+    "mla_use_nope": True,
+    "mla_use_output_gate": True,
+    "num_experts": 8,
+    "num_experts_per_token": 2,
+    "num_shared_experts": 1,
+    "moe_intermediate_size": 64,
+    "routed_expert_hidden_size": 96,
+    "latent_moe_use_norm": True,
+    "moe_router_activation_func": "sigmoid",
+    "moe_renormalize": True,
+    "routed_scaling_factor": 1.0,
+    "first_k_dense_replace": 1,
+    "moe_layer_freq": 1,
+    "num_expert_group": 1,
+    "topk_group": 1,
+    "topk_method": "noaux_tc",
+    "activation_situ_beta": 4.0,
+    "activation_situ_linear_beta": 25.0,
+    "attn_res_block_size": 4,
+    "tie_word_embeddings": False,
+    "linear_attn_config": {
+        "kda_layers": [1, 2, 3, 5, 6, 7, 9, 10, 11],
+        "full_attn_layers": [4, 8, 12, 13],
+        "head_dim": 32,
+        "num_heads": 4,
+        "gate_lower_bound": -5.0,
+        "short_conv_kernel_size": 4,
+        "use_full_rank_gate": True,
     },
 }
+TINY_CFG = {"model_type": "kimi_k3", "text_config": TINY_TEXT}
 
 
-def _build():
-    from exo.worker.engines.mlx.vendor.custom_models import register_custom_models
+def _load_module():
+    import exo.worker.engines.mlx.vendor.kimi_k3 as k3
+    return importlib.reload(k3)
 
-    register_custom_models()
-    from exo.worker.engines.mlx.vendor.kimi_k3 import Model, ModelArgs
 
-    args = ModelArgs.from_dict(TINY_CFG)
-    model = Model(args)
-    # random init всех параметров детерминированно
-    mx.random.seed(0)
-
-    def init(p):
-        return mx.random.normal(p.shape).astype(p.dtype) * 0.02
-
-    model.update(model.parameters())  # materialize tree
-    import mlx.utils as mu
-
-    flat = dict(mu.tree_flatten(model.parameters()))
-    model.update(mu.tree_unflatten([(k, init(v)) for k, v in flat.items()]))
+def _build(k3):
+    args = k3.ModelArgs.from_dict(TINY_CFG)
+    model = k3.Model(args)
     mx.eval(model.parameters())
-    return model, args
+    return args, model
 
 
 def test_forward_and_cache():
-    model, args = _build()
-    B, T = 1, 33
-    tokens = mx.random.randint(0, args.vocab_size, (B, T))
+    k3 = _load_module()
+    args, model = _build(k3)
+    x = mx.array([[1, 2, 3, 4, 5, 6, 7]])
+    out = model(x)
+    assert out.shape == (1, 7, TINY_TEXT["vocab_size"])
+    assert bool(mx.isfinite(out).all())
 
-    # single-shot prefill
-    logits = model(tokens)
-    mx.eval(logits)
-    assert logits.shape == (B, T, args.vocab_size)
-    assert bool(mx.all(mx.isfinite(logits.astype(mx.float32))))
-
-    # prefill + 4 decode-шага c hybrid cache
     cache = model.make_cache()
-    out = model(tokens, cache=cache)
-    mx.eval(out)
-    step = tokens[:, -1:]
-    for _ in range(4):
-        out = model(step, cache=cache)
-        mx.eval(out)
-        assert out.shape == (B, 1, args.vocab_size)
-        assert bool(mx.all(mx.isfinite(out.astype(mx.float32))))
-        step = mx.argmax(out[:, -1:, :], axis=-1)
+    out = model(x, cache=cache)
+    assert bool(mx.isfinite(out).all())
+    for step in range(4):
+        out = model(mx.array([[9 + step]]), cache=cache)
+        assert out.shape[1] == 1
+        assert bool(mx.isfinite(out).all())
 
 
 def test_chunked_prefill_matches_single_shot():
-    model, args = _build()
-    B, T, chunk = 1, 32, 8
-    tokens = mx.random.randint(0, args.vocab_size, (B, T))
+    k3 = _load_module()
+    args, model = _build(k3)
+    toks = mx.array([[3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5, 8]])
 
-    single = model(tokens)
-    mx.eval(single)
-    last_single = single[:, -1, :].astype(mx.float32)
+    ref = model(toks)[:, -1]
 
     cache = model.make_cache()
-    out = None
-    for s in range(0, T, chunk):
-        out = model(tokens[:, s : s + chunk], cache=cache)
-        mx.eval(out)
-    last_chunked = out[:, -1, :].astype(mx.float32)
+    for s in range(0, toks.shape[1], 4):
+        out = model(toks[:, s : s + 4], cache=cache)
+    got = out[:, -1]
 
-    diff = mx.abs(last_single - last_chunked)
-    max_abs = float(mx.max(diff))
-    denom = float(mx.max(mx.abs(last_single))) + 1e-9
-    rel = max_abs / denom
-    # bf16-накопление: порог утверждается на A3/A4; здесь smoke-допуск
-    assert rel < 5e-2, f"chunked != single-shot: max_abs={max_abs}, rel={rel}"
+    denom = float(mx.abs(ref).max()) or 1.0
+    rel = float(mx.abs(got - ref).max()) / denom
+    assert rel < 5e-2, f"chunked vs single rel={rel}"
 
 
 @pytest.mark.parametrize("semantics", ["per_head", "per_channel"])
-def test_alog_semantics_both_run(semantics, monkeypatch):
-    # обе интерпретации ДОЛЖНЫ выполняться; какая верна — решает P0-008b
-    import exo.worker.engines.mlx.vendor.kimi_k3 as k3
-
-    monkeypatch.setattr(k3, "ALOG_SEMANTICS", semantics)
-    model, args = _build()
-    logits = model(mx.random.randint(0, args.vocab_size, (1, 9)))
-    mx.eval(logits)
-    assert bool(mx.all(mx.isfinite(logits.astype(mx.float32))))
+def test_alog_semantics_paths_run(semantics, monkeypatch):
+    monkeypatch.setenv("EXO_K3_ALOG_SEMANTICS", semantics)
+    k3 = _load_module()
+    assert k3.ALOG_SEMANTICS == semantics
+    args, model = _build(k3)
+    out = model(mx.array([[1, 2, 3]]))
+    assert bool(mx.isfinite(out).all())
 
 
-def test_router_fp32_deterministic():
-    model, args = _build()
-    x = mx.random.randint(0, args.vocab_size, (1, 17))
-    a = model(x)
-    b = model(x)
-    mx.eval(a, b)
-    assert bool(mx.all(a == b)), "router/top-k недетерминирован при одинаковом входе"
+def test_remap_roundtrip_from_hf_names(monkeypatch):
+    """Синтетический чекпоинт с ОФИЦИАЛЬНЫМИ именами (language_model.*,
+    conv1d [C,1,K], A_log [head_dim] с паддингом, пер-экспертные w1/w2/w3,
+    fused kv_b, vision-мусор) -> remap -> strict load -> forward finite."""
+    monkeypatch.setenv("EXO_K3_ALOG_SEMANTICS", "per_head")
+    k3 = _load_module()
+    args, model = _build(k3)
+
+    H = args.kda_num_heads
+    D = args.kda_head_dim
+    nope, vh = args.qk_nope_head_dim, args.v_head_dim
+    heads = args.num_attention_heads
+    lat = args.routed_expert_hidden_size
+
+    ckpt = {"vision_tower.encoder.layers.0.fc.weight": mx.zeros((4, 4))}
+    for path, w in mu.tree_flatten(model.parameters()):
+        name = "language_model." + path
+        if ".switch_mlp." in path:
+            li = path.split(".")[2]
+            src = {"gate_proj": "w1", "up_proj": "w3", "down_proj": "w2"}[
+                path.split(".")[-2]
+            ]
+            for e in range(args.num_experts):
+                ckpt[
+                    f"language_model.model.layers.{li}.block_sparse_moe.experts.{e}.{src}.weight"
+                ] = w[e]
+            continue
+        if path.endswith("embed_q.weight") or path.endswith("unembed_out.weight"):
+            continue  # соберём fused kv_b ниже
+        if ".conv.weight" in path:
+            name = "language_model." + path.replace(
+                "q_conv.conv.weight", "q_conv1d.weight"
+            ).replace("k_conv.conv.weight", "k_conv1d.weight").replace(
+                "v_conv.conv.weight", "v_conv1d.weight"
+            )
+            ckpt[name] = w.moveaxis(1, 2)  # mlx [C,K,1] -> torch [C,1,K]
+            continue
+        if path.endswith("A_log"):
+            padded = mx.concatenate([w.reshape(-1), mx.zeros((D - H,), dtype=w.dtype)])
+            ckpt[name] = padded  # как в реальном чекпоинте: [head_dim] при H головах
+            continue
+        ckpt[name] = w
+
+    # fused kv_b из embed_q/unembed_out
+    params = dict(mu.tree_flatten(model.parameters()))
+    for li, layer in enumerate(model.layers):
+        if layer.is_linear:
+            continue
+        ap = f"model.layers.{li}.self_attn"
+        wk = params[f"{ap}.embed_q.weight"]      # [H, lat, nope]
+        wv = params[f"{ap}.unembed_out.weight"]  # [H, vh, lat]
+        fused = mx.concatenate([wk.swapaxes(-1, -2), wv], axis=1)  # [H, nope+vh, lat]
+        ckpt["language_model." + ap + ".kv_b_proj.weight"] = fused.reshape(
+            heads * (nope + vh), -1
+        )
+
+    remapped = model.sanitize(ckpt)
+    assert not any("vision_tower" in k for k in remapped)
+    model.load_weights(list(remapped.items()), strict=True)
+    out = model(mx.array([[1, 2, 3, 4]]))
+    assert bool(mx.isfinite(out).all())
+
+
+def test_router_deterministic():
+    k3 = _load_module()
+    args, model = _build(k3)
+    moe = None
+    for layer in model.layers:
+        if getattr(layer, "is_moe", False):
+            moe = layer.block_sparse_moe
+            break
+    assert moe is not None
+    x = mx.random.normal((2, 5, args.hidden_size)).astype(mx.bfloat16)
+    i1, w1 = moe.gate(x)
+    i2, w2 = moe.gate(x)
+    assert bool((i1 == i2).all())
+    assert float(mx.abs(w1 - w2).max()) == 0.0
