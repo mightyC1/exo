@@ -42,6 +42,7 @@ from mlx_lm.models.minimax import MiniMaxAttention
 from mlx_lm.models.minimax import Model as MiniMaxModel
 from exo.worker.engines.mlx.vendor.minimax_m3_vl import Model as MiniMaxM3Model
 from exo.worker.engines.mlx.vendor.kimi_k3 import (
+    ALOG_SEMANTICS as K3_ALOG_SEMANTICS,
     Model as KimiK3Model,
     ShortConv1d as KimiK3ShortConv1d,
 )
@@ -1546,13 +1547,16 @@ class KimiK3ShardingStrategy(TensorParallelShardingStrategy):
     Ownership (план §8.2, ревью v2), 96 -> 96/N голов на rank:
       KDA:  q/k/v_proj a2s; q/k/v conv channel-slice (головы rank'а);
             f_a REPLICATED; f_b a2s; b_proj a2s (rows=heads); g_proj a2s
-            (full-rank, INV#2); A_log [128] REPLICATED (INV#1 — НИКОГДА не
-            режется, семантика per_head/per_channel решается в runtime модели);
-            dt_bias head-slice [12288 -> 12288/N]; o_norm REPLICATED;
-            o_proj s2a (internal all_sum).
+            (full-rank, INV#2); A_log: per_head [96] -> head-slice [96/N]
+            (официальный код: Parameter([num_heads]); чекпоинтный [128]
+            режется до [96] в remap), per_channel [128] -> REPLICATED;
+            dt_bias head-slice [12288 -> 12288/N]; o_norm [128] REPLICATED;
+            o_proj s2a (collective внутри враппера).
       MLA:  q_a/q_a_norm/kv_a/kv_a_norm REPLICATED; q_b a2s;
             embed_q/unembed_out head-slice (.apply); g_proj (out gate) a2s;
-            o_proj s2a; num_heads //= N. NoPE — rope-веток нет.
+            o_proj s2a; num_heads //= N. 64-хвост: q_pe локальных голов из
+            q_b-шарда, k_pe (MQA, 1 голова) реплицирован из kv_a — ротации
+            нет (официально rotary_emb=None).
       MoE (KimiK3LatentMoE, INV#3/#11/#12): router+bias, latent down/norm/up —
             REPLICATED (не трогаем); switch_mlp gate/up in-place a2s
             (intermediate 3072 -> 3072/N, кратно quant-группе 32);
@@ -1589,10 +1593,18 @@ class KimiK3ShardingStrategy(TensorParallelShardingStrategy):
                 Hl = H // N
                 ch_s, ch_e = rank * Hl * D, (rank + 1) * Hl * D
 
-                # A_log: INV#1 — replicated, только assert формы
-                assert attn.A_log.shape == (D,), (
-                    f"A_log shape {attn.A_log.shape} != ({D},) — INV#1 violated"
-                )
+                # A_log: семантика решена по официальному коду (P0-008b):
+                # per_head (дефолт) — Parameter([num_heads]) => режем по головам;
+                # per_channel (контрольный эксперимент) — [head_dim] replicated.
+                if K3_ALOG_SEMANTICS == "per_head":
+                    assert attn.A_log.shape == (H,), (
+                        f"A_log {attn.A_log.shape} != ({H},) при per_head"
+                    )
+                    attn.A_log = mx.contiguous(attn.A_log[rank * Hl : (rank + 1) * Hl])
+                else:
+                    assert attn.A_log.shape == (D,), (
+                        f"A_log {attn.A_log.shape} != ({D},) при per_channel"
+                    )
 
                 attn.q_proj = self.all_to_sharded_linear(attn.q_proj)
                 attn.k_proj = self.all_to_sharded_linear(attn.k_proj)
@@ -1622,7 +1634,8 @@ class KimiK3ShardingStrategy(TensorParallelShardingStrategy):
                 H = attn.num_heads
                 assert H % N == 0, f"MLA heads {H} % world {N} != 0"
                 attn.q_b_proj = self.all_to_sharded_linear(attn.q_b_proj)
-                attn.g_proj = self.all_to_sharded_linear(attn.g_proj)
+                if getattr(attn, "use_output_gate", False):
+                    attn.g_proj = self.all_to_sharded_linear(attn.g_proj)
                 attn.o_proj = self.sharded_to_all_linear(attn.o_proj)
                 attn.num_heads = H // N
 
@@ -1659,7 +1672,7 @@ class KimiK3ShardingStrategy(TensorParallelShardingStrategy):
                     f"quant mode lost in sharding: {gate_mode_before} -> "
                     f"{gate_mode_after} (INV#7)"
                 )
-            elif layer.mlp is not None:
+            elif getattr(layer, "mlp", None) is not None:
                 layer.mlp.gate_proj = self.all_to_sharded_linear(layer.mlp.gate_proj)
                 layer.mlp.up_proj = self.all_to_sharded_linear(layer.mlp.up_proj)
                 layer.mlp.down_proj = self.sharded_to_all_linear(layer.mlp.down_proj)
