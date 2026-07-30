@@ -1538,45 +1538,46 @@ class MiniMaxM3ShardingStrategy(TensorParallelShardingStrategy):
 
 
 class KimiK3ShardingStrategy(TensorParallelShardingStrategy):
-    """Kimi K3 TP: делегирование в Model.shard(group) из апстримного mlx-lm
-    PR #1626 (vendored). shard() сам покрывает: KDA (fused qkv a2s segments=3,
-    conv per-head slice, A_log/dt_bias head-slice, f_b/b/g a2s, o_proj s2a),
-    MLA (q_b/g a2s, o_proj s2a, embed_q/unembed_out head-slice), MoE
-    (switch_mlp/shared in-place + mlp.sharding_group=group -> all_sum в
-    __call__), dense mlp a2s/s2a. Здесь остаётся EXO-контракт: пред-eval
-    слоёв (анти-FAST_SYNCH-deadlock), прогресс per-layer, сверка
-    квант-классов до/после (INV#7)."""
+    """Kimi K3 TP: ПОСЛОЙНОЕ делегирование в vendored Model.shard() (mlx-lm
+    PR #1626). shard() у апстрима — чистый per-layer цикл без model-level
+    хвоста (embed/lm_head/output_res реплицируются), поэтому зовём его через
+    однослойный шим: нулевой дрейф транскрипции + канонический memory-паттерн
+    eval -> shard -> eval per layer (полные тензоры слоя транзиентны; иначе
+    каждый ранг материализует все ~1.42TiB до первого среза — OOM)."""
+
+    class _OneLayerShim:
+        def __init__(self, layer: nn.Module):
+            self.layers = [layer]
 
     def shard_model(
         self,
         model: nn.Module,
     ) -> Generator[ModelLoadingResponse, None, nn.Module]:
         model = cast(KimiK3Model, model)
+        shard_fn = type(model).shard  # body использует только self.layers
         total = len(model.layers)
-        # Force load weights before sharding to avoid FAST_SYNCH deadlock
-        for i, layer in enumerate(model.layers):
-            mx.eval(layer.parameters())
-            yield ModelLoadingResponse(layers_loaded=i, total=total + 1)
 
-        modes_before = {
+        quant_before = {
             (n, type(m).__name__)
             for n, m in model.named_modules()
             if hasattr(m, "mode")
         }
-        model.shard(self.group)
-        modes_after = {
-            (n, type(m).__name__)
-            for n, m in model.named_modules()
-            if hasattr(m, "mode")
-        }
-        assert modes_before == modes_after, (
-            f"INV#7: квант-классы изменились при шардинге: "
-            f"{modes_before ^ modes_after}"
-        )
-        for layer in model.layers:
+        for i, layer in enumerate(model.layers):
+            # Force load weights before sharding to avoid FAST_SYNCH deadlock
+            mx.eval(layer.parameters())
+            shard_fn(self._OneLayerShim(layer), self.group)
             mx.eval(layer.parameters())
             mx.clear_cache()
-        yield ModelLoadingResponse(layers_loaded=total, total=total + 1)
+            yield ModelLoadingResponse(layers_loaded=i, total=total)
+        quant_after = {
+            (n, type(m).__name__)
+            for n, m in model.named_modules()
+            if hasattr(m, "mode")
+        }
+        assert quant_before == quant_after, (
+            f"INV#7: квант-классы изменились при шардинге: "
+            f"{quant_before ^ quant_after}"
+        )
         return model
 
 class ShardedDsaIndexer(CustomMlxLayer):
