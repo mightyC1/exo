@@ -1,50 +1,29 @@
-# Kimi K3 (moonshotai/Kimi-K3, text-only) — MLX implementation for EXO.
+# Kimi K3 — vendored из АПСТРИМНОГО mlx-lm PR #1626 "Add Kimi K3"
+# (ml-explore/mlx-lm @ 7d505c285b80, via EternaPeptix/mlx-lm k3/exo-support
+#  @ 4f16fb2, найдено Матеем через exo-explore/exo issue #2236).
 #
-# Vendored (vendor+register pattern, как minimax_m3_vl / mimo_v2): регистрируется
-# в sys.modules["mlx_lm.models.kimi_k3"] через custom_models. Пин mlx-lm не трогаем.
+# Замена моего ручного порта на ревьюнутую реализацию. Правки при вендоринге —
+# ТОЛЬКО импорты (relative -> pin mlx_lm.models.*, gated_delta -> локальная
+# копия kimi_k3_gated_delta с параметром lower_bound). Семантика не тронута.
 #
-# ИСТОЧНИК СЕМАНТИКИ: официальный modeling_kimi_linear.py из репозитория
-# moonshotai/Kimi-K3 (auto_map) + шейпы реального чекпоинта (A0/A0.5, 2026-07-29).
-# База реализации: mlx_lm.models.kimi_linear из пина (та же KDA-семья, parity-
-# проверенный порт) + K3-дельты:
-#   * KDA: full-rank выходной гейт g_proj (вместо g_a/g_b);
-#     decay = exp(max(-exp(A_log)*softplus(f(x)+dt_bias), lower_bound))
-#     (safe_gate = clamp в лог-пространстве, lower_bound=-5.0);
-#     o_norm = RMSNorm(head_dim) с ВЕСОМ * sigmoid(g_proj) (FusedRMSNormGated).
-#   * MLA: q-LoRA (q_a/q_a_ln/q_b), 64-мерный MQA-хвост БЕЗ ротации
-#     (rotary_emb=None в официальном коде; mla_use_nope=True), scale=192^-0.5,
-#     выходной гейт sigmoid(g_proj) перед o_proj; absorbed-кэш: latent 512 + хвост 64.
-#   * LatentMoE: down(7168->3584) -> 896 экспертов (SwitchGLU в латенте, SiTU)
-#     -> weighted sum -> [all_sum] -> RMSNorm(3584) -> up(3584->7168); shared
-#     (2x3072=6144) на полном hidden. Роутер: fp32 matmul, sigmoid, выбор по
-#     scores+e_score_correction_bias, ВЕСА из сырых scores, renorm(+1e-20).
-#   * AttnRes: softmax-аттеншен по снапшотам резидуал-стрима. Снапшоты на
-#     0-based слоях i%12==0 (стрим РЕБЕЙЗИТСЯ); на каждом слое два применения
-#     (перед attention при наличии снапшотов и перед MLP), финальное — перед
-#     model.norm. score = <v/rms(v), norm.w*proj.w>, softmax, mix сырых v (fp32).
-#   * SiTU: b*tanh(gate/b)*sigmoid(gate) * lb*tanh(up/lb), fp32 (b=4.0, lb=25.0).
-#
-# ИНВАРИАНТЫ:
-#   INV#2  full-rank g_proj (g_a/g_b отсутствуют) — подтверждено A0.
-#   INV#3/#11  ровно один routed all_sum ДО routed RMSNorm.
-#   INV#12 fp32 вокруг distributed all_sum (fused concat: latent+shared).
-#   INV#13 router matmul fp32.
-#   INV#14 SiTU и AttnRes-score в fp32.
-#
-# P0-008b (семантика A_log): канон fla/официального кода — Parameter([num_heads]),
-# но чекпоинт K3 хранит [head_dim]=[128] при 96 головах. Срез [:96] был бы
-# произвольным искажением, поэтому раскладка выбирается ПО ФОРМЕ (auto):
-# [96] -> per-head, [128] -> per-channel (broadcast по головам).
-# EXO_K3_ALOG_SEMANTICS форсирует режим для A3-эксперимента.
+# Что даёт относительно ручного порта: fused qkv+conv в KDA, инкрементальный
+# AttnRes (ResidualBlocks: raw+inv_rms) + Metal-кернел, gated_delta-кернел с
+# lower_bound (быстрый prefill), sanitize понимает И официальный
+# moonshotai-чекпоинт (view-репак mxfp4 на загрузке), И наш конвертированный
+# (switch_mlp.* passthrough), Model.shard(group) для любого TP N.
+# A_log: per-head, срез [:num_heads] в sanitize (консенсус: официальный
+# torch-код + llama.cpp parity 6.7e-05 + апстрим-ревью). Гейт:
+# compute_g_safe = exp(lb * sigmoid(exp(A_log) * (a + dt_bias))).
+# Copyright © 2026 Apple Inc.
 
-from __future__ import annotations
-
-import os
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+import re
+from dataclasses import dataclass
+from functools import partial
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
 from mlx_lm.models.base import (
     BaseModelArgs,
@@ -53,392 +32,439 @@ from mlx_lm.models.base import (
     scaled_dot_product_attention,
 )
 from mlx_lm.models.cache import ArraysCache, KVCache
-from mlx_lm.models.gated_delta import gated_delta_ops
+from exo.worker.engines.mlx.vendor.kimi_k3_gated_delta import gated_delta_update
+from mlx_lm.models.kimi_linear import ShortConv1d
 from mlx_lm.models.mla import MultiLinear
 from mlx_lm.models.switch_layers import SwitchGLU
 
-ALOG_SEMANTICS = os.environ.get("EXO_K3_ALOG_SEMANTICS", "auto")  # auto|per_head|per_channel
-DTBIAS_IN_GATE = os.environ.get("EXO_K3_DTBIAS_IN_GATE", "1") == "1"
 
-_logged = False
+@mx.compile
+def _group_expert_select(
+    gates: mx.array,
+    bias: Optional[mx.array],
+    top_k: int,
+    n_group: int,
+    topk_group: int,
+    routed_scaling_factor: float,
+    renormalize: bool,
+) -> Tuple[mx.array, mx.array]:
+    in_type = gates.dtype
+    scores = mx.sigmoid(gates.astype(mx.float32))
+    orig_scores = scores
+    if bias is not None:
+        scores = scores + bias.astype(scores.dtype)
 
-
-def _log_once() -> None:
-    global _logged
-    if not _logged:
-        print(
-            f"[kimi_k3] A_log semantics = {ALOG_SEMANTICS} (auto = по форме "
-            f"чекпоинта: [96]=per-head, [128]=per-channel), "
-            f"dt_bias_in_gate = {DTBIAS_IN_GATE}, gate = softplus+clamp(fla)"
+    if n_group > 1:
+        scores = mx.unflatten(scores, axis=-1, shape=(n_group, -1))
+        group_scores = mx.topk(scores, 2, axis=-1).sum(axis=-1, keepdims=True)
+        k = n_group - topk_group
+        group_idx = mx.argpartition(group_scores, kth=k - 1, axis=-2)[..., :k, :]
+        scores = mx.put_along_axis(
+            scores,
+            mx.stop_gradient(group_idx),
+            mx.array(0.0, dtype=scores.dtype),
+            axis=-2,
         )
-    _logged = True
+        scores = mx.flatten(scores, -2, -1)
 
+    inds = mx.argpartition(-scores, kth=top_k - 1, axis=-1)[..., :top_k]
+    scores = mx.take_along_axis(orig_scores, inds, axis=-1)
 
-# ---------------------------------------------------------------------------
-# config
-# ---------------------------------------------------------------------------
+    if top_k > 1 and renormalize:
+        denominator = scores.sum(axis=-1, keepdims=True) + 1e-20
+        scores = scores / denominator
+
+    return inds, (scores * routed_scaling_factor).astype(in_type)
+
 
 @dataclass
-class ModelArgs(BaseModelArgs):
-    model_type: str = "kimi_k3"
+class TextArgs(BaseModelArgs):
+    model_type: str = "kimi_linear"
     vocab_size: int = 163840
     hidden_size: int = 7168
     num_hidden_layers: int = 93
     num_attention_heads: int = 96
     num_key_value_heads: int = 96
     intermediate_size: int = 33792
-    hidden_act: str = "situ"
     rms_norm_eps: float = 1e-5
-    tie_word_embeddings: bool = False
     max_position_embeddings: int = 1048576
-
-    linear_attn_config: Dict[str, Any] = field(default_factory=dict)
-
-    # MLA
-    q_lora_rank: Optional[int] = 1536
-    kv_lora_rank: int = 512
-    qk_nope_head_dim: int = 128
-    qk_rope_head_dim: int = 64  # МХА-хвост БЕЗ ротации (mla_use_nope)
-    v_head_dim: int = 128
+    linear_attn_config: Optional[Dict[str, Any]] = None
+    hidden_act: str = "situ"
+    activation_situ_beta: Optional[float] = None
+    activation_situ_linear_beta: Optional[float] = None
+    attn_res_block_size: Optional[int] = None
+    q_lora_rank: Optional[int] = None
+    kv_lora_rank: Optional[int] = None
+    qk_nope_head_dim: Optional[int] = None
+    qk_rope_head_dim: Optional[int] = None
+    v_head_dim: Optional[int] = None
     mla_use_nope: bool = True
-    mla_use_output_gate: bool = True
-
-    # MoE
-    num_experts: int = 896
+    mla_use_output_gate: bool = False
+    num_experts: Optional[int] = None
     num_experts_per_token: int = 16
-    num_shared_experts: int = 2
-    moe_intermediate_size: int = 3072
-    routed_expert_hidden_size: Optional[int] = 3584
-    latent_moe_use_norm: bool = True
+    num_shared_experts: int = 0
+    moe_intermediate_size: Optional[int] = None
     moe_router_activation_func: str = "sigmoid"
     moe_renormalize: bool = True
     routed_scaling_factor: float = 1.0
-    first_k_dense_replace: int = 1
+    first_k_dense_replace: int = 0
     moe_layer_freq: int = 1
+    use_grouped_topk: bool = True
     num_expert_group: int = 1
     topk_group: int = 1
-    use_grouped_topk: bool = True
-    topk_method: str = "noaux_tc"
+    routed_expert_hidden_size: Optional[int] = None
+    latent_moe_use_norm: bool = False
+    tie_word_embeddings: bool = False
 
-    # SiTU
-    activation_situ_beta: float = 4.0
-    activation_situ_linear_beta: float = 25.0
+    def __post_init__(self):
+        if self.hidden_act != "situ":
+            raise ValueError(f"Unsupported activation '{self.hidden_act}'")
+        if self.moe_router_activation_func != "sigmoid":
+            raise ValueError(
+                f"Unsupported MoE router activation '{self.moe_router_activation_func}'"
+            )
 
-    # AttnRes
-    attn_res_block_size: Optional[int] = 12
+
+@dataclass
+class ModelArgs(BaseModelArgs):
+    text_config: Union[TextArgs, dict]
+    model_type: str = "kimi_k3"
 
     @classmethod
-    def from_dict(cls, params: Dict[str, Any]):
-        # Официальный конфиг — мультимодальная обёртка: текст в text_config.
-        if "text_config" in params and isinstance(params["text_config"], dict):
-            merged = dict(params["text_config"])
-            for k in ("quantization", "quantization_config"):
-                if k in params and k not in merged:
-                    merged[k] = params[k]
-            params = merged
-        params = dict(params)
-        params["model_type"] = "kimi_k3"  # text_config несёт "kimi_linear"
+    def from_dict(cls, params):
+        if "text_config" not in params:
+            return cls(model_type=params["model_type"], text_config=params)
         return super().from_dict(params)
 
-    # KDA-параметры из nested linear_attn_config
-    @property
-    def kda_layers(self) -> List[int]:
-        return list(self.linear_attn_config.get("kda_layers", []))
-
-    @property
-    def gate_lower_bound(self) -> Optional[float]:
-        v = self.linear_attn_config.get("gate_lower_bound", None)
-        return None if v is None else float(v)
-
-    @property
-    def kda_num_heads(self) -> int:
-        return int(self.linear_attn_config.get("num_heads", self.num_attention_heads))
-
-    @property
-    def kda_head_dim(self) -> int:
-        return int(self.linear_attn_config.get("head_dim", 128))
-
-    @property
-    def conv_kernel(self) -> int:
-        return int(self.linear_attn_config.get("short_conv_kernel_size", 4))
-
-    @property
-    def use_full_rank_gate(self) -> bool:
-        return bool(self.linear_attn_config.get("use_full_rank_gate", True))
+    def __post_init__(self):
+        if isinstance(self.text_config, dict):
+            self.text_config = TextArgs.from_dict(self.text_config)
 
 
-# ---------------------------------------------------------------------------
-# SiTU (fp32) — точная форма из официального SituAndMul
-# ---------------------------------------------------------------------------
-
-def situ_mul(gate: mx.array, up: mx.array, beta: float, linear_beta: Optional[float]) -> mx.array:
-    dt = up.dtype
-    g = gate.astype(mx.float32)
-    u = up.astype(mx.float32)
-    a = beta * mx.tanh(g / beta) * mx.sigmoid(g)
+@partial(mx.compile, shapeless=True)
+def _situ(x, gate, beta, linear_beta):
+    dtype = x.dtype
+    gate = gate.astype(mx.float32)
+    x = x.astype(mx.float32)
+    a = beta * mx.tanh(gate / beta) * mx.sigmoid(gate)
     if linear_beta is not None:
-        u = linear_beta * mx.tanh(u / linear_beta)
-    return (a * u).astype(dt)
+        x = linear_beta * mx.tanh(x / linear_beta)
+    return (a * x).astype(dtype)
 
 
-class SituGLUAct:
-    """Активация для SwitchGLU пина: вызывается как activation(x_up, x_gate)."""
-
-    def __init__(self, beta: float, linear_beta: Optional[float]):
+class SiTU(nn.Module):
+    def __init__(self, beta: float = 1.0, linear_beta: Optional[float] = None):
+        super().__init__()
         self.beta = beta
         self.linear_beta = linear_beta
 
-    def __call__(self, x_up: mx.array, x_gate: mx.array) -> mx.array:
-        return situ_mul(x_gate, x_up, self.beta, self.linear_beta)
+    def __call__(self, x: mx.array, gate: mx.array) -> mx.array:
+        return _situ(x, gate, self.beta, self.linear_beta)
 
 
 class KimiK3MLP(nn.Module):
-    """Dense MLP / shared experts (gate/up/down + SiTU)."""
-
-    def __init__(self, args: ModelArgs, intermediate_size: Optional[int] = None):
+    def __init__(self, args: TextArgs, intermediate_size: Optional[int] = None):
         super().__init__()
-        inter = intermediate_size or args.intermediate_size
-        self.gate_proj = nn.Linear(args.hidden_size, inter, bias=False)
-        self.up_proj = nn.Linear(args.hidden_size, inter, bias=False)
-        self.down_proj = nn.Linear(inter, args.hidden_size, bias=False)
-        self._beta = args.activation_situ_beta
-        self._lbeta = args.activation_situ_linear_beta
+        dim = args.hidden_size
+        hidden = intermediate_size or args.intermediate_size
+        self.gate_proj = nn.Linear(dim, hidden, bias=False)
+        self.up_proj = nn.Linear(dim, hidden, bias=False)
+        self.down_proj = nn.Linear(hidden, dim, bias=False)
+        self.beta = args.activation_situ_beta or 1.0
+        self.linear_beta = args.activation_situ_linear_beta
 
     def __call__(self, x: mx.array) -> mx.array:
-        return self.down_proj(situ_mul(self.gate_proj(x), self.up_proj(x), self._beta, self._lbeta))
-
-
-# ---------------------------------------------------------------------------
-# MoE
-# ---------------------------------------------------------------------------
-
-class KimiK3MoEGate(nn.Module):
-    """noaux_tc: fp32-логиты, sigmoid; выбор по scores+bias, веса из сырых scores."""
-
-    def __init__(self, args: ModelArgs):
-        super().__init__()
-        if args.num_expert_group != 1 or args.topk_group != 1:
-            raise NotImplementedError(
-                "kimi_k3: grouped top-k (num_expert_group>1) не реализован — "
-                "K3-конфиг использует 1/1"
-            )
-        self.args = args
-        self.weight = mx.zeros((args.num_experts, args.hidden_size))
-        self.e_score_correction_bias = mx.zeros((args.num_experts,), dtype=mx.float32)
-
-    def __call__(self, x: mx.array) -> Tuple[mx.array, mx.array]:
-        a = self.args
-        logits = x.astype(mx.float32) @ self.weight.astype(mx.float32).T  # INV#13
-        if a.moe_router_activation_func == "sigmoid":
-            scores = mx.sigmoid(logits)
-        else:
-            scores = mx.softmax(logits, axis=-1)
-        choice = scores + self.e_score_correction_bias
-        k = a.num_experts_per_token
-        inds = mx.argpartition(-choice, kth=k - 1, axis=-1)[..., :k]
-        weights = mx.take_along_axis(scores, inds, axis=-1)
-        if k > 1 and a.moe_renormalize:
-            weights = weights / (weights.sum(axis=-1, keepdims=True) + 1e-20)
-        weights = weights * a.routed_scaling_factor
-        return inds, weights
-
-
-class KimiK3LatentMoE(nn.Module):
-    """Латентный MoE. При TP: эксперты и shared шардируются, роутер/латентные
-    down/norm/up реплицируются; ОДИН fused fp32 all_sum (latent‖shared)."""
-
-    def __init__(self, args: ModelArgs):
-        super().__init__()
-        self.args = args
-        latent = args.routed_expert_hidden_size or args.hidden_size
-        self.latent = latent
-        self.gate = KimiK3MoEGate(args)
-        self.switch_mlp = SwitchGLU(
-            latent,
-            args.moe_intermediate_size,
-            args.num_experts,
-            activation=SituGLUAct(args.activation_situ_beta, args.activation_situ_linear_beta),
-        )
-        self.routed_expert_down_proj = nn.Linear(args.hidden_size, latent, bias=False)
-        self.routed_expert_up_proj = nn.Linear(latent, args.hidden_size, bias=False)
-        if args.latent_moe_use_norm:
-            self.routed_expert_norm = nn.RMSNorm(latent, eps=args.rms_norm_eps)
-        if args.num_shared_experts:
-            self.shared_experts = KimiK3MLP(
-                args, intermediate_size=args.moe_intermediate_size * args.num_shared_experts
-            )
-        else:
-            self.shared_experts = None
-        self.sharding_group: Optional[mx.distributed.Group] = None
-
-    def __call__(self, x: mx.array) -> mx.array:
-        identity = x
-        inds, weights = self.gate(x)
-        lat = self.routed_expert_down_proj(x)
-        y = self.switch_mlp(lat, inds)
-        y = (y * weights[..., None].astype(y.dtype)).sum(axis=-2)  # [B,T,latent], partial при TP
-        shared = self.shared_experts(identity) if self.shared_experts is not None else None
-
-        if self.sharding_group is not None:
-            # INV#12: fp32; один коллектив на слой — конкат latent‖shared.
-            if shared is not None:
-                fused = mx.concatenate(
-                    [y.astype(mx.float32), shared.astype(mx.float32)], axis=-1
-                )
-                fused = mx.distributed.all_sum(fused, group=self.sharding_group)
-                y = fused[..., : self.latent].astype(y.dtype)
-                shared = fused[..., self.latent:].astype(identity.dtype)
-            else:
-                y = mx.distributed.all_sum(
-                    y.astype(mx.float32), group=self.sharding_group
-                ).astype(y.dtype)
-
-        if self.args.latent_moe_use_norm:
-            y = self.routed_expert_norm(y)  # INV#3/#11: строго ПОСЛЕ полного суммирования
-        y = self.routed_expert_up_proj(y)
-        if shared is not None:
-            y = y + shared
-        return y
-
-
-# ---------------------------------------------------------------------------
-# KDA (delta attention) — база: пин kimi_linear; дельты K3 см. шапку
-# ---------------------------------------------------------------------------
-
-class ShortConv1d(nn.Module):
-    def __init__(self, channels: int, kernel_size: int):
-        super().__init__()
-        self.kernel_size = kernel_size
-        self.conv = nn.Conv1d(
-            in_channels=channels,
-            out_channels=channels,
-            kernel_size=kernel_size,
-            bias=False,
-            groups=channels,
-            padding=0,
+        return self.down_proj(
+            _situ(self.up_proj(x), self.gate_proj(x), self.beta, self.linear_beta)
         )
 
-    def __call__(
-        self,
-        x: mx.array,
-        state: Optional[mx.array],
-        mask: Optional[mx.array],
-        lengths: Optional[mx.array],
-    ) -> Tuple[mx.array, mx.array]:
-        if mask is not None:
-            x = mx.where(mask[..., None], x, 0)
-        if state is None:
-            state = mx.zeros((x.shape[0], self.kernel_size - 1, x.shape[-1]), dtype=x.dtype)
-        conv_input = mx.concatenate([state, x], axis=1)
-        out = nn.silu(self.conv(conv_input))
-        n_keep = self.kernel_size - 1
-        if lengths is not None:
-            ends = mx.clip(lengths, 0, x.shape[1])
-            positions = (ends[:, None] + mx.arange(n_keep))[..., None]
-            new_state = mx.take_along_axis(conv_input, positions, axis=1)
+
+class ResidualBlocks:
+    def __init__(self, eps: float):
+        self.eps = eps
+        self.raw = None
+        self.inv_rms = None
+
+    def append(self, x: mx.array):
+        xf = x.astype(mx.float32)
+        n = mx.rsqrt((xf * xf).mean(axis=-1) + self.eps)[None]
+        r = x[None]
+        if self.raw is None:
+            self.raw = r
+            self.inv_rms = n
         else:
-            new_state = mx.contiguous(conv_input[:, -n_keep:, :])
-        return out, new_state
+            self.raw = mx.concatenate([self.raw, r])
+            self.inv_rms = mx.concatenate([self.inv_rms, n])
 
 
-def alog_broadcast(A_log: mx.array, num_heads: int, head_dim: int) -> mx.array:
-    """Раскладка A_log по факту ФОРМЫ в чекпоинте (никаких срезов).
+@mx.compile
+def _attn_res_combine(raw, inv_rms, partial_sum, w_eff, eps):
+    pf = partial_sum.astype(mx.float32)
+    p_logit = (pf @ w_eff) * mx.rsqrt((pf * pf).mean(axis=-1) + eps)
+    logits = mx.concatenate([(raw.astype(mx.float32) @ w_eff) * inv_rms, p_logit[None]])
+    p = mx.softmax(logits, axis=0, precise=True)
+    out = (p[:-1, ..., None] * raw).sum(axis=0) + p[-1, ..., None] * partial_sum
+    return out.astype(partial_sum.dtype)
 
-    fla/KDA-канон: A_log = [num_v_heads] (per-head). Чекпоинт K3 хранит
-    [head_dim]=[128] при 96 головах — это НЕ per-head, поэтому форма и решает:
-      size == num_heads  -> [H,1]  (per-head, канон fla)
-      size == head_dim   -> [1,D]  (per-channel, фактическая раскладка K3)
-    EXO_K3_ALOG_SEMANTICS=per_head|per_channel форсирует выбор (A3-эксперимент);
-    при конфликте с формой — громкая ошибка, молча резать нельзя."""
-    n = A_log.size
-    if ALOG_SEMANTICS == "per_head":
-        if n != num_heads:
-            raise ValueError(
-                f"A_log size {n} != num_heads {num_heads}: форс per_head невозможен "
-                f"без произвольного среза (см. P0-008b)"
-            )
-        return A_log.reshape(num_heads, 1)
-    if ALOG_SEMANTICS == "per_channel":
-        if n != head_dim:
-            raise ValueError(f"A_log size {n} != head_dim {head_dim} при per_channel")
-        return A_log.reshape(1, head_dim)
-    # auto: по форме
-    if n == num_heads:
-        return A_log.reshape(num_heads, 1)
-    if n == head_dim:
-        return A_log.reshape(1, head_dim)
-    raise ValueError(
-        f"A_log size {n} не равен ни num_heads {num_heads}, ни head_dim {head_dim}"
+
+_ATTN_RES_SOURCE = """
+    constexpr int NACC = K + 2;
+    constexpr int NSIMD = THREADS / 32;
+
+    auto n = threadgroup_position_in_grid.y;
+    auto tid = thread_position_in_threadgroup.x;
+    auto lane = thread_index_in_simdgroup;
+    auto sg = simdgroup_index_in_threadgroup;
+
+    auto partial_ = partial + n * D;
+
+    float acc[NACC];
+    for (int i = 0; i < NACC; ++i) {
+      acc[i] = 0.0f;
+    }
+    for (uint d = tid; d < D; d += THREADS) {
+      float w = static_cast<float>(w_eff[d]);
+      float pv = static_cast<float>(partial_[d]);
+      for (int k = 0; k < K; ++k) {
+        acc[k] += static_cast<float>(raw[(k * N + n) * D + d]) * w;
+      }
+      acc[K] += pv * w;
+      acc[K + 1] += pv * pv;
+    }
+
+    threadgroup float shm[NACC * NSIMD];
+    for (int i = 0; i < NACC; ++i) {
+      float s = simd_sum(acc[i]);
+      if (lane == 0) {
+        shm[i * NSIMD + sg] = s;
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float weights[K + 1];
+    if (tid == 0) {
+      float tot[NACC];
+      for (int i = 0; i < NACC; ++i) {
+        tot[i] = 0.0f;
+        for (int j = 0; j < NSIMD; ++j) {
+          tot[i] += shm[i * NSIMD + j];
+        }
+      }
+      float rinv = metal::rsqrt(tot[K + 1] / D + eps[0]);
+      float logits[K + 1];
+      float m = -1e30f;
+      for (int k = 0; k < K; ++k) {
+        logits[k] = tot[k] * inv_rms[k * N + n];
+        m = metal::max(m, logits[k]);
+      }
+      logits[K] = tot[K] * rinv;
+      m = metal::max(m, logits[K]);
+      float denom = 0.0f;
+      for (int k = 0; k <= K; ++k) {
+        logits[k] = metal::exp(logits[k] - m);
+        denom += logits[k];
+      }
+      for (int k = 0; k <= K; ++k) {
+        weights[k] = logits[k] / denom;
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float wp = weights[K];
+    auto out_ = out + n * D;
+    for (uint d = tid; d < D; d += THREADS) {
+      float o = wp * static_cast<float>(partial_[d]);
+      for (int k = 0; k < K; ++k) {
+        o += weights[k] * static_cast<float>(raw[(k * N + n) * D + d]);
+      }
+      out_[d] = static_cast<InT>(o);
+    }
+"""
+
+_attn_res_kernel = (
+    mx.fast.metal_kernel(
+        name="attnres_mix",
+        input_names=["raw", "inv_rms", "partial", "w_eff", "eps", "N"],
+        output_names=["out"],
+        source=_ATTN_RES_SOURCE,
     )
+    if mx.metal.is_available()
+    else None
+)
+
+_ATTN_RES_THREADS = 512
+_attn_res_eps_cache: Dict[float, mx.array] = {}
 
 
-def compute_decay_k3(
-    a_logits: mx.array,      # [B,T,H,D] = f_b(f_a(x))
-    A_log: mx.array,         # [H] (per-head) или [D] (per-channel)
-    dt_bias: mx.array,       # [H*D]
-    lower_bound: Optional[float],
-    num_heads: int,
-    head_dim: int,
+def _attn_res_mix(
+    blocks: ResidualBlocks,
+    partial_sum: mx.array,
+    w_eff: mx.array,
+    eps: float,
+    use_kernel: bool = True,
 ) -> mx.array:
-    """KDA forget-gate, каноническая форма (fla KimiDeltaAttention + fused-кернел
-    пина mlx_lm.gated_delta):
+    if blocks.raw is None:
+        return partial_sum
+    if use_kernel and _attn_res_kernel is not None and mx.default_device() == mx.gpu:
+        raw = blocks.raw
+        K, D = raw.shape[0], raw.shape[-1]
+        N = raw.size // (K * D)
+        eps_arr = _attn_res_eps_cache.get(eps)
+        if eps_arr is None:
+            eps_arr = _attn_res_eps_cache.setdefault(
+                eps, mx.array([eps], dtype=mx.float32)
+            )
+        return _attn_res_kernel(
+            inputs=[raw, blocks.inv_rms, partial_sum, w_eff, eps_arr, N],
+            template=[
+                ("InT", partial_sum.dtype),
+                ("K", K),
+                ("D", D),
+                ("THREADS", _ATTN_RES_THREADS),
+            ],
+            grid=(_ATTN_RES_THREADS, N, 1),
+            threadgroup=(_ATTN_RES_THREADS, 1, 1),
+            output_shapes=[partial_sum.shape],
+            output_dtypes=[partial_sum.dtype],
+        )[0]
+    return _attn_res_combine(blocks.raw, blocks.inv_rms, partial_sum, w_eff, eps)
 
-        log_g = -exp(A_log) * softplus(a + dt_bias)
-        log_g = max(log_g, lower_bound)      # safe_gate: clamp в лог-пространстве
-        decay = exp(log_g)
 
-    Всё в fp32. Источники: fla 0.5.2 fla/layers/kda.py (docstring гейта +
-    описание lower_bound как clamp) и Metal-кернел пина
-    (neg_exp_A * softplus(a + dt_bias))."""
-    x = a_logits.astype(mx.float32)
-    if DTBIAS_IN_GATE:
-        x = x + dt_bias.astype(mx.float32).reshape(num_heads, head_dim)
-    A = mx.exp(alog_broadcast(A_log.astype(mx.float32), num_heads, head_dim))
-    log_g = -A * mx.logaddexp(x, mx.zeros_like(x))  # softplus, устойчивый
-    if lower_bound is not None:
-        log_g = mx.maximum(log_g, lower_bound)
-    return mx.exp(log_g)
+_SHORT_CONV_SOURCE = """
+    auto c = thread_position_in_grid.x;
+    auto b = thread_position_in_grid.y;
+
+    const device T* s = state + b * (KS - 1) * C;
+    float v = 0.0f;
+    for (int j = 0; j < KS - 1; ++j) {
+      v += static_cast<float>(w[c * KS + j]) * static_cast<float>(s[j * C + c]);
+    }
+    v += static_cast<float>(w[c * KS + KS - 1]) * static_cast<float>(x[b * C + c]);
+    y[b * C + c] = static_cast<T>(v / (1.0f + metal::exp(-v)));
+
+    device T* ns = new_state + b * (KS - 1) * C;
+    for (int j = 0; j < KS - 2; ++j) {
+      ns[j * C + c] = s[(j + 1) * C + c];
+    }
+    ns[(KS - 2) * C + c] = x[b * C + c];
+"""
+
+_short_conv_kernel = (
+    mx.fast.metal_kernel(
+        name="k3_short_conv_step",
+        input_names=["x", "state", "w"],
+        output_names=["y", "new_state"],
+        source=_SHORT_CONV_SOURCE,
+    )
+    if mx.metal.is_available()
+    else None
+)
+
+
+class KimiK3ShortConv(ShortConv1d):
+    def __call__(self, x, state, mask=None, lengths=None):
+        if (
+            _short_conv_kernel is None
+            or self.training
+            or x.shape[1] != 1
+            or state is None
+            or mask is not None
+            or lengths is not None
+            or x.dtype != state.dtype
+            or x.dtype != self.conv.weight.dtype
+            or mx.default_device() != mx.gpu
+        ):
+            return super().__call__(x, state, mask, lengths)
+        B, _, C = x.shape
+        return _short_conv_kernel(
+            inputs=[x, state, self.conv.weight],
+            template=[("T", x.dtype), ("C", C), ("KS", self.kernel_size)],
+            grid=(C, B, 1),
+            threadgroup=(min(1024, C), 1, 1),
+            output_shapes=[x.shape, state.shape],
+            output_dtypes=[x.dtype, x.dtype],
+        )
 
 
 class KimiK3DeltaAttention(nn.Module):
-    def __init__(self, args: ModelArgs, layer_idx: int):
+    def __init__(self, args: TextArgs, layer_idx: int):
         super().__init__()
+        cfg = args.linear_attn_config
+
         self.layer_idx = layer_idx
-        self.num_heads = args.kda_num_heads
-        self.head_dim = args.kda_head_dim
-        self.conv_kernel = args.conv_kernel
-        self.lower_bound = args.gate_lower_bound
-        if self.lower_bound is None:
-            raise ValueError("kimi_k3: ожидается gate_lower_bound в linear_attn_config")
-        if not args.use_full_rank_gate:
-            raise ValueError("kimi_k3: use_full_rank_gate=False не поддержан (INV#2)")
-
+        self.num_heads = cfg["num_heads"]
+        self.head_dim = cfg["head_dim"]
+        self.conv_kernel = cfg["short_conv_kernel_size"]
         self.projection_dim = self.num_heads * self.head_dim
-        hidden = args.hidden_size
         self.scale = float(self.head_dim) ** -0.5
+        self.lower_bound = cfg.get("gate_lower_bound", None)
+        self.use_full_rank_gate = cfg.get("use_full_rank_gate", False)
 
-        self.q_proj = nn.Linear(hidden, self.projection_dim, bias=False)
-        self.k_proj = nn.Linear(hidden, self.projection_dim, bias=False)
-        self.v_proj = nn.Linear(hidden, self.projection_dim, bias=False)
-        self.q_conv = ShortConv1d(self.projection_dim, self.conv_kernel)
-        self.k_conv = ShortConv1d(self.projection_dim, self.conv_kernel)
-        self.v_conv = ShortConv1d(self.projection_dim, self.conv_kernel)
+        hidden = args.hidden_size
+        self.qkv_proj = nn.Linear(hidden, 3 * self.projection_dim, bias=False)
+        self.qkv_conv = KimiK3ShortConv(3 * self.projection_dim, self.conv_kernel)
 
         self.f_a_proj = nn.Linear(hidden, self.head_dim, bias=False)
         self.f_b_proj = nn.Linear(self.head_dim, self.projection_dim, bias=False)
         self.b_proj = nn.Linear(hidden, self.num_heads, bias=False)
-        self.g_proj = nn.Linear(hidden, self.projection_dim, bias=False)  # INV#2
 
-        # Форма инициализации = ожидаемая форма чекпоинта. auto/per_channel ->
-        # [head_dim] (раскладка K3), per_head -> [num_heads] (канон fla).
-        self.A_log = mx.zeros(
-            (self.num_heads,) if ALOG_SEMANTICS == "per_head" else (self.head_dim,),
-            dtype=mx.float32,
+        if self.use_full_rank_gate:
+            self.g_proj = nn.Linear(hidden, self.projection_dim, bias=False)
+        else:
+            self.g_a_proj = nn.Linear(hidden, self.head_dim, bias=False)
+            self.g_b_proj = nn.Linear(self.head_dim, self.projection_dim, bias=False)
+
+        self.A_log = mx.log(
+            mx.random.uniform(low=1.0, high=16.0, shape=(self.num_heads,))
         )
-        self.dt_bias = mx.zeros((self.projection_dim,), dtype=mx.float32)
+        self.dt_bias = mx.zeros((self.projection_dim,))
 
         self.o_norm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
         self.o_proj = nn.Linear(self.projection_dim, hidden, bias=False)
+        self._step = None
+
+    def _decode_core(self, x, conv_state, ssm_state):
+        B = x.shape[0]
+        P = self.projection_dim
+        qkv, conv_state = self.qkv_conv(self.qkv_proj(x), conv_state, None, None)
+
+        q = qkv[..., :P].reshape(B, 1, self.num_heads, self.head_dim)
+        k = qkv[..., P : 2 * P].reshape(B, 1, self.num_heads, self.head_dim)
+        v = qkv[..., 2 * P :].reshape(B, 1, self.num_heads, self.head_dim)
+
+        eps = 1e-6 / self.head_dim
+        q = (self.scale**2) * mx.fast.rms_norm(q, None, eps)
+        k = self.scale * mx.fast.rms_norm(k, None, eps)
+
+        a_logits = self.f_b_proj(self.f_a_proj(x)).reshape(
+            B, 1, self.num_heads, self.head_dim
+        )
+        b_logits = self.b_proj(x).reshape(B, 1, self.num_heads)
+
+        out, ssm_state = gated_delta_update(
+            q,
+            k,
+            v,
+            a_logits,
+            b_logits,
+            self.A_log.reshape(self.num_heads, 1),
+            self.dt_bias.reshape(self.num_heads, self.head_dim),
+            state=ssm_state,
+            mask=None,
+            use_kernel=True,
+            lower_bound=self.lower_bound,
+        )
+
+        if self.use_full_rank_gate:
+            gate = self.g_proj(x)
+        else:
+            gate = self.g_b_proj(self.g_a_proj(x))
+        gate = gate.reshape(B, 1, self.num_heads, self.head_dim)
+        out = (
+            self.o_norm(out.reshape(B, 1, self.num_heads, self.head_dim))
+            * mx.sigmoid(gate)
+        ).reshape(B, 1, -1)
+        return self.o_proj(out), conv_state, ssm_state
 
     def __call__(
         self,
@@ -447,82 +473,133 @@ class KimiK3DeltaAttention(nn.Module):
         cache: Optional[Any] = None,
     ) -> mx.array:
         B, T, _ = x.shape
-        H, D = self.num_heads, self.head_dim
+        dtype = x.dtype
+        P = self.projection_dim
 
         if cache is not None:
-            q_state, k_state, v_state, ssm_state = cache
+            conv_state, ssm_state = cache
             lengths = cache.lengths
         else:
-            q_state = k_state = v_state = ssm_state = None
+            conv_state = None
+            ssm_state = None
             lengths = None
-        if q_state is None:
-            s = mx.zeros((B, self.conv_kernel - 1, self.projection_dim), dtype=x.dtype)
-            q_state, k_state, v_state = s, s, s
 
-        q_conv, q_state = self.q_conv(self.q_proj(x), q_state, mask, lengths)
-        k_conv, k_state = self.k_conv(self.k_proj(x), k_state, mask, lengths)
-        v_conv, v_state = self.v_conv(self.v_proj(x), v_state, mask, lengths)
+        if (
+            T == 1
+            and not self.training
+            and mask is None
+            and lengths is None
+            and cache is not None
+            and mx.metal.is_available()
+        ):
+            if conv_state is None:
+                conv_state = mx.zeros((B, self.conv_kernel - 1, 3 * P), dtype=dtype)
+            if ssm_state is None:
+                ssm_state = mx.zeros(
+                    (B, self.num_heads, self.head_dim, self.head_dim),
+                    dtype=mx.float32,
+                )
+            if self._step is None:
+                self._step = mx.compile(self._decode_core)
+            y, conv_state, ssm_state = self._step(x, conv_state, ssm_state)
+            cache[0] = conv_state
+            cache[1] = ssm_state
+            cache.advance(1)
+            return y
+
+        if conv_state is None:
+            conv_state = mx.zeros((B, self.conv_kernel - 1, 3 * P), dtype=dtype)
+
+        qkv, conv_state = self.qkv_conv(self.qkv_proj(x), conv_state, mask, lengths)
+
         if cache is not None:
-            cache[0], cache[1], cache[2] = q_state, k_state, v_state
+            cache[0] = conv_state
 
-        q = q_conv.reshape(B, T, H, D)
-        k = k_conv.reshape(B, T, H, D)
-        v = v_conv.reshape(B, T, H, D)
+        q = qkv[..., :P].reshape(B, T, self.num_heads, self.head_dim)
+        k = qkv[..., P : 2 * P].reshape(B, T, self.num_heads, self.head_dim)
+        v = qkv[..., 2 * P :].reshape(B, T, self.num_heads, self.head_dim)
 
-        # qk L2-norm + масштабирование — ровно как в parity-порте kimi_linear
-        # (use_qk_l2norm_in_kernel в официальном вызове).
-        q = (self.scale**2) * mx.fast.rms_norm(q, None, 1e-6)
-        k = self.scale * mx.fast.rms_norm(k, None, 1e-6)
+        inv_scale = self.scale
+        eps = 1e-6 / self.head_dim
+        q = (inv_scale**2) * mx.fast.rms_norm(q, None, eps)
+        k = inv_scale * mx.fast.rms_norm(k, None, eps)
 
-        a_logits = self.f_b_proj(self.f_a_proj(x)).reshape(B, T, H, D)
-        decay = compute_decay_k3(
-            a_logits, self.A_log, self.dt_bias, self.lower_bound, H, D
+        a_logits = self.f_b_proj(self.f_a_proj(x)).reshape(
+            B, T, self.num_heads, self.head_dim
         )
-        beta = mx.sigmoid(self.b_proj(x).astype(mx.float32))  # sigmoid в ядре у Moonshot
+        b_logits = self.b_proj(x).reshape(B, T, self.num_heads)
 
-        out, ssm_state = gated_delta_ops(q, k, v, decay, beta, ssm_state, mask)
+        out, ssm_state = gated_delta_update(
+            q,
+            k,
+            v,
+            a_logits,
+            b_logits,
+            self.A_log.reshape(self.num_heads, 1),
+            self.dt_bias.reshape(self.num_heads, self.head_dim),
+            state=ssm_state,
+            mask=mask,
+            use_kernel=not self.training,
+            lower_bound=self.lower_bound,
+        )
+
         if cache is not None:
-            cache[3] = ssm_state
-            if hasattr(cache, "advance"):
-                cache.advance(T)
+            cache[1] = ssm_state
+            cache.advance(T)
 
-        gate = self.g_proj(x).reshape(B, T, H, D)
-        out = (self.o_norm(out.reshape(B, T, H, D)) * mx.sigmoid(gate)).reshape(B, T, -1)
+        if self.use_full_rank_gate:
+            gate = self.g_proj(x)
+        else:
+            gate = self.g_b_proj(self.g_a_proj(x))
+        gate = gate.reshape(B, T, self.num_heads, self.head_dim)
+        out = (
+            self.o_norm(out.reshape(B, T, self.num_heads, self.head_dim))
+            * mx.sigmoid(gate)
+        ).reshape(B, T, -1)
         return self.o_proj(out)
 
 
-# ---------------------------------------------------------------------------
-# MLA (q-LoRA + безротационный MQA-хвост + выходной гейт), absorbed-кэш
-# ---------------------------------------------------------------------------
-
 class KimiK3MLAAttention(nn.Module):
-    def __init__(self, args: ModelArgs):
+    def __init__(self, args: TextArgs):
         super().__init__()
-        assert args.mla_use_nope, "kimi_k3: официальный код assert'ит mla_use_nope"
+        if not args.mla_use_nope:
+            raise ValueError("Only NoPE MLA is supported (mla_use_nope=True)")
         self.num_heads = args.num_attention_heads
         self.qk_nope_head_dim = args.qk_nope_head_dim
-        self.qk_rope_head_dim = args.qk_rope_head_dim  # хвост, ротация НЕ применяется
+        self.qk_rope_head_dim = args.qk_rope_head_dim
         self.q_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         self.v_head_dim = args.v_head_dim
+        self.q_lora_rank = args.q_lora_rank
         self.kv_lora_rank = args.kv_lora_rank
-        self.scale = self.q_head_dim ** -0.5  # 192^-0.5
+        self.scale = self.q_head_dim**-0.5
+        self.use_gate = args.mla_use_output_gate
 
         hidden = args.hidden_size
-        self.q_a_proj = nn.Linear(hidden, args.q_lora_rank, bias=False)
-        self.q_a_layernorm = nn.RMSNorm(args.q_lora_rank, eps=args.rms_norm_eps)
-        self.q_b_proj = nn.Linear(args.q_lora_rank, self.num_heads * self.q_head_dim, bias=False)
-
+        if self.q_lora_rank is not None:
+            self.q_a_proj = nn.Linear(hidden, self.q_lora_rank, bias=False)
+            self.q_a_layernorm = nn.RMSNorm(self.q_lora_rank, eps=1e-6)
+            self.q_b_proj = nn.Linear(
+                self.q_lora_rank, self.num_heads * self.q_head_dim, bias=False
+            )
+        else:
+            self.q_proj = nn.Linear(
+                hidden, self.num_heads * self.q_head_dim, bias=False
+            )
         self.kv_a_proj_with_mqa = nn.Linear(
             hidden, self.kv_lora_rank + self.qk_rope_head_dim, bias=False
         )
-        self.kv_a_layernorm = nn.RMSNorm(self.kv_lora_rank, eps=args.rms_norm_eps)
-        self.embed_q = MultiLinear(self.qk_nope_head_dim, self.kv_lora_rank, self.num_heads)
-        self.unembed_out = MultiLinear(self.kv_lora_rank, self.v_head_dim, self.num_heads)
-
-        self.use_output_gate = args.mla_use_output_gate
-        if self.use_output_gate:
-            self.g_proj = nn.Linear(hidden, self.num_heads * self.v_head_dim, bias=False)
+        self.kv_a_layernorm = nn.RMSNorm(self.kv_lora_rank, eps=1e-6)
+        self.embed_q = MultiLinear(
+            self.qk_nope_head_dim, self.kv_lora_rank, self.num_heads
+        )
+        self.unembed_out = MultiLinear(
+            self.kv_lora_rank, self.v_head_dim, self.num_heads
+        )
         self.o_proj = nn.Linear(self.num_heads * self.v_head_dim, hidden, bias=False)
+        if self.use_gate:
+            self.g_proj = nn.Linear(
+                hidden, self.num_heads * self.v_head_dim, bias=False
+            )
 
     def __call__(
         self,
@@ -532,23 +609,29 @@ class KimiK3MLAAttention(nn.Module):
     ) -> mx.array:
         B, L, _ = x.shape
 
-        q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(x)))
+        if self.q_lora_rank is not None:
+            q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(x)))
+        else:
+            q = self.q_proj(x)
         q = q.reshape(B, L, self.num_heads, self.q_head_dim).transpose(0, 2, 1, 3)
         q_nope, q_pe = mx.split(q, [self.qk_nope_head_dim], axis=-1)
 
         compressed_kv = self.kv_a_proj_with_mqa(x)
         compressed_kv, k_pe = mx.split(compressed_kv, [self.kv_lora_rank], axis=-1)
         k_pe = k_pe.reshape(B, L, 1, self.qk_rope_head_dim).transpose(0, 2, 1, 3)
-        kv_latent = mx.expand_dims(self.kv_a_layernorm(compressed_kv), axis=1)
+        kv_latent = self.kv_a_layernorm(compressed_kv)
+
+        kv_latent = mx.expand_dims(kv_latent, axis=1)
 
         if cache is not None:
             kv_latent, k_pe = cache.update_and_fetch(kv_latent, k_pe)
 
-        # Хвост участвует в скорах БЕЗ ротации (официально rotary_emb=None).
         pe_scores = (q_pe * self.scale) @ k_pe.swapaxes(-1, -2)
         if mask is not None:
             pe_scores = mx.where(
-                mask, pe_scores, mx.array(mx.finfo(pe_scores.dtype).min, pe_scores.dtype)
+                mask,
+                pe_scores,
+                mx.array(mx.finfo(pe_scores.dtype).min, pe_scores.dtype),
             )
 
         if L == 1:
@@ -561,166 +644,250 @@ class KimiK3MLAAttention(nn.Module):
         output = scaled_dot_product_attention(
             q_nope, k, v, cache=cache, scale=self.scale, mask=pe_scores
         )
+
         if L == 1:
             output = self.unembed_out(output)
 
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-        if self.use_output_gate:
+        if self.use_gate:
             output = output * mx.sigmoid(self.g_proj(x))
         return self.o_proj(output)
 
 
-# ---------------------------------------------------------------------------
-# AttnRes: softmax-микс по снапшотам резидуал-стрима (fp32)
-# ---------------------------------------------------------------------------
+class KimiK3SparseMoE(nn.Module):
+    def __init__(self, args: TextArgs):
+        super().__init__()
+        self.args = args
+        hidden = args.hidden_size
+        experts = args.num_experts
+        self.latent_size = args.routed_expert_hidden_size
 
-def _attn_res_mix(
-    prefix: mx.array,               # [B,T,Hid]
-    snapshots: List[mx.array],      # список [B,T,Hid]
-    proj_weight: mx.array,          # [1,Hid]
-    norm_weight: mx.array,          # [Hid]
-    eps: float,
-) -> mx.array:
-    v = mx.stack(snapshots + [prefix], axis=-2).astype(mx.float32)  # [B,T,S,Hid]
-    k = v * mx.rsqrt(mx.mean(v * v, axis=-1, keepdims=True) + eps)
-    sw = (norm_weight.astype(mx.float32) * proj_weight.reshape(-1).astype(mx.float32))
-    scores = (k * sw).sum(axis=-1)                     # [B,T,S]  (INV#14: fp32)
-    probs = mx.softmax(scores, axis=-1)
-    out = (probs[..., None] * v).sum(axis=-2)          # микс СЫРЫХ снапшотов
-    return out.astype(prefix.dtype)
+        expert_dim = self.latent_size or hidden
+        self.gate = nn.Linear(hidden, experts, bias=False)
+        self.switch_mlp = SwitchGLU(
+            expert_dim,
+            args.moe_intermediate_size,
+            experts,
+            activation=SiTU(
+                args.activation_situ_beta or 1.0, args.activation_situ_linear_beta
+            ),
+        )
+        self.e_score_correction_bias = mx.zeros((experts,), dtype=mx.float32)
 
+        if self.latent_size is not None:
+            self.routed_expert_down_proj = nn.Linear(
+                hidden, self.latent_size, bias=False
+            )
+            self.routed_expert_up_proj = nn.Linear(self.latent_size, hidden, bias=False)
+            if args.latent_moe_use_norm:
+                self.routed_expert_norm = nn.RMSNorm(
+                    self.latent_size, eps=args.rms_norm_eps
+                )
+            else:
+                self.routed_expert_norm = None
+        else:
+            self.routed_expert_norm = None
 
-# ---------------------------------------------------------------------------
-# decoder / model
-# ---------------------------------------------------------------------------
+        if args.num_shared_experts:
+            shared_hidden = args.moe_intermediate_size * args.num_shared_experts
+            self.shared_experts = KimiK3MLP(args, intermediate_size=shared_hidden)
+        else:
+            self.shared_experts = None
+
+        self.sharding_group = None
+
+    def __call__(self, x: mx.array) -> mx.array:
+        if self.sharding_group is not None:
+            x = sum_gradients(self.sharding_group)(x)
+
+        scores = self.gate(x)
+        inds, weights = _group_expert_select(
+            scores,
+            self.e_score_correction_bias,
+            self.args.num_experts_per_token,
+            self.args.num_expert_group,
+            self.args.topk_group,
+            self.args.routed_scaling_factor,
+            self.args.moe_renormalize,
+        )
+        y = self.routed_expert_down_proj(x) if self.latent_size is not None else x
+        y = self.switch_mlp(y, inds)
+        y = (y * weights[..., None]).sum(axis=-2)
+        shared = self.shared_experts(x) if self.shared_experts is not None else None
+        if self.sharding_group is not None:
+            if shared is not None:
+                split = y.shape[-1]
+                combined = mx.distributed.all_sum(
+                    mx.concatenate([y, shared], axis=-1), group=self.sharding_group
+                )
+                y, shared = mx.split(combined, [split], axis=-1)
+            else:
+                y = mx.distributed.all_sum(y, group=self.sharding_group)
+        if self.routed_expert_norm is not None:
+            y = self.routed_expert_norm(y)
+        if self.latent_size is not None:
+            y = self.routed_expert_up_proj(y)
+        if shared is not None:
+            y = y + shared
+        return y
+
 
 class KimiK3DecoderLayer(nn.Module):
-    def __init__(self, args: ModelArgs, layer_idx: int):
+    def __init__(self, args: TextArgs, layer_idx: int):
         super().__init__()
-        self.layer_idx = layer_idx
-        self.is_linear = (layer_idx + 1) in args.kda_layers  # 1-based список
+        self.eps = args.rms_norm_eps
+        kda_layers = args.linear_attn_config["kda_layers"]
+        self.is_linear = (layer_idx + 1) in kda_layers
 
         if self.is_linear:
             self.self_attn = KimiK3DeltaAttention(args, layer_idx)
         else:
             self.self_attn = KimiK3MLAAttention(args)
 
-        self.is_moe = (
-            args.num_experts is not None
+        if (
+            (args.num_experts or 0) > 0
             and layer_idx >= args.first_k_dense_replace
             and layer_idx % args.moe_layer_freq == 0
-        )
-        if self.is_moe:
-            self.block_sparse_moe = KimiK3LatentMoE(args)
+        ):
+            self.mlp = KimiK3SparseMoE(args)
         else:
             self.mlp = KimiK3MLP(args)
 
         self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-        self.post_attention_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.post_attention_layernorm = nn.RMSNorm(
+            args.hidden_size, eps=args.rms_norm_eps
+        )
 
-        self.use_attn_residuals = args.attn_res_block_size is not None
-        if self.use_attn_residuals:
-            self.attn_res_block_size = args.attn_res_block_size
-            self.self_attention_res_norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-            self.mlp_res_norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.use_attn_res = args.attn_res_block_size is not None
+        if self.use_attn_res:
+            self.is_block_start = layer_idx % args.attn_res_block_size == 0
             self.self_attention_res_proj = nn.Linear(args.hidden_size, 1, bias=False)
+            self.self_attention_res_norm = nn.RMSNorm(
+                args.hidden_size, eps=args.rms_norm_eps
+            )
             self.mlp_res_proj = nn.Linear(args.hidden_size, 1, bias=False)
-        self._eps = args.rms_norm_eps
-
-    def _ffn(self, h: mx.array) -> mx.array:
-        return self.block_sparse_moe(h) if self.is_moe else self.mlp(h)
+            self.mlp_res_norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+            self._attn_res_w_eff = None
+            self._mlp_res_w_eff = None
 
     def __call__(
         self,
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
-        snapshots: Optional[List[mx.array]] = None,
-    ) -> mx.array:
-        if not self.use_attn_residuals:
+        blocks: Optional[ResidualBlocks] = None,
+    ) -> Tuple[mx.array, Optional[ResidualBlocks]]:
+        if not self.use_attn_res:
             h = x + self.self_attn(self.input_layernorm(x), mask, cache)
-            return h + self._ffn(self.post_attention_layernorm(h))
+            return h + self.mlp(self.post_attention_layernorm(h)), blocks
 
-        # Официальный датафлоу _forward_attn_residual (ребейз стрима на снапшотах).
-        prefix = x
-        h = x
-        if snapshots:
-            h = _attn_res_mix(
-                prefix, snapshots,
-                self.self_attention_res_proj.weight,
-                self.self_attention_res_norm.weight, self._eps,
-            )
-        rebase = (self.layer_idx % self.attn_res_block_size) == 0
-        if rebase:
-            snapshots.append(prefix)
-            prefix = None
+        if self.training or self._attn_res_w_eff is None:
+            self._attn_res_w_eff = self.self_attention_res_norm.weight.astype(
+                mx.float32
+            ) * self.self_attention_res_proj.weight.reshape(-1)
+            self._mlp_res_w_eff = self.mlp_res_norm.weight.astype(
+                mx.float32
+            ) * self.mlp_res_proj.weight.reshape(-1)
 
-        a = self.self_attn(self.input_layernorm(h), mask, cache)
-        prefix = a if prefix is None else prefix + a
-
-        h2 = _attn_res_mix(
-            prefix, snapshots,
-            self.mlp_res_proj.weight, self.mlp_res_norm.weight, self._eps,
+        partial_sum = x
+        h = _attn_res_mix(
+            blocks, partial_sum, self._attn_res_w_eff, self.eps, not self.training
         )
-        m = self._ffn(self.post_attention_layernorm(h2))
-        return prefix + m
+        if self.is_block_start:
+            blocks.append(partial_sum)
+            partial_sum = None
+
+        y = self.self_attn(self.input_layernorm(h), mask, cache)
+        partial_sum = y if partial_sum is None else partial_sum + y
+
+        h = _attn_res_mix(
+            blocks, partial_sum, self._mlp_res_w_eff, self.eps, not self.training
+        )
+        partial_sum = partial_sum + self.mlp(self.post_attention_layernorm(h))
+        return partial_sum, blocks
 
 
-class KimiK3Model(nn.Module):
-    def __init__(self, args: ModelArgs):
+class KimiK3TextModel(nn.Module):
+    def __init__(self, args: TextArgs):
         super().__init__()
         self.args = args
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
-        self.layers = [KimiK3DecoderLayer(args, i) for i in range(args.num_hidden_layers)]
+        self.layers = [
+            KimiK3DecoderLayer(args, i) for i in range(args.num_hidden_layers)
+        ]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-
-        self.use_attn_residuals = args.attn_res_block_size is not None
-        if self.use_attn_residuals:
-            self.output_attn_res_norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.use_attn_res = args.attn_res_block_size is not None
+        if self.use_attn_res:
             self.output_attn_res_proj = nn.Linear(args.hidden_size, 1, bias=False)
+            self.output_attn_res_norm = nn.RMSNorm(
+                args.hidden_size, eps=args.rms_norm_eps
+            )
+            self._output_res_w_eff = None
 
-        kda = args.kda_layers
-        self.ssm_idx = kda[0] - 1 if kda else 0
-        self.attn_idx = 0
-        for i in range(args.num_hidden_layers):
-            if (i + 1) not in kda:
+        kda_layers = args.linear_attn_config["kda_layers"]
+        self.ssm_idx = kda_layers[0] - 1 if kda_layers else None
+        self.attn_idx = None
+        for i in range(len(self.layers)):
+            if (i + 1) not in kda_layers:
                 self.attn_idx = i
                 break
 
-    def __call__(self, inputs: mx.array, cache: Optional[List[Any]] = None) -> mx.array:
+    def __call__(
+        self,
+        inputs: mx.array,
+        cache: Optional[List[Any]] = None,
+    ) -> mx.array:
         h = self.embed_tokens(inputs)
         if cache is None:
             cache = [None] * len(self.layers)
 
-        ssm_mask = create_ssm_mask(h, cache[self.ssm_idx])
-        attn_mask = create_attention_mask(h, cache[self.attn_idx], return_array=True)
+        ssm_mask = (
+            create_ssm_mask(h, cache[self.ssm_idx])
+            if self.ssm_idx is not None
+            else None
+        )
+        if self.attn_idx is not None:
+            attn_mask = create_attention_mask(
+                h, cache[self.attn_idx], return_array=True
+            )
+        else:
+            attn_mask = None
 
-        snapshots: Optional[List[mx.array]] = [] if self.use_attn_residuals else None
+        blocks = ResidualBlocks(self.args.rms_norm_eps) if self.use_attn_res else None
         for layer, layer_cache in zip(self.layers, cache):
             mask = ssm_mask if layer.is_linear else attn_mask
-            h = layer(h, mask=mask, cache=layer_cache, snapshots=snapshots)
+            h, blocks = layer(h, mask=mask, cache=layer_cache, blocks=blocks)
 
-        if self.use_attn_residuals:
+        if blocks is not None:
+            if self.training or self._output_res_w_eff is None:
+                self._output_res_w_eff = self.output_attn_res_norm.weight.astype(
+                    mx.float32
+                ) * self.output_attn_res_proj.weight.reshape(-1)
             h = _attn_res_mix(
-                h, snapshots,
-                self.output_attn_res_proj.weight,
-                self.output_attn_res_norm.weight, self.args.rms_norm_eps,
+                blocks,
+                h,
+                self._output_res_w_eff,
+                self.args.rms_norm_eps,
+                not self.training,
             )
         return self.norm(h)
 
 
-class Model(nn.Module):
-    def __init__(self, args: ModelArgs):
+class LanguageModel(nn.Module):
+    def __init__(self, args: TextArgs):
         super().__init__()
-        _log_once()
         self.args = args
-        self.model_type = args.model_type
-        self.model = KimiK3Model(args)
-        self.lm_head = None if args.tie_word_embeddings else nn.Linear(
-            args.hidden_size, args.vocab_size, bias=False
-        )
+        self.model = KimiK3TextModel(args)
+        if args.tie_word_embeddings:
+            self.lm_head = None
+        else:
+            self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
-    def __call__(self, inputs: mx.array, cache: Optional[List[Any]] = None) -> mx.array:
+    def __call__(
+        self,
+        inputs: mx.array,
+        cache: Optional[List[Any]] = None,
+    ) -> mx.array:
         out = self.model(inputs, cache)
         if self.lm_head is None:
             return self.model.embed_tokens.as_linear(out)
@@ -731,104 +898,364 @@ class Model(nn.Module):
         return self.model.layers
 
     def make_cache(self):
-        return [
-            ArraysCache(size=4) if layer.is_linear else KVCache()
-            for layer in self.layers
-        ]
+        caches: List[Any] = []
+        for layer in self.layers:
+            if layer.is_linear:
+                caches.append(ArraysCache(size=2))
+            else:
+                caches.append(KVCache())
+        return caches
 
     def sanitize(self, weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
-        return remap_checkpoint(weights, self.args, self.layers)
+        args = self.args
+        weights = {
+            k: v for k, v in weights.items() if not k.startswith(("model.mtp", "mtp"))
+        }
+        layer_re = re.compile(r"model\.layers\.(\d+)\.")
+        weights = {
+            k: v
+            for k, v in weights.items()
+            if not (m := layer_re.match(k)) or int(m.group(1)) < args.num_hidden_layers
+        }
+
+        if args.tie_word_embeddings:
+            weights.pop("lm_head.weight", None)
+
+        res_renames = []
+        for src in ("self_attention_res", "mlp_res", "output_attn_res"):
+            res_renames.append((f"{src}.proj_weight", f"{src}_proj.weight"))
+            res_renames.append((f"{src}.norm_weight", f"{src}_norm.weight"))
+        for k in list(weights):
+            for pat, dst in res_renames:
+                if k.endswith(pat):
+                    weights[k[: -len(pat)] + dst] = weights.pop(k)
+                    break
+
+        for layer_idx, layer in enumerate(self.model.layers):
+            lp = f"model.layers.{layer_idx}"
+
+            if isinstance(layer.mlp, KimiK3SparseMoE):
+                src_prefix = f"{lp}.block_sparse_moe"
+                dst_prefix = f"{lp}.mlp"
+                for src, dst in [
+                    ("w1", "gate_proj"),
+                    ("w2", "down_proj"),
+                    ("w3", "up_proj"),
+                ]:
+                    if f"{src_prefix}.experts.0.{src}.weight_packed" in weights:
+                        packed = mx.stack(
+                            [
+                                weights.pop(
+                                    f"{src_prefix}.experts.{i}.{src}.weight_packed"
+                                )
+                                for i in range(args.num_experts)
+                            ]
+                        )
+                        scales = mx.stack(
+                            [
+                                weights.pop(
+                                    f"{src_prefix}.experts.{i}.{src}.weight_scale"
+                                )
+                                for i in range(args.num_experts)
+                            ]
+                        )
+                        weights[f"{dst_prefix}.switch_mlp.{dst}.weight"] = packed.view(
+                            mx.uint32
+                        )
+                        weights[f"{dst_prefix}.switch_mlp.{dst}.scales"] = scales
+                    else:
+                        for suffix in ("weight", "scales", "biases"):
+                            if f"{src_prefix}.experts.0.{src}.{suffix}" in weights:
+                                weights[f"{dst_prefix}.switch_mlp.{dst}.{suffix}"] = (
+                                    mx.stack(
+                                        [
+                                            weights.pop(
+                                                f"{src_prefix}.experts.{i}.{src}.{suffix}"
+                                            )
+                                            for i in range(args.num_experts)
+                                        ]
+                                    )
+                                )
+
+                for name in (
+                    "shared_experts.gate_proj",
+                    "shared_experts.up_proj",
+                    "shared_experts.down_proj",
+                    "routed_expert_down_proj",
+                    "routed_expert_up_proj",
+                    "routed_expert_norm",
+                    "gate",
+                    "switch_mlp.gate_proj",
+                    "switch_mlp.up_proj",
+                    "switch_mlp.down_proj",
+                ):
+                    for suffix in ("weight", "scales", "biases"):
+                        src_key = f"{src_prefix}.{name}.{suffix}"
+                        if src_key in weights:
+                            weights[f"{dst_prefix}.{name}.{suffix}"] = weights.pop(
+                                src_key
+                            )
+
+                for bias_key in (
+                    f"{src_prefix}.gate.e_score_correction_bias",
+                    f"{src_prefix}.e_score_correction_bias",
+                ):
+                    if bias_key in weights:
+                        weights[f"{dst_prefix}.e_score_correction_bias"] = weights.pop(
+                            bias_key
+                        )
+
+            attn = getattr(layer, "self_attn", None)
+            ap = f"{lp}.self_attn"
+            if isinstance(attn, KimiK3DeltaAttention):
+                for src_name, dst_name in (
+                    ("q_conv1d", "q_conv"),
+                    ("k_conv1d", "k_conv"),
+                    ("v_conv1d", "v_conv"),
+                ):
+                    src_key = f"{ap}.{src_name}.weight"
+                    if src_key in weights:
+                        w = weights.pop(src_key)
+                        if w.ndim == 3:
+                            w = w.moveaxis(2, 1)
+                        weights[f"{ap}.{dst_name}.conv.weight"] = w
+                for name in ("dt_bias", "A_log"):
+                    key = f"{ap}.{name}"
+                    if key in weights and weights[key].ndim > 1:
+                        weights[key] = mx.reshape(weights[key], (-1,))
+                a_log_key = f"{ap}.A_log"
+                num_heads = args.linear_attn_config["num_heads"]
+                if a_log_key in weights and weights[a_log_key].shape[0] > num_heads:
+                    weights[a_log_key] = weights[a_log_key][:num_heads]
+
+                if f"{ap}.qkv_proj.weight" not in weights:
+                    for suffix in ("weight", "scales", "biases"):
+                        parts = [f"{ap}.{p}_proj.{suffix}" for p in "qkv"]
+                        if all(p in weights for p in parts):
+                            weights[f"{ap}.qkv_proj.{suffix}"] = mx.concatenate(
+                                [weights.pop(p) for p in parts], axis=0
+                            )
+                conv_parts = [f"{ap}.{p}_conv.conv.weight" for p in "qkv"]
+                if f"{ap}.qkv_conv.conv.weight" not in weights and all(
+                    p in weights for p in conv_parts
+                ):
+                    weights[f"{ap}.qkv_conv.conv.weight"] = mx.concatenate(
+                        [weights.pop(p) for p in conv_parts], axis=0
+                    )
+
+            kv_b_key = f"{ap}.kv_b_proj.weight"
+            if kv_b_key in weights:
+                qk_nope = args.qk_nope_head_dim
+                v_head = args.v_head_dim
+                head_dim = qk_nope + v_head
+                num_heads = args.num_attention_heads
+
+                quantized = f"{ap}.kv_b_proj.scales" in weights
+                v = weights.pop(kv_b_key)
+
+                if quantized:
+                    dims = args.kv_lora_rank
+                    scales = weights.pop(f"{ap}.kv_b_proj.scales")
+                    biases = weights.pop(f"{ap}.kv_b_proj.biases")
+                    bits = (v.shape[-1] * 32) // dims
+                    group_size = dims // scales.shape[-1]
+                    v = mx.dequantize(
+                        v, scales, biases, bits=bits, group_size=group_size
+                    )
+
+                v = v.reshape(num_heads, head_dim, -1)
+                wk = mx.contiguous(v[:, :qk_nope, :].swapaxes(-1, -2))
+                wv = mx.contiguous(v[:, qk_nope:, :])
+
+                if quantized:
+                    wk, wk_s, wk_b = mx.quantize(wk, bits=bits, group_size=group_size)
+                    wv, wv_s, wv_b = mx.quantize(wv, bits=bits, group_size=group_size)
+                    weights[f"{ap}.embed_q.scales"] = wk_s
+                    weights[f"{ap}.embed_q.biases"] = wk_b
+                    weights[f"{ap}.unembed_out.scales"] = wv_s
+                    weights[f"{ap}.unembed_out.biases"] = wv_b
+
+                weights[f"{ap}.embed_q.weight"] = wk
+                weights[f"{ap}.unembed_out.weight"] = wv
+
+        return weights
 
     @property
     def cast_predicate(self):
-        keep_fp32 = ("A_log", "dt_bias", "e_score_correction_bias")
-
-        def predicate(path: str) -> bool:
-            return not any(path.endswith(s) or s in path for s in keep_fp32)
+        def predicate(path: str):
+            if "e_score_correction_bias" in path:
+                return False
+            if path.endswith("A_log") or path.endswith("dt_bias"):
+                return False
+            return True
 
         return predicate
 
     @property
     def quant_predicate(self):
-        def predicate(path: str, _module) -> bool:
-            # MXFP4 только у routed experts (R3-скоуп чекпоинта).
-            return "switch_mlp" in path
+        def predicate(path, _):
+            if path.endswith("mlp.gate"):
+                return {"group_size": 64, "bits": 8}
+            if path.endswith("res_proj"):
+                return False
+            return True
 
         return predicate
 
 
-# ---------------------------------------------------------------------------
-# remap: ЕДИНСТВЕННЫЙ источник соответствия имён чекпоинта модулю
-# ---------------------------------------------------------------------------
+class Model(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.args = args
+        self.model_type = args.model_type
+        self.language_model = LanguageModel(args.text_config)
 
-_WRAPPER_PREFIX = "language_model."
-_DROP_MARKERS = ("vision_tower", "mm_projector", "multi_modal")
-_CONV_RENAMES = (
-    (".q_conv1d.weight", ".q_conv.conv.weight"),
-    (".k_conv1d.weight", ".k_conv.conv.weight"),
-    (".v_conv1d.weight", ".v_conv.conv.weight"),
-)
+    def __call__(
+        self,
+        inputs: mx.array,
+        cache: Optional[List[Any]] = None,
+    ) -> mx.array:
+        return self.language_model(inputs, cache)
 
+    @property
+    def model(self):
+        return self.language_model.model
 
-def remap_checkpoint(
-    weights: Dict[str, mx.array], args: ModelArgs, layers: List[KimiK3DecoderLayer]
-) -> Dict[str, mx.array]:
-    out: Dict[str, mx.array] = {}
-    for k, v in weights.items():
-        if k.startswith(_WRAPPER_PREFIX):
-            k = k[len(_WRAPPER_PREFIX):]
-        if any(m in k for m in _DROP_MARKERS) or ".mtp" in k or k.startswith("model.mtp"):
-            continue
-        if k.endswith((".weight_packed", ".weight_scale")):
-            raise RuntimeError(
-                "kimi_k3: сырой compressed-tensors MXFP4 чекпоинт. Прогони offline-"
-                "конвертер (B2) — пин mlx-lm интерпретирует compressed-tensors как "
-                "affine и это числовой мусор."
-            )
-        for src, dst in _CONV_RENAMES:
-            if k.endswith(src):
-                k = k[: -len(src)] + dst
-                if v.ndim == 3:
-                    v = v.moveaxis(2, 1)  # torch [C,1,K] -> mlx [C,K,1]
-                break
-        if k.endswith("A_log"):
-            # НИКАКИХ срезов: форма чекпоинта — источник истины, раскладку
-            # решает alog_broadcast() в рантайме (P0-008b).
-            H, D = args.kda_num_heads, args.kda_head_dim
-            v = v.reshape(-1)
-            if v.shape[0] not in (H, D):
-                raise ValueError(
-                    f"kimi_k3: A_log {v.shape} не равен ни ({H},), ни ({D},)"
+    @property
+    def layers(self):
+        return self.language_model.layers
+
+    def make_cache(self):
+        return self.language_model.make_cache()
+
+    def shard(self, group: Optional[mx.distributed.Group] = None):
+        group = group or mx.distributed.init()
+        N = group.size()
+        if N == 1:
+            return
+        rank = group.rank()
+
+        for layer in self.layers:
+            attn = layer.self_attn
+
+            if layer.is_linear:
+                D = attn.head_dim
+                P = attn.projection_dim
+                num_heads = attn.num_heads // N
+                sh = rank * num_heads
+                eh = sh + num_heads
+
+                attn.qkv_proj = shard_linear(
+                    attn.qkv_proj, "all-to-sharded", segments=3, group=group
                 )
-        if k.endswith("dt_bias") and v.ndim > 1:
-            v = v.reshape(-1)
-        out[k] = v
+                attn.f_b_proj = shard_linear(
+                    attn.f_b_proj, "all-to-sharded", group=group
+                )
+                if attn.use_full_rank_gate:
+                    attn.g_proj = shard_linear(
+                        attn.g_proj, "all-to-sharded", group=group
+                    )
+                else:
+                    attn.g_b_proj = shard_linear(
+                        attn.g_b_proj, "all-to-sharded", group=group
+                    )
+                attn.b_proj = shard_linear(attn.b_proj, "all-to-sharded", group=group)
+                attn.o_proj = shard_linear(attn.o_proj, "sharded-to-all", group=group)
 
-    # Стекинг сырых bf16-экспертов (parity/тесты; у конвертированного репо
-    # уже стековые имена switch_mlp.*)
-    for li, layer in enumerate(layers):
-        if not getattr(layer, "is_moe", False):
-            continue
-        moe_p = f"model.layers.{li}.block_sparse_moe"
-        for src, dst in (("w1", "gate_proj"), ("w3", "up_proj"), ("w2", "down_proj")):
-            k0 = f"{moe_p}.experts.0.{src}.weight"
-            if k0 in out:
-                stacked = [
-                    out.pop(f"{moe_p}.experts.{i}.{src}.weight")
-                    for i in range(args.num_experts)
-                ]
-                out[f"{moe_p}.switch_mlp.{dst}.weight"] = mx.stack(stacked)
+                w = attn.qkv_conv.conv.weight
+                attn.qkv_conv.conv.weight = mx.concatenate(
+                    [w[seg * P + sh * D : seg * P + eh * D] for seg in range(3)],
+                    axis=0,
+                )
+                attn.qkv_conv.conv.groups = 3 * num_heads * D
 
-    # kv_b absorption -> embed_q / unembed_out (bf16 в K3: self_attn вне квант-скоупа)
-    for li, layer in enumerate(layers):
-        ap = f"model.layers.{li}.self_attn"
-        kv_b_key = f"{ap}.kv_b_proj.weight"
-        if kv_b_key not in out:
-            continue
-        nope, vh = args.qk_nope_head_dim, args.v_head_dim
-        H = args.num_attention_heads
-        w = out.pop(kv_b_key).reshape(H, nope + vh, -1)
-        out[f"{ap}.embed_q.weight"] = mx.contiguous(w[:, :nope, :].swapaxes(-1, -2))
-        out[f"{ap}.unembed_out.weight"] = mx.contiguous(w[:, nope:, :])
+                attn.A_log = attn.A_log.reshape(-1)[sh:eh]
+                attn.dt_bias = attn.dt_bias.reshape(-1)[sh * D : eh * D]
+                attn.num_heads = num_heads
+                attn.projection_dim = num_heads * D
+            else:
+                if attn.q_lora_rank is not None:
+                    attn.q_b_proj = shard_linear(
+                        attn.q_b_proj, "all-to-sharded", group=group
+                    )
+                else:
+                    attn.q_proj = shard_linear(
+                        attn.q_proj, "all-to-sharded", group=group
+                    )
+                if attn.use_gate:
+                    attn.g_proj = shard_linear(
+                        attn.g_proj, "all-to-sharded", group=group
+                    )
+                attn.o_proj = shard_linear(attn.o_proj, "sharded-to-all", group=group)
 
-    return out
+                attn.num_heads //= N
+                num_heads = attn.num_heads
+                sh = rank * num_heads
+                eh = sh + num_heads
+
+                def shard_heads(w):
+                    return w[sh:eh]
+
+                attn.embed_q.apply(shard_heads)
+                attn.unembed_out.apply(shard_heads)
+
+            if isinstance(layer.mlp, KimiK3SparseMoE):
+                layer.mlp.sharding_group = group
+                shard_inplace(
+                    layer.mlp.switch_mlp.gate_proj, "all-to-sharded", group=group
+                )
+                shard_inplace(
+                    layer.mlp.switch_mlp.up_proj, "all-to-sharded", group=group
+                )
+                shard_inplace(
+                    layer.mlp.switch_mlp.down_proj, "sharded-to-all", group=group
+                )
+                if layer.mlp.shared_experts is not None:
+                    shard_inplace(
+                        layer.mlp.shared_experts.gate_proj,
+                        "all-to-sharded",
+                        group=group,
+                    )
+                    shard_inplace(
+                        layer.mlp.shared_experts.up_proj, "all-to-sharded", group=group
+                    )
+                    shard_inplace(
+                        layer.mlp.shared_experts.down_proj,
+                        "sharded-to-all",
+                        group=group,
+                    )
+            else:
+                layer.mlp.gate_proj = shard_linear(
+                    layer.mlp.gate_proj, "all-to-sharded", group=group
+                )
+                layer.mlp.up_proj = shard_linear(
+                    layer.mlp.up_proj, "all-to-sharded", group=group
+                )
+                layer.mlp.down_proj = shard_linear(
+                    layer.mlp.down_proj, "sharded-to-all", group=group
+                )
+
+    def sanitize(self, weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
+        prefix = "language_model."
+        weights = {
+            k[len(prefix) :] if k.startswith(prefix) else k: v
+            for k, v in weights.items()
+            if not k.startswith(
+                (
+                    "vision_tower",
+                    "vision_model",
+                    "multi_modal_projector",
+                    "mm_projector",
+                )
+            )
+        }
+        weights = self.language_model.sanitize(weights)
+        return {f"{prefix}{k}": v for k, v in weights.items()}
+
+    @property
+    def cast_predicate(self):
+        return self.language_model.cast_predicate
+
+    @property
+    def quant_predicate(self):
+        return self.language_model.quant_predicate
