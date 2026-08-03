@@ -520,7 +520,18 @@ def encode_prompt(tokenizer: TokenizerWrapper, prompt: str) -> mx.array:
     that would corrupt the prompt structure.
     """
     # Chat templates define their own structure - don't add BOS/EOS
-    prompt_tokens = tokenizer.encode(prompt, add_special_tokens=False)
+    inner = getattr(tokenizer, "_tokenizer", tokenizer)
+    if hasattr(inner, "_encode_text_piece"):
+        # Kimi TikToken-токенизатор (K2/K3): ЛЮБОЙ kwargs уводит его encode в
+        # фоллбек super().encode -> структурные XTML-маркеры (<|open|>, <|sep|>,
+        # <|close|>, <|end_of_msg|>) кодируются обычным текстом, модель отвечает
+        # тем же -- ломаются think/response-сплит, стоп и тул-коллы. Нативный
+        # путь (без kwargs) кодирует их спец-ID. BOS/EOS он и так не добавляет.
+        # Замечание: allow_special=True на всей строке -- инъекция маркеров из
+        # пользовательского текста возможна; для single-user кластера принято.
+        prompt_tokens = inner.encode(prompt)
+    else:
+        prompt_tokens = tokenizer.encode(prompt, add_special_tokens=False)
     return mx.array(prompt_tokens)
 
 
