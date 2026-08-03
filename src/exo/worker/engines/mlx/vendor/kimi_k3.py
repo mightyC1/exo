@@ -11,7 +11,10 @@
 # lower_bound (быстрый prefill), sanitize понимает И официальный
 # moonshotai-чекпоинт (view-репак mxfp4 на загрузке), И наш конвертированный
 # (switch_mlp.* passthrough), Model.shard(group) для любого TP N.
-# A_log: per-head, срез [:num_heads] в sanitize (консенсус: официальный
+# Диагностические рубильники (бисекция GPU Address Fault, 2026-08-03):
+#   EXO_K3_NO_GD_KERNEL=1  -> gated-delta через ops-фоллбек (без Metal-кернела)
+#   EXO_K3_NO_RES_KERNEL=1 -> AttnRes-микс через ops (без Metal-кернела)
+# # A_log: per-head, срез [:num_heads] в sanitize (консенсус: официальный
 # torch-код + llama.cpp parity 6.7e-05 + апстрим-ревью). Гейт:
 # compute_g_safe = exp(lb * sigmoid(exp(A_log) * (a + dt_bias))).
 # Copyright © 2026 Apple Inc.
@@ -23,6 +26,12 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
+import os as _os
+_NO_GD_KERNEL = _os.environ.get("EXO_K3_NO_GD_KERNEL", "0") == "1"
+_NO_RES_KERNEL = _os.environ.get("EXO_K3_NO_RES_KERNEL", "0") == "1"
+if _NO_GD_KERNEL or _NO_RES_KERNEL:
+    print(f"[kimi_k3] diag: gd_kernel={'OFF' if _NO_GD_KERNEL else 'on'} "
+          f"res_kernel={'OFF' if _NO_RES_KERNEL else 'on'}")
 from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
 from mlx_lm.models.base import (
@@ -305,7 +314,7 @@ def _attn_res_mix(
 ) -> mx.array:
     if blocks.raw is None:
         return partial_sum
-    if use_kernel and _attn_res_kernel is not None and mx.default_device() == mx.gpu:
+    if use_kernel and not _NO_RES_KERNEL and _attn_res_kernel is not None and mx.default_device() == mx.gpu:
         raw = blocks.raw
         K, D = raw.shape[0], raw.shape[-1]
         N = raw.size // (K * D)
@@ -451,7 +460,7 @@ class KimiK3DeltaAttention(nn.Module):
             self.dt_bias.reshape(self.num_heads, self.head_dim),
             state=ssm_state,
             mask=None,
-            use_kernel=True,
+            use_kernel=not _NO_GD_KERNEL,
             lower_bound=self.lower_bound,
         )
 
@@ -539,7 +548,7 @@ class KimiK3DeltaAttention(nn.Module):
             self.dt_bias.reshape(self.num_heads, self.head_dim),
             state=ssm_state,
             mask=mask,
-            use_kernel=not self.training,
+            use_kernel=not (self.training or _NO_GD_KERNEL),
             lower_bound=self.lower_bound,
         )
 
