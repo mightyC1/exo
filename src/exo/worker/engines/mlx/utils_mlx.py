@@ -374,7 +374,7 @@ def load_tokenizer_for_model_id(
     eos_token_ids = get_eos_token_ids_for_model(model_id)
 
     # Kimi uses a custom TikTokenTokenizer that transformers 5.x can't load via AutoTokenizer
-    if "kimi-k2" in model_id_lower:
+    if "kimi-k2" in model_id_lower or "kimi-k3" in model_id_lower:
         import importlib.util
         import types
 
@@ -414,6 +414,28 @@ def load_tokenizer_for_model_id(
             return list(hf_tokenizer.model.encode(text, allowed_special="all"))  # pyright: ignore[reportUnknownMemberType,reportUnknownArgumentType]
 
         hf_tokenizer.encode = _patched_encode
+
+        if "kimi-k3" in model_id_lower:
+            # K3-дайлект (XTML, encoding_k3): секции размечены
+            # <|open|>NAME<|sep|> ... <|close|>NAME<|sep|>. Автодетект пина
+            # (_infer_thinking) знает только <think>-семейство -> None,None.
+            # Прошиваем маркеры руками; think_end = ПОЛНЫЙ переход
+            # think->response, чтобы контент начинался чисто.
+            wrapper = TokenizerWrapper(hf_tokenizer, eos_token_ids=eos_token_ids)
+            _enc = hf_tokenizer.model.encode  # pyright: ignore[reportUnknownMemberType]
+            think_start = "<|open|>think<|sep|>"
+            think_end = "<|close|>think<|sep|><|open|>response<|sep|>"
+            wrapper.think_start = think_start
+            wrapper.think_end = "<|close|>think<|sep|>"
+            wrapper.think_start_tokens = list(
+                _enc(think_start, allowed_special="all")  # pyright: ignore[reportUnknownArgumentType]
+            )
+            wrapper.think_end_tokens = list(
+                _enc(think_end, allowed_special="all")  # pyright: ignore[reportUnknownArgumentType]
+            )
+            # тул-парсер K3 (vendored kimi_k3_tool_parser) — отдельным шагом
+            return wrapper
+
         return TokenizerWrapper(
             hf_tokenizer,
             eos_token_ids=eos_token_ids,
