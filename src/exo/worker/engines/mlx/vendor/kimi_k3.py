@@ -36,6 +36,21 @@ _NO_RES_KERNEL = _os.environ.get("EXO_K3_NO_RES_KERNEL", "0") == "1"
 # ~22 у ops. Поэтому: prefill = кернел, decode = ops. Форс кернела в декоде
 # (для охоты на гонку): EXO_K3_GD_DECODE_KERNEL=1.
 _GD_DECODE_KERNEL = _os.environ.get("EXO_K3_GD_DECODE_KERNEL", "0") == "1"
+# ВЕРДИКТ 2026-08-03 (длинная экспозиция, 15+ сообщений): конфиг «GD полностью
+# ops» стабилен; любой GD-кернел (декод ИЛИ префилл) в EXO-меше триггерит
+# GPU Address Fault / InnocentVictim (связка с RDMA fast-synch, который
+# неотключаем). ДЕФОЛТ = стабильность: GD-кернел выключен везде.
+# Возврат для экспериментов: EXO_K3_GD_PREFILL_KERNEL=1 (префилл ~9ms/ток
+# против ~22 у ops), EXO_K3_GD_DECODE_KERNEL=1.
+_GD_PREFILL_KERNEL = _os.environ.get("EXO_K3_GD_PREFILL_KERNEL", "0") == "1"
+# Аудит 2026-08-03: в файле есть ТРЕТИЙ кастомный кернел (k3_short_conv_step,
+# 69 запусков/токен) и mx.compile(_decode_core), смешивающий кастомный
+# примитив, mutable state и all_sum в одном графе. Без этих рубильников
+# «kernel-free» бисекции не существует. Дефолты сохраняют текущее (проверенно
+# работавшее) поведение; диагностическая база включает оба:
+#   EXO_K3_NO_CONV_KERNEL=1 EXO_K3_NO_DECODE_COMPILE=1
+_NO_CONV_KERNEL = _os.environ.get("EXO_K3_NO_CONV_KERNEL", "0") == "1"
+_NO_DECODE_COMPILE = _os.environ.get("EXO_K3_NO_DECODE_COMPILE", "0") == "1"
 if _NO_GD_KERNEL or _NO_RES_KERNEL:
     print(f"[kimi_k3] diag: gd_kernel={'OFF' if _NO_GD_KERNEL else 'on'} "
           f"res_kernel={'OFF' if _NO_RES_KERNEL else 'on'}")
@@ -389,6 +404,7 @@ class KimiK3ShortConv(ShortConv1d):
             or x.dtype != state.dtype
             or x.dtype != self.conv.weight.dtype
             or mx.default_device() != mx.gpu
+            or _NO_CONV_KERNEL
         ):
             return super().__call__(x, state, mask, lengths)
         B, _, C = x.shape
@@ -515,9 +531,12 @@ class KimiK3DeltaAttention(nn.Module):
                     (B, self.num_heads, self.head_dim, self.head_dim),
                     dtype=mx.float32,
                 )
-            if self._step is None:
-                self._step = mx.compile(self._decode_core)
-            y, conv_state, ssm_state = self._step(x, conv_state, ssm_state)
+            if _NO_DECODE_COMPILE:
+                y, conv_state, ssm_state = self._decode_core(x, conv_state, ssm_state)
+            else:
+                if self._step is None:
+                    self._step = mx.compile(self._decode_core)
+                y, conv_state, ssm_state = self._step(x, conv_state, ssm_state)
             cache[0] = conv_state
             cache[1] = ssm_state
             cache.advance(1)
@@ -555,7 +574,8 @@ class KimiK3DeltaAttention(nn.Module):
             self.dt_bias.reshape(self.num_heads, self.head_dim),
             state=ssm_state,
             mask=mask,
-            use_kernel=not (self.training or _NO_GD_KERNEL),
+            use_kernel=_GD_PREFILL_KERNEL
+            and not (self.training or _NO_GD_KERNEL),
             lower_bound=self.lower_bound,
         )
 

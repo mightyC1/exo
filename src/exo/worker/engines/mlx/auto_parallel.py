@@ -469,6 +469,14 @@ def patch_pipeline_model[T](model: T, group: mx.distributed.Group) -> T:
             dep_cache = last[0] if hasattr(last, "caches") else last  # type: ignore
             if hasattr(dep_cache, "keys") and dep_cache.keys is not None:  # type: ignore
                 dep_cache.keys = mx.depends(dep_cache.keys, logits)  # type: ignore
+            elif hasattr(dep_cache, "cache"):
+                # ArraysCache (KDA-слои K3): .keys нет, state лежит списком в
+                # .cache — без этой ветки dependency-патч для K3 молча
+                # НИЧЕГО не делал (аудит 2026-08-03, последний слой K3 = KDA).
+                dep_cache.cache = [
+                    mx.depends(v, logits) if v is not None else None
+                    for v in dep_cache.cache  # type: ignore
+                ]
 
         return logits
 
@@ -496,8 +504,13 @@ def patch_tensor_model[T](model: T) -> T:
         if cache is not None and len(cache) > 0:  # pyright: ignore[reportAny]
             last = cache[-1]  # pyright: ignore[reportAny]
             dep_cache = last[0] if hasattr(last, "caches") else last  # pyright: ignore[reportAny]
-            if hasattr(dep_cache, "keys"):  # type: ignore
+            if hasattr(dep_cache, "keys") and dep_cache.keys is not None:  # type: ignore
                 dep_cache.keys = mx.depends(dep_cache.keys, logits)  # pyright: ignore[reportAny]
+            elif hasattr(dep_cache, "cache"):
+                dep_cache.cache = [
+                    mx.depends(v, logits) if v is not None else None
+                    for v in dep_cache.cache  # type: ignore
+                ]
 
         return logits
 
