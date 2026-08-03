@@ -153,7 +153,9 @@ def mlx_distributed_init(
         # первый коллектив ДО реальной нагрузки — синхронизирует ранги и
         # отсекает класс "shape corruption on first recv". Дешёвый и
         # безусловный для всех бэкендов.
-        mx.eval(mx.distributed.all_sum(mx.ones((8,)), group=group))
+        mx.eval(
+            mx.distributed.all_sum(mx.ones((10,)), group=group, stream=mx.cpu)
+        )
         logger.info(f"Rank {rank} mlx distributed initialization complete (barrier ok)")
 
         return group
