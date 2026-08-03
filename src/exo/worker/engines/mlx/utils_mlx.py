@@ -421,16 +421,30 @@ def load_tokenizer_for_model_id(
             # (_infer_thinking) знает только <think>-семейство -> None,None.
             # Прошиваем маркеры руками; think_end = ПОЛНЫЙ переход
             # think->response, чтобы контент начинался чисто.
-            wrapper = TokenizerWrapper(hf_tokenizer, eos_token_ids=eos_token_ids)
+            wrapper = TokenizerWrapper(
+                hf_tokenizer,
+                eos_token_ids=eos_token_ids,
+                tool_call_start="<|open|>tools<|sep|>",
+                tool_call_end="<|close|>tools<|sep|>",
+                tool_parser=_parse_kimi_k3_tool_calls,
+            )
+            # маркер для apply_all_parsers: включает parse_k3_sections
+            wrapper._k3_dialect = True  # noqa: SLF001
             _enc = hf_tokenizer.model.encode  # pyright: ignore[reportUnknownMemberType]
             think_start = "<|open|>think<|sep|>"
+            # think_end = ПОЛНЫЙ переход think->response: EXO-стейт-машина
+            # (parse_thinking_models, префикс-буфер) проглотит его целиком,
+            # и контент начнётся без огрызков.
             think_end = "<|close|>think<|sep|><|open|>response<|sep|>"
-            wrapper.think_start = think_start
-            wrapper.think_end = "<|close|>think<|sep|>"
-            wrapper.think_start_tokens = list(
+            # ВАЖНО: think_start/has_thinking у TokenizerWrapper — properties
+            # поверх _think_*; писать нужно во внутренние поля, иначе
+            # has_thinking остаётся False и парсер не включается.
+            wrapper._think_start = think_start  # noqa: SLF001
+            wrapper._think_end = think_end  # noqa: SLF001
+            wrapper._think_start_tokens = tuple(  # noqa: SLF001
                 _enc(think_start, allowed_special="all")  # pyright: ignore[reportUnknownArgumentType]
             )
-            wrapper.think_end_tokens = list(
+            wrapper._think_end_tokens = tuple(  # noqa: SLF001
                 _enc(think_end, allowed_special="all")  # pyright: ignore[reportUnknownArgumentType]
             )
             # тул-парсер K3 (vendored kimi_k3_tool_parser) — отдельным шагом
@@ -902,6 +916,29 @@ def mx_barrier(group: mx.distributed.Group | None):
             mx.array(1.0), group=group, stream=mx.default_stream(mx.Device(mx.cpu))
         )
     )
+
+
+def _parse_kimi_k3_tool_calls(text: str):
+    """K3 XTML tools-секция -> list[dict(id, name, arguments)] (контракт K2).
+
+    Формат (vendored апстрим-парсер #1626 — истина):
+      <|open|>tools<|sep|><|open|>call tool="NAME" index="N"<|sep|>
+        [typed-аргументы | <|open|>json ...<|sep|>{...}<|close|>json<|sep|>]
+      <|close|>call<|sep|>...<|close|>tools<|sep|>
+    """
+    from exo.worker.engines.mlx.vendor.kimi_k3_tool_parser import (
+        parse_tool_call as _k3_parse,
+    )
+
+    calls = _k3_parse(text)
+    return [
+        dict(
+            id=f"functions.{c['name']}:{i}",
+            name=c["name"],
+            arguments=c["arguments"],
+        )
+        for i, c in enumerate(calls, 1)
+    ]
 
 
 def _parse_kimi_tool_calls(text: str):

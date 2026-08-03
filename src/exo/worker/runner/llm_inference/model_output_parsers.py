@@ -105,6 +105,9 @@ def apply_all_parsers(
                 starts_in_thinking=detect_thinking_prompt_suffix(prompt, tokenizer),
             )
 
+        if getattr(tokenizer, "_k3_dialect", False):
+            generator = parse_k3_sections(generator)
+
         if tool_parser:
             generator = parse_tool_calls(generator, tool_parser, tools)
 
@@ -411,6 +414,75 @@ def parse_thinking_models(
 
         yield from drain_pending(is_thinking)
         yield response.model_copy(update={"is_thinking": is_thinking})
+
+
+_K3_SWALLOW = ("<|close|>response<|sep|>", "<|close|>message<|sep|>")
+_K3_TOOLS_OPEN = "<|open|>tools<|sep|>"
+_K3_TOOLS_CLOSE = "<|close|>tools<|sep|>"
+
+
+def parse_k3_sections(
+    responses: Generator[GenerationResponse | None],
+) -> Generator[GenerationResponse | None]:
+    """Kimi K3 XTML-диалект: (1) глотает структурные хвосты секций
+    (<|close|>response/message<|sep|>), (2) КОАЛЕСЦИРУЕТ tools-секцию в один
+    response.text — стоковый parse_tool_calls матчит start/end по одиночной
+    дельте, а маркеры K3 многотокенные. Префикс-буфер как в
+    parse_thinking_models."""
+    candidates = _K3_SWALLOW + (_K3_TOOLS_OPEN,)
+    acc = ""
+    pending: list[GenerationResponse] = []
+    tools_buf: str | None = None
+    tools_resp: GenerationResponse | None = None
+
+    def drain_pending():
+        for buffered in pending:
+            yield buffered
+        pending.clear()
+
+    for response in responses:
+        if response is None:
+            yield None
+            continue
+
+        if tools_buf is not None:
+            tools_buf += response.text
+            tools_resp = response
+            if tools_buf.endswith(_K3_TOOLS_CLOSE):
+                yield response.model_copy(update={"text": tools_buf})
+                tools_buf = None
+                tools_resp = None
+            elif response.finish_reason is not None:
+                yield response.model_copy(update={"text": tools_buf})
+                tools_buf = None
+                tools_resp = None
+            continue
+
+        if response.finish_reason is not None:
+            yield from drain_pending()
+            acc = ""
+            yield response
+            continue
+
+        acc += response.text
+
+        if acc in _K3_SWALLOW:
+            acc = ""
+            pending.clear()
+            continue
+        if acc == _K3_TOOLS_OPEN:
+            tools_buf = acc
+            tools_resp = response
+            acc = ""
+            pending.clear()
+            continue
+        if any(c.startswith(acc) for c in candidates):
+            pending.append(response)
+            continue
+
+        acc = ""
+        yield from drain_pending()
+        yield response
 
 
 def parse_tool_calls(
