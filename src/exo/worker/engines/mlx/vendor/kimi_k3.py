@@ -51,6 +51,14 @@ _GD_PREFILL_KERNEL = _os.environ.get("EXO_K3_GD_PREFILL_KERNEL", "0") == "1"
 #   EXO_K3_NO_CONV_KERNEL=1 EXO_K3_NO_DECODE_COMPILE=1
 _NO_CONV_KERNEL = _os.environ.get("EXO_K3_NO_CONV_KERNEL", "0") == "1"
 _NO_DECODE_COMPILE = _os.environ.get("EXO_K3_NO_DECODE_COMPILE", "0") == "1"
+# Механизм-дискриминаторы для охоты на GD-кернел (аудит, тесты 1-2; активны
+# только вместе с EXO_K3_GD_PREFILL_KERNEL=1):
+#   EXO_K3_GD_SYNC_EVAL=1 -> mx.eval выходов кернела сразу после вызова:
+#     стабилизирует => ordering/fence-дефект, не OOB в арифметике.
+#   EXO_K3_GD_COPY=1 -> дополнительно копия выходов в новые буферы:
+#     нужна и она => alias/lifetime.
+_GD_SYNC_EVAL = _os.environ.get("EXO_K3_GD_SYNC_EVAL", "0") == "1"
+_GD_COPY = _os.environ.get("EXO_K3_GD_COPY", "0") == "1"
 if _NO_GD_KERNEL or _NO_RES_KERNEL:
     print(f"[kimi_k3] diag: gd_kernel={'OFF' if _NO_GD_KERNEL else 'on'} "
           f"res_kernel={'OFF' if _NO_RES_KERNEL else 'on'}")
@@ -578,6 +586,10 @@ class KimiK3DeltaAttention(nn.Module):
             and not (self.training or _NO_GD_KERNEL),
             lower_bound=self.lower_bound,
         )
+        if _GD_COPY:
+            out, ssm_state = mx.array(out), mx.array(ssm_state)
+        if _GD_SYNC_EVAL or _GD_COPY:
+            mx.eval(out, ssm_state)
 
         if cache is not None:
             cache[1] = ssm_state
