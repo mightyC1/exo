@@ -1,6 +1,9 @@
+import faulthandler
 import os
 import resource
+import time
 import traceback
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Self, cast
 
@@ -37,6 +40,26 @@ class RunnerTerminationError:
         return f"{self.exception_type}: {self.exception_message}\n{self.traceback}"
 
 
+_CRASH_LOG = None  # держим хэндл живым до конца процесса
+
+
+def _enable_crash_capture(runner_id: object) -> None:
+    """faulthandler в файл: при SIGSEGV/SIGABRT/SIGBUS (Metal/jaccl C++)
+    дампит python-стеки ВСЕХ тредов туда, где их можно найти после смерти —
+    в отличие от tmux-скроллбека. ml-explore/mlx#3207-класс отладки."""
+    global _CRASH_LOG
+    try:
+        crash_dir = Path.home() / ".exo" / "crash"
+        crash_dir.mkdir(parents=True, exist_ok=True)
+        path = crash_dir / f"runner-{runner_id}-{os.getpid()}-{int(time.time())}.log"
+        _CRASH_LOG = open(path, "w", buffering=1)
+        _CRASH_LOG.write(f"runner={runner_id} pid={os.getpid()} started\n")
+        faulthandler.enable(file=_CRASH_LOG, all_threads=True)
+        logger.info(f"crash capture -> {path}")
+    except Exception as e:  # диагностика не должна ронять раннер
+        logger.warning(f"crash capture disabled: {e}")
+
+
 def entrypoint(
     bound_instance: BoundInstance,
     event_sender: MpSender[Event | RunnerTerminationError],
@@ -44,6 +67,7 @@ def entrypoint(
     cancel_receiver: MpReceiver[TaskId],
     _logger: "loguru.Logger",
 ) -> None:
+    _enable_crash_capture(getattr(bound_instance, 'bound_runner_id', 'unknown'))
     global logger
     logger = _logger
 
