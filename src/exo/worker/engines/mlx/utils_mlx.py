@@ -149,7 +149,12 @@ def mlx_distributed_init(
                 os.environ["MLX_JACCL_COORDINATOR"] = jaccl_coordinator
                 group = mx.distributed.init(backend="jaccl", strict=True)
 
-        logger.info(f"Rank {rank} mlx distributed initialization complete")
+        # Init-барьер (ml-explore/mlx#3207, JACCL/TB5 troubleshooting):
+        # первый коллектив ДО реальной нагрузки — синхронизирует ранги и
+        # отсекает класс "shape corruption on first recv". Дешёвый и
+        # безусловный для всех бэкендов.
+        mx.eval(mx.distributed.all_sum(mx.ones((8,)), group=group))
+        logger.info(f"Rank {rank} mlx distributed initialization complete (barrier ok)")
 
         return group
 
