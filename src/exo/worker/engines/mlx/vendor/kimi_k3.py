@@ -29,6 +29,13 @@ import mlx.nn as nn
 import os as _os
 _NO_GD_KERNEL = _os.environ.get("EXO_K3_NO_GD_KERNEL", "0") == "1"
 _NO_RES_KERNEL = _os.environ.get("EXO_K3_NO_RES_KERNEL", "0") == "1"
+# Гибрид (2026-08-03): GPU Address Fault ловился ТОЛЬКО в декоде (69 микро-
+# запусков кернела/токен вперемешку с ~186 RDMA-коллективами; fast-synch
+# обязателен для форка и выключению не подлежит). В изоляции кернел чист
+# (40K итераций stress). Префилл с кернелом стабилен и даёт ~9ms/ток против
+# ~22 у ops. Поэтому: prefill = кернел, decode = ops. Форс кернела в декоде
+# (для охоты на гонку): EXO_K3_GD_DECODE_KERNEL=1.
+_GD_DECODE_KERNEL = _os.environ.get("EXO_K3_GD_DECODE_KERNEL", "0") == "1"
 if _NO_GD_KERNEL or _NO_RES_KERNEL:
     print(f"[kimi_k3] diag: gd_kernel={'OFF' if _NO_GD_KERNEL else 'on'} "
           f"res_kernel={'OFF' if _NO_RES_KERNEL else 'on'}")
@@ -460,7 +467,7 @@ class KimiK3DeltaAttention(nn.Module):
             self.dt_bias.reshape(self.num_heads, self.head_dim),
             state=ssm_state,
             mask=None,
-            use_kernel=not _NO_GD_KERNEL,
+            use_kernel=_GD_DECODE_KERNEL and not _NO_GD_KERNEL,
             lower_bound=self.lower_bound,
         )
 
