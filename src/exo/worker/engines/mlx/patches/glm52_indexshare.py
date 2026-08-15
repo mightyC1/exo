@@ -24,12 +24,26 @@ import mlx.core as mx
 
 from exo.worker.runner.bootstrap import logger as default_logger
 
+from .glm52_prefill import (
+    GLM52PrefillConfig,
+    PrefillProfileRecorder,
+    UnsupportedPrefillMask,
+    cache_requires_dense_prefill,
+    profiled_monolithic_indexer_call,
+    read_prefill_config,
+    set_cache_growth,
+    shared_cache_placeholder_width,
+    sparse_prefill_attention,
+    tiled_indexer_call,
+)
+
 _INDEXSHARE_CTX: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
     "exo_glm52_indexshare_ctx",
     default=None,
 )
 _MISSING = object()
 _CLASSES_PATCHED = False
+_DEFAULT_PREFILL_CFG = GLM52PrefillConfig()
 
 
 def _env_raw(*names: str) -> str | None:
@@ -279,6 +293,8 @@ def _patch_mlx_lm_classes_once() -> None:
                         allowed={"dense", "error"},
                     ),
                     "missing_warned": False,
+                    "mask_fallback_warned": False,
+                    "padded_batch_fallback_warned": False,
                 }
             )
             try:
@@ -302,10 +318,35 @@ def _patch_mlx_lm_classes_once() -> None:
             if not getattr(self, "_exo_glm52_indexshare_enabled", False):
                 return self._exo_original_call(x, mask, cache)  # type: ignore[attr-defined]
 
-            # This body mirrors mlx_lm.models.deepseek_v32.DeepseekV32Attention.
-            # The behavioral change is only topk_indices selection for shared
-            # GLM-5.2 IndexShare layers.
+            cfg: GLM52PrefillConfig = getattr(
+                self,
+                "_exo_glm52_prefill_cfg",
+                _DEFAULT_PREFILL_CFG,
+            )
+            set_cache_growth(cache, cfg)
+
+            # This body mirrors the pinned mlx-lm DeepseekV32Attention. The
+            # decode branch below remains the old IndexShare implementation;
+            # W3/W4 can only be selected when L > 1.
             B, L, _ = x.shape
+            offset = cache[0].offset if cache is not None else 0
+            try:
+                expected_kv_len = int(offset) + int(L)
+            except (TypeError, ValueError):
+                expected_kv_len = int(L)
+            profiler = (
+                PrefillProfileRecorder.for_attention(
+                    self,
+                    cfg,
+                    offset=offset,
+                    qlen=int(L),
+                    kvlen=expected_kv_len,
+                    logger=default_logger,
+                )
+                if cfg.profile
+                else None
+            )
+
             qr = self.q_a_layernorm(self.q_a_proj(x))
             q = self.q_b_proj(qr)
             q = q.reshape(B, L, self.num_heads, self.q_head_dim).transpose(0, 2, 1, 3)
@@ -316,15 +357,18 @@ def _patch_mlx_lm_classes_once() -> None:
             k_pe = k_pe.reshape(B, L, 1, self.qk_rope_head_dim).transpose(0, 2, 1, 3)
             kv_latent = self.kv_a_layernorm(compressed_kv)
 
-            offset = cache[0].offset if cache is not None else 0
             q_pe = self.rope(q_pe, offset)
             k_pe = self.rope(k_pe, offset)
+            if profiler is not None:
+                profiler.stage("attn_qkv_proj_rope", q_nope, q_pe, kv_latent, k_pe)
 
             kv_latent = mx.expand_dims(kv_latent, axis=1)
             if cache is not None:
                 kv_latent, k_pe = cache[0].update_and_fetch(kv_latent, k_pe)
             else:
                 cache = [None] * 2
+            if profiler is not None:
+                profiler.stage("attn_cache0_grow_update", kv_latent, k_pe)
 
             ctx = _INDEXSHARE_CTX.get()
             layer_idx = getattr(self, "_exo_glm52_layer_idx", None)
@@ -344,16 +388,9 @@ def _patch_mlx_lm_classes_once() -> None:
                             f"layer {layer_idx}; source={source_layer}. This can "
                             "happen with unsupported pipeline splits."
                         )
-                    if missing_mode == "local":
-                        # Local shared-indexers are not mathematically valid for
-                        # GLM-5.2 IndexShare. Treat this as dense fallback instead
-                        # of accidentally using materialized/random shared weights.
-                        topk_indices = None
-                    else:
-                        # Dense fallback avoids using a materially wrong local
-                        # shared-layer indexer. It should only happen for unusual
-                        # pipeline splits or malformed configs.
-                        topk_indices = None
+                    # A local shared indexer is not mathematically valid for
+                    # IndexShare, so both accepted fallback values are dense.
+                    topk_indices = None
                     if not ctx.get("missing_warned", False):
                         default_logger.warning(
                             "[EXO][GLM-5.2][IndexShare] missing source top-k "
@@ -362,9 +399,7 @@ def _patch_mlx_lm_classes_once() -> None:
                         )
                         ctx["missing_warned"] = True
                 else:
-                    # value may be None. None is meaningful: DSA has not switched
-                    # on yet because cumulative length <= index_topk, so shared
-                    # layers must also keep dense attention.
+                    # None is meaningful before cumulative length crosses top-k.
                     topk_indices = value
                     if ctx.get("debug", False):
                         default_logger.info(
@@ -372,30 +407,112 @@ def _patch_mlx_lm_classes_once() -> None:
                             f"{layer_idx} reused top-k from layer {source_layer}"
                         )
             else:
-                topk_indices = self.indexer(x, qr, mask, cache=cache[1])
+                if int(L) > 1 and cfg.indexer_enabled:
+                    topk_indices = tiled_indexer_call(
+                        self.indexer,
+                        x,
+                        qr,
+                        mask,
+                        cache[1],
+                        cfg,
+                        profiler=profiler,
+                    )
+                elif profiler is not None:
+                    topk_indices = profiled_monolithic_indexer_call(
+                        self.indexer,
+                        x,
+                        qr,
+                        mask,
+                        cache[1],
+                        profiler=profiler,
+                    )
+                else:
+                    topk_indices = self.indexer(x, qr, mask, cache=cache[1])
                 indexer_was_called = True
                 if ctx is not None and layer_idx is not None:
                     ctx["topk_by_layer"][layer_idx] = topk_indices
 
-            # Shared IndexShare layers run no indexer, so their per-layer indexer
-            # KV cache (cache[1]) would otherwise stay unpopulated (keys=None).
-            # mlx-lm's generate loop force-evaluates cache state via
-            # mx.eval([c.state for c in prompt_cache]); KVCache.state dereferences
-            # self.keys.shape on a never-used cache and crashes during warmup
-            # prefill. Keep cache[1] in lockstep with cache[0] using a zero update
-            # (value dim 0, mirroring the indexer's own update). Contents are
-            # never read back; top-k is reused from the nearest full layer.
+            # Shared IndexShare layers do not execute an indexer. Populate their
+            # cache[1] so CacheList.state/trim/filter remain valid. "compact"
+            # stores one unused channel instead of index_head_dim channels.
             if not indexer_was_called and cache is not None and cache[1] is not None:
-                _ihd = getattr(self, "_exo_glm52_index_head_dim", 0)
-                try:
-                    _ihd = int(_ihd or 0)
-                except (TypeError, ValueError):
-                    _ihd = 0
+                placeholder_width = shared_cache_placeholder_width(self, cfg)
                 cache[1].update_and_fetch(
-                    mx.zeros((B, 1, L, _ihd), dtype=kv_latent.dtype),
+                    mx.zeros((B, 1, L, placeholder_width), dtype=kv_latent.dtype),
                     mx.zeros((B, 1, L, 0), dtype=kv_latent.dtype),
                 )
+                if profiler is not None:
+                    profiler.stage(
+                        "shared_cache1_zero_grow_update",
+                        cache[1].keys,
+                        cache[1].values,
+                    )
 
+            # Keep the indexer graph bounded only on layers that ran it. This
+            # must happen before the sparse early return as well as dense SDPA.
+            if indexer_was_called and cache is not None and cache[0] is not None:
+                cache[0].keys = mx.depends(
+                    cache[0].keys,
+                    (cache[1].keys, cache[1].values),
+                )
+
+            kv_length = int(kv_latent.shape[2])
+            sparse_requested = (
+                topk_indices is not None
+                and int(L) > 1
+                and cfg.sparse_enabled_for(
+                    query_length=int(L),
+                    kv_length=kv_length,
+                )
+            )
+            padded_batch_fallback = bool(
+                sparse_requested
+                and cache is not None
+                and cache[0] is not None
+                and cache_requires_dense_prefill(cache[0])
+            )
+            use_sparse_prefill = sparse_requested and not padded_batch_fallback
+            if padded_batch_fallback and (
+                ctx is None or not ctx.get("padded_batch_fallback_warned", False)
+            ):
+                default_logger.warning(
+                    "[EXO][GLM-5.2][Prefill] padded batched cache can contain "
+                    "all-masked query rows; using exact masked-dense fallback"
+                )
+                if ctx is not None:
+                    ctx["padded_batch_fallback_warned"] = True
+
+            if use_sparse_prefill:
+                try:
+                    output = sparse_prefill_attention(
+                        self,
+                        q_nope=q_nope,
+                        q_pe=q_pe,
+                        kv_latent=kv_latent,
+                        k_pe=k_pe,
+                        topk_indices=topk_indices,
+                        mask=mask,
+                        scaled_dot_product_attention=scaled_dot_product_attention,
+                        cfg=cfg,
+                        profiler=profiler,
+                    )
+                except UnsupportedPrefillMask as exc:
+                    # Preserve exact upstream semantics instead of guessing at
+                    # additive/string/custom masks.
+                    if ctx is None or not ctx.get("mask_fallback_warned", False):
+                        default_logger.warning(
+                            "[EXO][GLM-5.2][Prefill] sparse mask unsupported; "
+                            f"using masked-dense fallback: {exc}"
+                        )
+                        if ctx is not None:
+                            ctx["mask_fallback_warned"] = True
+                else:
+                    if profiler is not None:
+                        profiler.finish(output, path="sparse")
+                    return output
+
+            # Original decode and masked-dense prefill path. Decode is preserved
+            # byte-for-byte in its gather/mask behavior.
             if topk_indices is not None:
                 if L == 1:
                     idx = topk_indices[:, :, 0, :, None]
@@ -410,10 +527,6 @@ def _patch_mlx_lm_classes_once() -> None:
                         axis=2,
                     )
                     if mask is not None and hasattr(cache[0], "left_padding"):
-                        # Keep this branch fully on-device. Calling .item() here
-                        # introduces a GPU->CPU sync per attention layer on every
-                        # decode token, which is especially costly under multi-node
-                        # Tensor/JACCL execution.
                         gathered_idx = topk_indices[:, :, 0, :]
                         left_pad = cache[0].left_padding[:, None, None]
                         mask = (gathered_idx >= left_pad)[:, :, None, :]
@@ -432,13 +545,8 @@ def _patch_mlx_lm_classes_once() -> None:
                     if mask is not None:
                         sparse_mask = sparse_mask & mask
                     mask = sparse_mask
-
-            # Keep the indexer graph bounded only for layers that actually ran an
-            # indexer. Shared IndexShare layers keep a minimal zero-filled cache[1]
-            # (populated above) purely so mlx's cache-state evaluation stays valid;
-            # its contents are never read.
-            if indexer_was_called and cache is not None and cache[0] is not None:
-                cache[0].keys = mx.depends(cache[0].keys, (cache[1].keys, cache[1].values))
+                    if profiler is not None:
+                        profiler.stage("sparse_mask_build", mask)
 
             pe_scores = (q_pe * self.scale) @ k_pe.swapaxes(-1, -2)
             if mask is not None:
@@ -447,6 +555,8 @@ def _patch_mlx_lm_classes_once() -> None:
                     pe_scores,
                     mx.array(mx.finfo(pe_scores.dtype).min, pe_scores.dtype),
                 )
+            if profiler is not None:
+                profiler.stage("pe_scores_full", pe_scores)
 
             if L == 1:
                 q_nope = self.embed_q(q_nope)
@@ -454,6 +564,8 @@ def _patch_mlx_lm_classes_once() -> None:
             else:
                 k = self.embed_q(kv_latent, transpose=False)
                 v = self.unembed_out(kv_latent)
+                if profiler is not None:
+                    profiler.stage("kv_materialize", k, v)
 
             output = scaled_dot_product_attention(
                 q_nope,
@@ -463,15 +575,20 @@ def _patch_mlx_lm_classes_once() -> None:
                 scale=self.scale,
                 mask=pe_scores,
             )
+            if profiler is not None:
+                profiler.stage("sdpa", output)
             if L == 1:
                 output = self.unembed_out(output)
             output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-            return self.o_proj(output)
+            output = self.o_proj(output)
+            if profiler is not None:
+                profiler.stage("unembed_o_proj_collective", output)
+                profiler.finish(output, path="decode" if L == 1 else "masked_dense")
+            return output
 
         DeepseekV32Attention.__call__ = _exo_attention_call
 
     _CLASSES_PATCHED = True
-
 
 def _fix_indexer_rope_noninterleaved(
     attn: Any,
@@ -582,12 +699,19 @@ def apply_glm52_indexshare_patch(
     ):
         return model
 
+    # Resolve and hash-check the pinned mlx-lm hot paths before monkey-patching
+    # their classes. A mismatch disables W3/W4 but leaves existing IndexShare
+    # behavior available.
+    from mlx_lm.models import deepseek_v32
+
+    prefill_cfg = read_prefill_config(deepseek_v32, logger=logger)
     _patch_mlx_lm_classes_once()
 
     inner = _inner_model(model)
     setattr(inner, "_exo_glm52_indexshare_enabled", True)
     setattr(inner, "_exo_glm52_indexer_types", indexer_types)
     setattr(inner, "_exo_glm52_indexshare_sources", sources)
+    setattr(inner, "_exo_glm52_prefill_cfg", prefill_cfg)
 
     full_count = 0
     shared_count = 0
@@ -657,6 +781,27 @@ def apply_glm52_indexshare_patch(
         )
     indexer_rope_fixed = 0
 
+    if prefill_cfg.profile_layers:
+        profile_layers = set(prefill_cfg.profile_layers)
+    elif prefill_cfg.profile:
+        # Default to one full and one shared layer so attribution catches both
+        # indexer compute and shared-cache/IndexShare reuse.
+        profile_layers: set[int] = set()
+        first_full = next(
+            (i for i, typ in enumerate(indexer_types) if typ in {"full", "sparse"}),
+            None,
+        )
+        first_shared = next(
+            (i for i, typ in enumerate(indexer_types) if typ == "shared"),
+            None,
+        )
+        if first_full is not None:
+            profile_layers.add(first_full)
+        if first_shared is not None:
+            profile_layers.add(first_shared)
+    else:
+        profile_layers = set()
+
     for i, layer in enumerate(layers):
         if layer is None:
             continue
@@ -684,6 +829,8 @@ def apply_glm52_indexshare_patch(
         setattr(attn, "_exo_glm52_indexer_type", typ)
         setattr(attn, "_exo_glm52_indexshare_source", sources[i])
         setattr(attn, "_exo_glm52_index_head_dim", index_head_dim)
+        setattr(attn, "_exo_glm52_prefill_cfg", prefill_cfg)
+        setattr(attn, "_exo_glm52_profile_selected", i in profile_layers)
 
     logger.info(
         "[EXO][GLM-5.2][IndexShare] enabled: "
@@ -695,8 +842,25 @@ def apply_glm52_indexshare_patch(
         f"indexer_rope_fixed={indexer_rope_fixed}, "
         f"validate={_env_bool('EXO_GLM52_INDEXSHARE_VALIDATE', 'EXO_GLM_INDEXSHARE_VALIDATE', default=True)}, "
         f"strict_checkpoint={_env_bool('EXO_GLM52_INDEXSHARE_STRICT_CHECKPOINT', 'EXO_GLM_INDEXSHARE_STRICT_CHECKPOINT', default=False)}, "
-        f"missing_fallback={_env_choice('EXO_GLM52_INDEXSHARE_MISSING', 'EXO_GLM_INDEXSHARE_MISSING', default='dense', allowed={'dense', 'error'})}"
+        f"missing_fallback={_env_choice('EXO_GLM52_INDEXSHARE_MISSING', 'EXO_GLM_INDEXSHARE_MISSING', default='dense', allowed={'dense', 'error'})}, "
+        f"hotpath_compatible={prefill_cfg.hotpath_compatible}, "
+        f"sparse_mode={prefill_cfg.sparse_mode}, "
+        f"sparse_q_chunk={prefill_cfg.sparse_q_chunk}, "
+        f"sparse_min_kv={prefill_cfg.sparse_min_kv}, "
+        f"indexer_mode={prefill_cfg.indexer_mode}, "
+        f"indexer_q_chunk={prefill_cfg.indexer_q_chunk}, "
+        f"indexer_k_chunk={prefill_cfg.indexer_k_chunk}, "
+        f"cache_growth={prefill_cfg.cache_growth or 'off'}, "
+        f"shared_index_cache={prefill_cfg.shared_index_cache}, "
+        f"profile_layers={sorted(profile_layers)}, "
+        f"upstream_indexer_sha256={prefill_cfg.upstream_indexer_sha256}, "
+        f"upstream_attention_sha256={prefill_cfg.upstream_attention_sha256}"
     )
+    if not prefill_cfg.hotpath_compatible:
+        logger.warning(
+            "[EXO][GLM-5.2][Prefill] compatibility guard: "
+            f"{prefill_cfg.compatibility_reason}"
+        )
     if diag:
         examples: list[str] = []
         for i, typ in enumerate(indexer_types):
