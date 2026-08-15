@@ -55,6 +55,11 @@ from exo.worker.engines.mlx.constants import (
     KV_GROUP_SIZE,
     MAX_TOKENS,
 )
+from exo.worker.engines.mlx.prefill_config import (
+    PrefillTelemetry,
+    assert_distributed_prefill_config,
+    resolve_prefill_step,
+)
 from exo.worker.engines.mlx.generator.remote_prefill import remote_prefill
 from exo.worker.engines.mlx.types import KVCacheType, Model
 from exo.worker.engines.mlx.utils_mlx import (
@@ -303,19 +308,32 @@ def prefill(
 
     logger.debug(f"Prefilling {num_tokens} tokens...")
     start_time = time.perf_counter()
+    prefill_step_size = resolve_prefill_step(logger)
+    is_pipeline = _has_pipeline_communication_layer(model)
+    pipeline_prefill_active = is_pipeline and num_tokens >= prefill_step_size
+    if pipeline_prefill_active:
+        assert group is not None, "Pipeline prefill requires a distributed group"
+        expected_segment_tokens = max(
+            1, prefill_step_size // min(4, group.size())
+        )
+    else:
+        expected_segment_tokens = prefill_step_size
+    prefill_fingerprint = assert_distributed_prefill_config(
+        group, prefill_step_size, logger
+    )
+    telemetry = PrefillTelemetry(
+        logger=logger,
+        expected_segment_tokens=expected_segment_tokens,
+        start_time=start_time,
+    )
     has_ssm = has_non_kv_caches(cache)
     snapshots: list[CacheSnapshot] = []
 
     # TODO(evan): kill the callbacks/runner refactor
     def progress_callback(processed: int, total: int) -> None:
-        elapsed = time.perf_counter() - start_time
-        tok_per_sec = processed / elapsed if elapsed > 0 else 0
-        logger.debug(
-            f"Prefill progress: {processed}/{total} tokens ({tok_per_sec:.1f} tok/s)"
-        )
+        telemetry.update(processed, total)
         if has_ssm:
             snapshots.append(snapshot_ssm_states(cache))
-
         if on_prefill_progress is not None:
             on_prefill_progress(processed, total)
 
@@ -327,14 +345,15 @@ def prefill(
     set_pipeline_prefill(model, is_prefill=True)
 
     mx_barrier(group)
-    logger.info("Starting prefill")
-
-    is_pipeline = _has_pipeline_communication_layer(model)
-
-    prefill_step_size = 4096
+    logger.info(
+        "Starting prefill: "
+        f"tokens={num_tokens} step={prefill_step_size} "
+        f"pipeline={pipeline_prefill_active} "
+        f"config_fingerprint={prefill_fingerprint[:16]}"
+    )
 
     try:
-        if is_pipeline and num_tokens >= prefill_step_size:
+        if pipeline_prefill_active:
             set_pipeline_queue_sends(model, queue_sends=True)
             assert group is not None, "Pipeline prefill requires a distributed group"
             pipeline_parallel_prefill(
