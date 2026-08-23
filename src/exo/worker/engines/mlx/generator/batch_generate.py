@@ -337,6 +337,7 @@ class ExoBatchGenerator:
         )
         _step_tic = time.perf_counter()
         _, responses = self._mlx_gen.next()
+        from exo.worker.engines.mlx.patches.resource_guard import tick as _rg_tick; _rg_tick()
         _next_elapsed = time.perf_counter() - _step_tic
 
         topk = take_ready_topk(gb)
