@@ -23,6 +23,35 @@ def _is_glm52_indexshare_model(model) -> bool:
     return bool(getattr(inner, "_exo_glm52_indexshare_enabled", False))
 
 
+_GRAPH_CHAIN_CACHE_MODELS = ("deepseekv4",)
+
+
+def _is_graph_chain_cache_model(model) -> bool:
+    """Models whose caches chain un-detached per-step graphs (mlx-lm #1332).
+
+    DeepSeek-V4 pooling/indexer caches rebuild state via ``mx.concatenate``
+    every decode step; the cache holds the graph head, so each prior step's
+    intermediate array stays resident. Without periodically materializing the
+    cache state the Metal live-buffer cap (499000) is exhausted after a few
+    thousand tokens (~1 buffer per cache per step) and the runner dies inside
+    a jaccl collective, wedging RDMA on the peers.
+    """
+    inner = getattr(model, "model", model)
+    return type(inner).__name__.lower().startswith(_GRAPH_CHAIN_CACHE_MODELS)
+
+
+def _auto_drain_every(model) -> int:
+    if _is_glm52_indexshare_model(model):
+        return 1
+    if _is_graph_chain_cache_model(model):
+        raw = os.environ.get("EXO_CACHE_DRAIN_AUTO_EVERY", "1")
+        try:
+            return max(1, int(raw.strip()))
+        except (ValueError, AttributeError):
+            return 1
+    return 0
+
+
 def _cache_drain_every(batch: GenerationBatch) -> int:
     """How often to force-materialize prompt cache state during decode.
 
@@ -35,7 +64,7 @@ def _cache_drain_every(batch: GenerationBatch) -> int:
     raw = os.environ.get("EXO_CACHE_DRAIN_EVERY", _CACHE_DRAIN_DEFAULT_AUTO)
     raw = raw.strip().lower()
     if raw in {"", "auto"}:
-        return 1 if _is_glm52_indexshare_model(getattr(batch, "model", None)) else 0
+        return _auto_drain_every(getattr(batch, "model", None))
     if raw in {"off", "false", "no", "n"}:
         return 0
     if raw in {"on", "true", "yes", "y"}:
@@ -43,7 +72,7 @@ def _cache_drain_every(batch: GenerationBatch) -> int:
     try:
         return max(0, int(raw))
     except ValueError:
-        return 1 if _is_glm52_indexshare_model(getattr(batch, "model", None)) else 0
+        return _auto_drain_every(getattr(batch, "model", None))
 
 
 def _drain_prompt_cache_if_needed(batch: GenerationBatch) -> None:
@@ -57,7 +86,11 @@ def _drain_prompt_cache_if_needed(batch: GenerationBatch) -> None:
         return
 
     try:
-        mx.eval([cache.state for cache in batch.prompt_cache])
+        states = [cache.state for cache in batch.prompt_cache]
+        if _bool_env("EXO_CACHE_DRAIN_ASYNC", False):
+            mx.async_eval(states)
+        else:
+            mx.eval(states)
     except Exception as exc:  # noqa: BLE001 - cache drain is a stability aid only
         if _bool_env("EXO_CACHE_DRAIN_WARN", False):
             try:
