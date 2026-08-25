@@ -150,6 +150,33 @@ def take_ready_topk(batch: GenerationBatch) -> BatchTopKLogprobs:
     return _get_buffer(batch).ready
 
 
+def _advance_chain_arrays(prompt_cache) -> list:
+    """Lazy per-step chains that nothing else evaluates.
+
+    In batch mode the generator sets ``lengths``/``left_padding`` mx-arrays on
+    every ArraysCache, and linear-attention models call ``cache.advance(N)``
+    per layer per token. ``advance`` rebuilds both arrays lazily
+    (``self.lengths -= N``), the chains are excluded from ``cache.state`` (so
+    the periodic drain never touches them) and, on some models, from the token
+    graph as well — retaining ~1 live Metal buffer per linear layer per token
+    until the generation's cache dies. Evaluating them with the step keeps
+    every chain at length <= 1. Standalone mlx_lm has both set to None, which
+    is why the leak never reproduces outside the batch path.
+    """
+    out = []
+    stack = list(prompt_cache or ())
+    while stack:
+        c = stack.pop()
+        for attr in ("lengths", "left_padding"):
+            v = getattr(c, attr, None)
+            if v is not None:
+                out.append(v)
+        sub = getattr(c, "caches", None)
+        if sub:
+            stack.extend(sub)
+    return out
+
+
 def _patched_step(self: GenerationBatch) -> tuple[list[int], list[mx.array]]:
     self._current_tokens = self._next_tokens
     self._current_logprobs = self._next_logprobs
@@ -207,9 +234,14 @@ def _patched_step(self: GenerationBatch) -> tuple[list[int], list[mx.array]]:
             pending_indices,
             pending_values,
             pending_selected,
+            *_advance_chain_arrays(self.prompt_cache),
         )
     else:
-        mx.async_eval(self._next_tokens, self._next_logprobs)
+        mx.async_eval(
+            self._next_tokens,
+            self._next_logprobs,
+            *_advance_chain_arrays(self.prompt_cache),
+        )
 
     current_lp = self._current_logprobs
     if isinstance(current_lp, mx.array):
