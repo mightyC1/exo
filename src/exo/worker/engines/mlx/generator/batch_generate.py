@@ -327,6 +327,15 @@ class ExoBatchGenerator:
         return uid
 
     def step(self) -> list[tuple[int, GenerationResponse]]:
+        from exo.worker.engines.mlx.patches.prefix_flush import take_request as _pf_take
+        if _pf_take() and self.kv_prefix_cache is not None:
+            import gc as _gc
+            import mlx.core as _mx
+            n = len(self.kv_prefix_cache.caches)
+            self.kv_prefix_cache.clear()
+            _gc.collect()
+            _mx.clear_cache()
+            logger.info(f"prefix-flush: dropped {n} parked cache entries (SIGUSR1)")
         if not self.has_work:
             return []
 

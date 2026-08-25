@@ -110,6 +110,8 @@ def entrypoint(
             )
 
         runner = Runner(bound_instance, builder, event_sender_downcast, task_receiver)
+        from exo.worker.engines.mlx.patches.prefix_flush import install as _pf_install
+        _pf_install()
         runner.main()
     except ClosedResourceError:
         logger.warning("Runner communication closed unexpectedly")

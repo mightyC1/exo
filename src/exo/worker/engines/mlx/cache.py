@@ -47,6 +47,13 @@ _MEMORY_THRESHOLD = float(
     os.environ.get("EXO_MEMORY_THRESHOLD", _default_memory_threshold())
 )
 
+# Cap on parked prefix-cache entries. Parked caches are cheap in bytes but
+# expensive in Metal buffer count (~1k buffers per entry on DSV4-class
+# models), so the RAM-percentage eviction above never fires while the
+# per-process resource limit (499000 live buffers) is being eaten.
+# 0 disables the cap (legacy behaviour).
+_MAX_ENTRIES = int(os.environ.get("EXO_PREFIX_CACHE_MAX_ENTRIES", "32"))
+
 
 class CacheSnapshot:
     """Snapshot of states at a known token position."""
@@ -443,6 +450,22 @@ class KVPrefixCache:
             return
 
         evicted_any = False
+        # Entry-count cap first: collective-free, deterministic across ranks
+        if _MAX_ENTRIES > 0:
+            while len(self.caches) >= _MAX_ENTRIES:
+                lru_index = self._last_used.index(min(self._last_used))
+                evicted_tokens = len(self.prompts[lru_index])
+                self.prompts.pop(lru_index)
+                self.caches.pop(lru_index)
+                self._snapshots.pop(lru_index)
+                self._media_regions.pop(lru_index)
+                self._last_used.pop(lru_index)
+                self.prefill_tps.pop(lru_index)
+                evicted_any = True
+                logger.info(
+                    f"KV cache evicted LRU entry ({evicted_tokens} tokens) due to entry cap"
+                )
+
         # Evict LRU entries until below threshold
         while (
             len(self.caches) > 0
