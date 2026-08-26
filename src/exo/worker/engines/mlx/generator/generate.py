@@ -328,12 +328,19 @@ def prefill(
     )
     has_ssm = has_non_kv_caches(cache)
     snapshots: list[CacheSnapshot] = []
+    _snap_tick = 0
 
     # TODO(evan): kill the callbacks/runner refactor
     def progress_callback(processed: int, total: int) -> None:
         telemetry.update(processed, total)
         if has_ssm:
-            snapshots.append(snapshot_ssm_states(cache))
+            nonlocal _snap_tick
+            _snap_tick += 1
+            from exo.worker.engines.mlx.patches.ssm_snapshots import (
+                should_snapshot as _ssm_should_snapshot,
+            )
+            if _ssm_should_snapshot(_snap_tick, processed, total):
+                snapshots.append(snapshot_ssm_states(cache))
         if on_prefill_progress is not None:
             on_prefill_progress(processed, total)
 

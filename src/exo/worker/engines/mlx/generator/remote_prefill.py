@@ -69,4 +69,7 @@ def remote_prefill(
         f"transfer={(t_received - t0) * 1000:.0f}ms, "
         f"inject={(t_done - t_received) * 1000:.0f}ms"
     )
+    from exo.worker.engines.mlx.patches.ssm_snapshots import snapshots_enabled
+    if not snapshots_enabled():
+        return tps, num_tokens, []
     return tps, num_tokens, [snapshot_ssm_states(cache)]

@@ -513,6 +513,13 @@ class ExoBatchGenerator:
     ) -> None:
         if self.kv_prefix_cache is None:
             return
+        from exo.worker.engines.mlx.patches.ssm_snapshots import snapshots_enabled
+        from exo.worker.engines.mlx.cache import has_non_kv_caches
+        if not snapshots_enabled() and has_non_kv_caches(cache):
+            # off-режим: SSM-запись без снапшота нереюзабельна по построению
+            # (_get_snapshot -> (0, None) -> свежий кэш) — не тратим гигабайты
+            logger.debug("prefix cache: SSM parking skipped (EXO_SSM_SNAPSHOT_EVERY=off)")
+            return
 
         try:
             hit_ratio = (
