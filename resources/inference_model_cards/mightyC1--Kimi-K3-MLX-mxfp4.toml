@@ -18,13 +18,13 @@ base_model = "Kimi K3"
 capabilities = ["text", "thinking"]
 
 # v1 DoD = стабильные 128K (chunked prefill); 1M — P2. Поднять после P0-056.
-context_length = 131072
+context_length = 262144
 backends = ["MlxMetal"]
 
 # ~1.561 TB официального чекпоинта; converted-размер уточнить после B2
 # (byte-preserving repack экспертов + bf16 остальное => близко к исходному).
 [storage_size]
-in_bytes = 1561000000000
+in_bytes = 1559969222656
 
 # Официальные рекомендации K3 (HF-карточка, подтверждено 28.07.2026):
 # temperature=1.0; top_p=0.95 single-step / 1.0 agentic. Дефолт карточки —
