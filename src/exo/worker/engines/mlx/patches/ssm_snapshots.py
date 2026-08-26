@@ -9,7 +9,7 @@ EXO_SSM_SNAPSHOT_EVERY:
     "1" (default)  snapshot every prefill progress tick (legacy behaviour)
     "K" (int > 1)  snapshot every K-th tick PLUS always the final tick, so
                    exact-continuation reuse is byte-identical to legacy
-    "0"/"off"      no snapshots at all; callers must then also skip PARKING
+    "0"/"off"      only the mandatory rollback pair (last two ticks); callers skip PARKING
                    SSM entries (without a snapshot they can never be reused,
                    see KVPrefixCache._get_snapshot -> (0, None) -> fresh cache)
 """
@@ -37,13 +37,19 @@ def snapshots_enabled() -> bool:
 
 
 def should_snapshot(tick_index: int, processed: int, total: int) -> bool:
-    """tick_index is 1-based. The final tick (processed >= total) always
-    snapshots when enabled — continuation reuse depends on it."""
+    """tick_index is 1-based.
+
+    The last TWO ticks (processed >= total - 1) are snapshotted UNCONDITIONALLY,
+    in every mode including off: prefill's "+2 rollback" restores SSM state
+    from snapshots[-2] (state at total-1) because recurrent caches cannot be
+    trimmed backwards (see generate.py prefill / is_non_trimmable_cache_entry).
+    These two are a correctness requirement, not a reuse optimization.
+    """
+    if processed >= total - 1:
+        return True
     every = snapshot_every()
     if every == 0:
         return False
     if every == 1:
-        return True
-    if processed >= total:
         return True
     return tick_index % every == 0
