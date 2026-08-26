@@ -1,3 +1,38 @@
+<!-- fork-notice -->
+> ## ⚠️ Fork notice — `mightyC1/exo`
+>
+> Personal **production fork** for a 4-node Apple Silicon (M3 Ultra) cluster over
+> Thunderbolt-RDMA (JACCL, TP4). Deployed branch: **`mightyC1`**. Not general-purpose;
+> no support; expect force-pushes.
+>
+> **Delta vs upstream (`mightyC1` branch):**
+>
+> *Models (vendored, `src/exo/worker/engines/mlx/vendor/`)*
+> - **Kimi K3** (KDA+MLA, TP4 port): `kimi_k3*.py`, custom Metal kernels behind
+>   env gates (`EXO_K3_*`), tool parser
+> - **DeepSeek-V4** encoding (`deepseek_v4_encoding.py`, `dsml_encoding.py`)
+> - **MiMo v2**, **MiniMax M3 VL**, misc `custom_models.py`
+>
+> *GLM-5.2 IndexShare (`patches/`)*
+> - `glm52_indexshare.py` (interleaved-rope fix), `glm52_prefill.py` +
+>   `sparse_attention_dispatch.py` (sparse prefill, `EXO_GLM52_SPARSE_*`),
+>   `standard_yarn_rope.py`
+>
+> *Memory / stability — Aug 2026 Metal resource-limit incident
+> (**see [`docs/memory-knobs.md`](docs/memory-knobs.md)** for knobs & writeup)*
+> - per-step cache drain with per-model auto-gate (`opt_batch_gen.py`,
+>   `EXO_CACHE_DRAIN_*`)
+> - `ArraysCache.advance()` lazy-chain eval — family leak fix
+>   (1 buf/linear-layer/token in the batch path)
+> - `KVPrefixCache` entry cap + SIGUSR1 flush (`cache.py`, `prefix_flush.py`,
+>   `EXO_PREFIX_CACHE_MAX_ENTRIES`)
+> - Metal-buffer telemetry (`resource_guard.py`, `EXO_MLX_MEM_LOG_EVERY`)
+>
+> *Dependency pins (darwin, built from source on nodes)*
+> - `mlx` → [`mightyC1/mlx-jaccl-fix-small-recv`](https://github.com/mightyC1/mlx-jaccl-fix-small-recv)
+>   `mightyC1` (resource-limit 2M + `MLX_RESOURCE_LIMIT`; base `rltakashige` @ `cc3f3e60`)
+> - `mlx-lm` → `rltakashige/mlx-lm` `leo/deepseek-v4`
+
 <div align="center">
 
 <picture>
