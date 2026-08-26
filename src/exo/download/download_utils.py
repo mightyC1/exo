@@ -379,6 +379,14 @@ async def _build_file_list_from_local_directory(
     return None
 
 
+class HuggingFaceNotFoundError(Exception):
+    """Model/revision missing on HF (HTTP 404) — permanent, never retried."""
+
+
+# model_ids, про которые уже сообщили, что их нет на HF (раз на процесс)
+_hf_404_noted: set[str] = set()
+
+
 async def fetch_file_list_with_cache(
     model_id: ModelId,
     revision: str = "main",
@@ -428,12 +436,24 @@ async def fetch_file_list_with_cache(
             )
         return file_list
     except Exception as e:
-        logger.opt(exception=e).warning(
-            "Ran into exception when fetching file list from HF."
-        )
+        expected_404 = isinstance(e, HuggingFaceNotFoundError)
+        if expected_404:
+            # Локальные конверсии закономерно 404-ят на HF; фолбэк ниже —
+            # штатный путь. Один раз на модель, без трейсбека.
+            if model_id not in _hf_404_noted:
+                _hf_404_noted.add(model_id)
+                logger.info(
+                    f"{model_id} is not on HuggingFace (404); "
+                    "using cached/local file list"
+                )
+        else:
+            logger.opt(exception=e).warning(
+                "Ran into exception when fetching file list from HF."
+            )
+        _note = logger.debug if expected_404 else logger.warning
 
         if await aios.path.exists(cache_file):
-            logger.warning(
+            _note(
                 f"No cached file list for {model_id} - using local file list"
             )
             async with aiofiles.open(cache_file, "r") as f:
@@ -442,7 +462,7 @@ async def fetch_file_list_with_cache(
             model_id, recursive
         )
         if local_file_list is not None:
-            logger.warning(
+            _note(
                 f"Failed to fetch file list for {model_id} and no cache exists, using local file list"
             )
             return local_file_list
@@ -461,6 +481,8 @@ async def fetch_file_list_with_retry(
         try:
             return await _fetch_file_list(model_id, revision, path, recursive)
         except HuggingFaceAuthenticationError:
+            raise
+        except HuggingFaceNotFoundError:
             raise
         except HuggingFaceRateLimitError as e:
             if attempt == n_attempts - 1:
@@ -523,6 +545,10 @@ async def _fetch_file_list(
                     "and may be truncated; cursor pagination is not implemented"
                 )
             return files
+        elif response.status == 404:
+            raise HuggingFaceNotFoundError(
+                f"Model {model_id} not found on HuggingFace (404)"
+            )
         else:
             raise Exception(f"Failed to fetch file list: {response.status}")
 
