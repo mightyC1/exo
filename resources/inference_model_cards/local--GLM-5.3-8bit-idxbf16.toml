@@ -1,0 +1,29 @@
+# EXO model card: GLM-5.3 (big), self-quantized int8-g64 (idxbf16-стиль).
+# Числа из РЕАЛЬНОГО config.json (zai-org/GLM-5.3 @ 935644c).
+# Архитектура glm_moe_dsa == GLM-5.2: путь пин(deepseek_v32) + патчи
+# glm52_indexshare/glm52_prefill уже обкатан. Нативный IndexShare в конфиге:
+# indexer_types full@{0,1,2}, далее full каждый 4-й (offset 3).
+# int8 ~795GB -> только распределённо (x4: ~200GB/нода).
+
+model_id = "local/GLM-5.3-8bit-idxbf16"
+n_layers = 78                     # layers.78 (MTP) отброшен конвертером
+hidden_size = 6144                # %4 ok
+num_key_value_heads = 64          # TP: 64 голов MLA, x4 ok
+supports_tensor = true            # glm_moe_dsa TP-путь живой (GLM-5.2)
+tasks = ["TextGeneration"]
+family = "glm"
+quantization = "8bit"
+base_model = "GLM-5.3"
+capabilities = ["text", "thinking"]
+reasoning_dialect = "post_last_user"   # проверить по chat_template.jinja
+context_length = 1048576
+
+backends = ["MlxMetal"]
+
+[storage_size]
+# заполнить после конверсии: du -sb $DST | awk '{print $1}'
+bytes = 790155290197
+
+[sampling_defaults]
+temperature = 1.0
+top_p = 0.95
