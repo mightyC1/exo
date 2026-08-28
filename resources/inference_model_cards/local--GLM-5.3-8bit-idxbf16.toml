@@ -22,7 +22,7 @@ backends = ["MlxMetal"]
 
 [storage_size]
 # заполнить после конверсии: du -sb $DST | awk '{print $1}'
-bytes = 790155290197
+in_bytes = 790155290197
 
 [sampling_defaults]
 temperature = 1.0
