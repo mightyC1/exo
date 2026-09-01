@@ -413,15 +413,42 @@ def _patch_mlx_lm_classes_once() -> None:
                         )
             else:
                 if int(L) > 1 and cfg.indexer_enabled:
-                    topk_indices = tiled_indexer_call(
-                        self.indexer,
-                        x,
-                        qr,
-                        mask,
-                        cache[1],
-                        cfg,
-                        profiler=profiler,
-                    )
+                    if int(L) <= _MICRO_DECODE_L:
+                        # Micro multi-token decode (MTP verify, L=2): the
+                        # tiled/streaming indexer is prefill machinery (memory
+                        # bounds for huge score matrices); at L<=4 the full
+                        # score block is a few MB even at 147k kv, and the
+                        # monolithic call drops the per-cycle chunk-loop
+                        # overhead. Fail back to tiled on any surprise.
+                        try:
+                            topk_indices = self.indexer(x, qr, mask, cache=cache[1])
+                        except Exception:
+                            if ctx is None or not ctx.get("micro_mono_warned", False):
+                                default_logger.warning(
+                                    "[EXO][GLM-5.2][IndexShare] monolithic "
+                                    "micro-L indexer failed; using tiled path"
+                                )
+                                if ctx is not None:
+                                    ctx["micro_mono_warned"] = True
+                            topk_indices = tiled_indexer_call(
+                                self.indexer,
+                                x,
+                                qr,
+                                mask,
+                                cache[1],
+                                cfg,
+                                profiler=profiler,
+                            )
+                    else:
+                        topk_indices = tiled_indexer_call(
+                            self.indexer,
+                            x,
+                            qr,
+                            mask,
+                            cache[1],
+                            cfg,
+                            profiler=profiler,
+                        )
                 elif profiler is not None:
                     topk_indices = profiled_monolithic_indexer_call(
                         self.indexer,
