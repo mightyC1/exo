@@ -45,6 +45,11 @@ _MISSING = object()
 _CLASSES_PATCHED = False
 _DEFAULT_PREFILL_CFG = GLM52PrefillConfig()
 
+# Query lengths up to this ride the sparse gather path whenever the indexer
+# produced top-k, bypassing the sparse_min_kv prefill-economics threshold.
+# Covers the MTP verify forward (L=2) and any future micro multi-token decode.
+_MICRO_DECODE_L = 4
+
 
 def _env_raw(*names: str) -> str | None:
     for name in names:
@@ -457,12 +462,22 @@ def _patch_mlx_lm_classes_once() -> None:
                 )
 
             kv_length = int(kv_latent.shape[2])
+            # Micro multi-token decode (the MTP verify forward, L=2): the
+            # sparse_min_kv crossover is prefill economics (L~1024 chunks);
+            # for L<=_MICRO_DECODE_L gather-topk is strictly cheaper than
+            # dense whenever the indexer produced indices, and — decisive —
+            # it keeps the verify in the same topk math family as the L==1
+            # decode branch, so t1/h match what MTP=off would compute.
+            micro_decode = topk_indices is not None and 1 < int(L) <= _MICRO_DECODE_L
             sparse_requested = (
                 topk_indices is not None
                 and int(L) > 1
-                and cfg.sparse_enabled_for(
-                    query_length=int(L),
-                    kv_length=kv_length,
+                and (
+                    micro_decode
+                    or cfg.sparse_enabled_for(
+                        query_length=int(L),
+                        kv_length=kv_length,
+                    )
                 )
             )
             padded_batch_fallback = bool(
