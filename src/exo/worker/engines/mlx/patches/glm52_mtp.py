@@ -37,6 +37,7 @@ Consistency hooks (installed with the step wrapper):
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import time
@@ -145,9 +146,11 @@ def load_mtp_module(
     layer_idx: int,
     quant: dict[str, Any] | None,
     logger: Any = default_logger,
+    raw: dict[str, mx.array] | None = None,
 ) -> GLM52MTPModule:
     """Build the block and side-load mtp.safetensors (presence-driven quant)."""
-    raw = mx.load(str(weights_path))
+    if raw is None:
+        raw = mx.load(str(weights_path))
     weights: dict[str, mx.array] = {}
     for k, v in raw.items():
         nk = _rename_sidecar_key(k, layer_idx)
@@ -449,20 +452,41 @@ def _off(c: Any) -> int:
     return int(o)
 
 
-def _validate_cycle(state: _MTPState, batch: Any, m: int) -> None:
-    cl0 = batch.prompt_cache[0]
-    cl_last = batch.prompt_cache[-1]
-    off00, off01 = _off(cl0[0]), _off(cl0[1])
-    offl0, offl1 = _off(cl_last[0]), _off(cl_last[1])
-    if not (off00 == off01 == offl0 == offl1):
-        raise _MTPValidateError(
-            f"[MTP][VALIDATE] slot/layer offset skew: "
-            f"L0=({off00},{off01}) Ln=({offl0},{offl1})"
-        )
+def _validate_pre_verify(state: _MTPState, y: mx.array, drafts: list[mx.array]) -> None:
+    """Cross-rank agreement on the tokens about to enter the TP verify."""
     grp = _dist_group()
     if grp is None:
         return
-    mtp_off = _off(state.mtp_cache[0]) if state.mtp_cache is not None else 0
+    toks = [y.reshape(-1)[0:1].astype(mx.int32)] + [d.reshape(-1)[0:1].astype(mx.int32) for d in drafts]
+    vec = mx.concatenate(toks)
+    total = mx.distributed.all_sum(vec, group=grp)
+    mx.eval(total)
+    if not mx.array_equal(total, vec * grp.size()).item():
+        raise _MTPValidateError(
+            f"[MTP][VALIDATE] pre-verify token divergence: local={vec.tolist()} "
+            f"sum={total.tolist()} size={grp.size()}"
+        )
+
+
+def _validate_cycle(state: _MTPState, batch: Any, m: int, base: int | None = None) -> None:
+    offs = [[_cur(c) for c in cl.caches] for cl in batch.prompt_cache]
+    flat = {o for row in offs for o in row}
+    if len(flat) != 1:
+        bad = [(i, row) for i, row in enumerate(offs) if len(set(row)) != 1 or row[0] != offs[0][0]]
+        raise _MTPValidateError(f"[MTP][VALIDATE] slot/layer offset skew at layers {bad[:3]}")
+    if base is not None and offs[0][0] != base + 1 + m:
+        raise _MTPValidateError(
+            f"[MTP][VALIDATE] committed delta {offs[0][0] - base} != 1+m={1 + m}"
+        )
+    if state.mtp_cache is not None:
+        mo = [_cur(c) for c in state.mtp_cache.caches]
+        if len(set(mo)) != 1:
+            raise _MTPValidateError(f"[MTP][VALIDATE] MTP slot skew {mo}")
+    off00 = offs[0][0]
+    grp = _dist_group()
+    if grp is None:
+        return
+    mtp_off = _cur(state.mtp_cache[0]) if state.mtp_cache is not None else 0
     vec = mx.array([m, off00, mtp_off, len(state.buffer)], dtype=mx.int32)
     total = mx.distributed.all_sum(vec, group=grp)
     mx.eval(total)
@@ -701,6 +725,9 @@ def _battle_step(state: _MTPState, prev_step: Any, batch: Any):
         d_next, h_mtp = state.draft_multi([(h_mtp, drafts[-1])])
         drafts.append(d_next)
 
+    base_off = _cur(batch.prompt_cache[0][0]) if state.validate else None
+    if state.validate:
+        _validate_pre_verify(state, y, drafts)
     verify_in = mx.concatenate(
         [y.reshape(-1)[0:1]] + [x.astype(y.dtype).reshape(-1)[0:1] for x in drafts]
     ).reshape(1, k + 1)
@@ -801,7 +828,7 @@ def _battle_step(state: _MTPState, prev_step: Any, batch: Any):
             state.p_build = state.p_resolve = state.p_post = 0.0
     state.account_cycle(m)
     if state.validate:
-        _validate_cycle(state, batch, m)
+        _validate_cycle(state, batch, m, base=base_off)
     return [ti], [_lp_row(y_lp)]
 
 
@@ -940,18 +967,67 @@ _REQUIRED_FAMILIES = (
 )
 
 
-def _validate_sidecar(weights_path: Path, layer_idx: int) -> tuple[bool, str]:
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(64 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _validate_sidecar(
+    weights_path: Path, layer_idx: int, *, quant: dict[str, Any] | None, logger: Any
+) -> tuple[dict[str, mx.array] | None, str]:
+    """Fail-closed side-car validation: manifest present, byte size and
+    SHA-256 match, policy fields agree with the model, required tensor
+    families present, and — under TP — the digest identical on every rank
+    (different side-cars would feed different draft tokens into the TP
+    verify before VALIDATE could see it). Returns the loaded tensors."""
     if not weights_path.is_file():
-        return False, f"{weights_path} not found"
+        return None, f"{weights_path} not found"
+    manifest_path = weights_path.with_name("mtp.manifest.json")
+    if not manifest_path.is_file():
+        return None, f"{manifest_path.name} missing next to side-car"
     try:
-        keys = set(mx.load(str(weights_path)).keys())
+        manifest = json.loads(manifest_path.read_text())
+    except Exception as e:  # noqa: BLE001
+        return None, f"cannot read manifest: {e!r}"
+    size = weights_path.stat().st_size
+    if int(manifest.get("bytes", -1)) != size:
+        return None, f"side-car size {size} != manifest {manifest.get('bytes')}"
+    if int(manifest.get("layer", layer_idx)) != layer_idx:
+        return None, f"manifest layer {manifest.get('layer')} != {layer_idx}"
+    q = quant or {}
+    pol = ((manifest.get("policy", {}) or {}).get("quant", {}) or {})
+    for key, want in (("bits", int(q.get("bits", 8))), ("group_size", int(q.get("group_size", 64)))):
+        have = pol.get(key)
+        if have is not None and int(have) != want:
+            return None, f"manifest policy {key}={have} != model {want}"
+    t0 = time.perf_counter()
+    digest = _sha256_file(weights_path)
+    if digest != str(manifest.get("sha256", "")):
+        return None, "side-car SHA-256 does not match manifest"
+    logger.info(f"[MTP] side-car sha256 verified ({digest[:16]}…) in {time.perf_counter() - t0:.1f}s")
+
+    grp = _dist_group()
+    if grp is not None:
+        words = mx.array(
+            [int(digest[i:i + 8], 16) & 0x7FFFFFFF for i in range(0, 64, 8)], dtype=mx.int32
+        )
+        total = mx.distributed.all_sum(words, group=grp)
+        mx.eval(total)
+        if not mx.array_equal(total, words * grp.size()).item():
+            return None, "side-car digest differs across ranks"
+
+    try:
+        raw = mx.load(str(weights_path))
     except Exception as e:  # noqa: BLE001 — fail-closed with reason
-        return False, f"cannot read {weights_path}: {e!r}"
-    renamed = {_rename_sidecar_key(k, layer_idx) for k in keys}
+        return None, f"cannot read {weights_path}: {e!r}"
+    renamed = {_rename_sidecar_key(k, layer_idx) for k in raw.keys()}
     missing = [f for f in _REQUIRED_FAMILIES if f not in renamed]
     if missing:
-        return False, f"sidecar missing families: {missing[:4]}"
-    return True, "ok"
+        return None, f"sidecar missing families: {missing[:4]}"
+    return raw, "ok"
 
 
 def apply_glm52_mtp_patch(
@@ -1002,8 +1078,10 @@ def apply_glm52_mtp_patch(
         model_path / "mtp.safetensors" if raw_weights in ("", "auto")
         else Path(raw_weights).expanduser()
     )
-    ok, reason = _validate_sidecar(weights_path, layer_idx)
-    if not ok:
+    raw, reason = _validate_sidecar(
+        weights_path, layer_idx, quant=config.get("quantization"), logger=logger
+    )
+    if raw is None:
         logger.warning(f"[MTP] {reason}; patch not applied")
         return model
 
@@ -1017,7 +1095,7 @@ def apply_glm52_mtp_patch(
     try:
         mtp = load_mtp_module(
             args, weights_path, layer_idx=layer_idx,
-            quant=config.get("quantization"), logger=logger,
+            quant=config.get("quantization"), logger=logger, raw=raw,
         )
     except Exception:
         logger.opt(exception=True).warning(

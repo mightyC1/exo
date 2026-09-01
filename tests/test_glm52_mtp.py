@@ -917,7 +917,7 @@ def test_validate_error_is_not_swallowed(off_stream, sidecar, monkeypatch):
     state = _battle_state(model, sidecar, k=1)
     state.validate = True
 
-    def boom(state_, batch, m):
+    def boom(state_, batch, m, base=None):
         raise gm._MTPValidateError("injected validate failure")
 
     monkeypatch.setattr(gm, "_validate_cycle", boom)
@@ -942,3 +942,71 @@ def test_norm_wrapper_keeps_parameter_tree(sidecar):
     assert before == after
     assert mx.array_equal(model.model.norm(x), ref).item()
     mx.eval(model.parameters())
+
+
+# ---------------------------------------------------------------------------
+# Audit P0.6: side-car content validation (fail-closed)
+# ---------------------------------------------------------------------------
+
+
+def _model_dir_for(tmp_path, sidecar: Path, mutate=None) -> Path:
+    import shutil
+
+    d = tmp_path / "model"
+    d.mkdir()
+    shutil.copy(sidecar, d / "mtp.safetensors")
+    shutil.copy(sidecar.with_name("mtp.manifest.json"), d / "mtp.manifest.json")
+    (d / "config.json").write_text(json.dumps({
+        "model_type": "glm_moe_dsa", "num_nextn_predict_layers": 1,
+        "num_hidden_layers": LAYER,
+        "quantization": {"group_size": 64, "bits": 8, "mode": "affine"},
+    }))
+    if mutate:
+        mutate(d)
+    return d
+
+
+def _apply_on_tiny(model, d, monkeypatch):
+    from exo.worker.engines.mlx.patches import glm52_mtp as gm
+
+    monkeypatch.setenv("EXO_GLM52_MTP", "on")
+    log = _StubLogger()
+    _detach(model)
+    out = gm.apply_glm52_mtp_patch(model, d, logger=log)
+    applied = hasattr(model, "_exo_glm52_mtp_state")
+    _detach(model)
+    return applied, log
+
+
+def test_sidecar_valid_applies(sidecar, tmp_path, monkeypatch):
+    model = _tiny_model()
+    applied, log = _apply_on_tiny(model, _model_dir_for(tmp_path, sidecar), monkeypatch)
+    assert applied, log.lines
+    assert any("sha256 verified" in line for line in log.lines)
+
+
+def test_sidecar_corrupted_bytes_rejected(sidecar, tmp_path, monkeypatch):
+    def corrupt(d):
+        pth = d / "mtp.safetensors"
+        b = bytearray(pth.read_bytes()); b[-1] ^= 0xFF; pth.write_bytes(bytes(b))
+    model = _tiny_model()
+    applied, log = _apply_on_tiny(model, _model_dir_for(tmp_path, sidecar, corrupt), monkeypatch)
+    assert not applied and any("SHA-256" in line for line in log.lines)
+
+
+def test_sidecar_missing_manifest_rejected(sidecar, tmp_path, monkeypatch):
+    model = _tiny_model()
+    applied, log = _apply_on_tiny(
+        model, _model_dir_for(tmp_path, sidecar, lambda d: (d / "mtp.manifest.json").unlink()), monkeypatch
+    )
+    assert not applied and any("manifest" in line for line in log.lines)
+
+
+def test_sidecar_policy_mismatch_rejected(sidecar, tmp_path, monkeypatch):
+    def bad_policy(d):
+        m = json.loads((d / "mtp.manifest.json").read_text())
+        m["policy"]["quant"]["bits"] = 4
+        (d / "mtp.manifest.json").write_text(json.dumps(m))
+    model = _tiny_model()
+    applied, log = _apply_on_tiny(model, _model_dir_for(tmp_path, sidecar, bad_policy), monkeypatch)
+    assert not applied and any("policy" in line for line in log.lines)
