@@ -658,3 +658,85 @@ def test_k2_flush_rolls_back_r2_and_r1(off_stream, sidecar):
         finally:
             _detach(model)
         assert (emitted + toks_after) == ref, (pops, emitted, toks_after, ref)
+
+
+
+def _oracle_draftk(state_holder, k):
+    """k-step oracle: step j peeks [y, d1..d_{j-1}] (calls cycle mod k)."""
+    mem = {"n": 0, "seq": None}
+
+    def draft(pairs):
+        gb = state_holder[0].cur_batch
+        tok = pairs[-1][1].reshape(1, 1).astype(mx.uint32)
+        if mem["n"] % k == 0:
+            mem["seq"] = tok
+        else:
+            mem["seq"] = mx.concatenate([mem["seq"], tok], axis=1)
+        mem["n"] += 1
+        seq = mem["seq"]
+        lg = gb.model(seq, cache=gb.prompt_cache)
+        t = mx.argmax(lg[:, -1, :], axis=-1).reshape(1)
+        mx.eval(t)
+        for cl in gb.prompt_cache:
+            cl.trim(seq.shape[1])
+        return t, pairs[-1][0]
+    return draft
+
+
+def test_k3_byte_equal_all_accept(off_stream, sidecar):
+    model, ref = off_stream
+    state, toks, _ = _run_on(model, sidecar, N_GEN, lambda h: _oracle_draftk(h, 3), k=3)
+    assert state.acc_pos[2] > 0, "oracle3 must produce m=3 cycles"
+    assert toks == ref, f"k3(all-accept) diverged: {toks} vs {ref}"
+
+
+def test_k3_byte_equal_all_reject_and_real(off_stream, sidecar):
+    model, ref = off_stream
+    state, toks, _ = _run_on(
+        model, sidecar, N_GEN, lambda h: (lambda pairs: (mx.array([3]), pairs[-1][0])), k=3
+    )
+    assert state.accepted == 0 and toks == ref
+    state, toks, _ = _run_on(model, sidecar, N_GEN, None, k=3)
+    assert state.cycles > 0 and toks == ref
+
+
+def test_k3_extract_parities(off_stream, sidecar):
+    model, _ = off_stream
+    for n in (5, 6, 7, 8):
+        _, _, last = _run_on(model, sidecar, n, lambda h: _oracle_draftk(h, 3), k=3)
+        assert last.finish_reason == "length"
+        assert last.prompt_cache[0][0].offset == len(last.all_tokens), n
+
+
+def test_norm_capture_modes():
+    from exo.worker.engines.mlx.patches.glm52_mtp import _PreNormCapture
+
+    norm = nn.RMSNorm(8, eps=1e-6)
+    norm.weight = mx.arange(1, 9).astype(mx.float32)  # non-uniform: pre != post
+    x = mx.random.normal((1, 3, 8))
+    post_store, pre_store = {}, {}
+    _PreNormCapture(norm, post_store, mode="post")(x)
+    _PreNormCapture(norm, pre_store, mode="pre")(x)
+    assert mx.array_equal(post_store["h"], norm(x)).item()
+    assert mx.array_equal(pre_store["h"], x).item()
+    assert not mx.array_equal(post_store["h"], pre_store["h"]).item()
+
+
+def test_chain_recycles_post_norm(sidecar):
+    """The hidden handed to the next chained step must be head_norm(block out)."""
+    m = _load(sidecar)
+    embed = nn.Embedding(97, HID)
+    lm_head = nn.Linear(HID, 97, bias=False)
+    st = _State2(mode="on", concat="eh", mtp=m, embed=embed, lm_head=lm_head,
+                 store={}, logger=_StubLogger(), draft_k=2)
+    st.start_request(uid=1)
+    h = mx.random.normal((1, 1, HID)).astype(mx.bfloat16)
+    _, h_rec = st.draft_multi([(h, mx.array([5], dtype=mx.uint32))])
+    # re-run the block computation manually on a fresh state to compare
+    st2 = _State2(mode="on", concat="eh", mtp=m, embed=embed, lm_head=lm_head,
+                  store={}, logger=_StubLogger(), draft_k=2)
+    st2.start_request(uid=2)
+    e = m.enorm(embed(mx.array([[5]], dtype=mx.uint32)))
+    x = m.eh_proj(mx.concatenate([e, m.hnorm(h.astype(e.dtype))], axis=-1))
+    y = m.block(x, mask=None, cache=st2.mtp_cache)
+    assert mx.array_equal(h_rec, m.head_norm(y[:, -1:, :])).item()

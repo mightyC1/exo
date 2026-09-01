@@ -56,6 +56,7 @@ _ENV_VALIDATE = "EXO_GLM52_MTP_VALIDATE"
 _ENV_DRAFT_K = "EXO_GLM52_MTP_DRAFT_K"
 _ENV_TRACE = "EXO_GLM52_MTP_TRACE"
 _ENV_PROF = "EXO_GLM52_MTP_PROF"
+_ENV_HIDDEN = "EXO_GLM52_MTP_HIDDEN"
 
 _LOG_EVERY = 64
 _WIN = 256
@@ -186,15 +187,22 @@ def load_mtp_module(
 
 
 class _PreNormCapture:
-    """Passthrough wrapper over the model's final norm; stores its input."""
+    """Passthrough wrapper over the model's final norm.
 
-    def __init__(self, orig: Any, store: dict[str, Any]) -> None:
+    mode="post" (default, matches vLLM: DeepseekV2Model.forward returns the
+    normed hidden and the MTP proposer consumes it) stores the norm output;
+    mode="pre" stores its input (donor convention, kept for A/B).
+    """
+
+    def __init__(self, orig: Any, store: dict[str, Any], mode: str = "post") -> None:
         self._orig = orig
         self._store = store
+        self._mode = mode
 
     def __call__(self, x: mx.array) -> mx.array:
-        self._store["h"] = x
-        return self._orig(x)
+        out = self._orig(x)
+        self._store["h"] = out if self._mode == "post" else x
+        return out
 
     @property
     def weight(self) -> Any:  # keep donors of .weight working
@@ -234,7 +242,7 @@ class _MTPState:
         self.prof = prof
         self.draft_k = draft_k
         self.cycle_pack: tuple | None = None
-        self.acc_pos = [0, 0]  # accepted at draft position 1 / 2
+        self.acc_pos = [0, 0, 0]  # accepted at draft positions 1..3
         self.p_build = 0.0
         self.p_resolve = 0.0
         self.p_post = 0.0
@@ -279,7 +287,7 @@ class _MTPState:
         self.mtp_backlog = []
         self.flush_pack = None
         self.cycle_pack = None
-        self.acc_pos = [0, 0]
+        self.acc_pos = [0, 0, 0]
         self.cycles = 0
         self.proposed = 0
         self.accepted = 0
@@ -327,18 +335,17 @@ class _MTPState:
         self.proposed += self.draft_k
         self.accepted += m
         self.out_tokens += m + 1
-        if m >= 1:
-            self.acc_pos[0] += 1
-        if m >= 2:
-            self.acc_pos[1] += 1
+        for i in range(min(m, 3)):
+            self.acc_pos[i] += 1
         if self.cycles % _LOG_EVERY == 0:
             a1 = self.acc_pos[0] / max(self.cycles, 1)
             a2 = self.acc_pos[1] / max(self.acc_pos[0], 1)
+            a3 = self.acc_pos[2] / max(self.acc_pos[1], 1)
             self.logger.info(
                 f"[MTP] uid={self.uid} cycles={self.cycles} k={self.draft_k} "
                 f"proposed={self.proposed} accepted={self.accepted} "
                 f"accept_rate={self.accepted / self.proposed:.3f} "
-                f"a1={a1:.3f} a2={a2:.3f} out={self.out_tokens} "
+                f"a1={a1:.3f} a2={a2:.3f} a3={a3:.3f} out={self.out_tokens} "
                 f"eff_tokens_per_step={self.out_tokens / self.cycles:.3f}"
             )
 
@@ -347,11 +354,12 @@ class _MTPState:
         if self.cycles:
             a1 = self.acc_pos[0] / max(self.cycles, 1)
             a2 = self.acc_pos[1] / max(self.acc_pos[0], 1)
+            a3 = self.acc_pos[2] / max(self.acc_pos[1], 1)
             self.logger.info(
                 f"[MTP_SUMMARY] ({why}) uid={self.uid} req_cycles={self.cycles} "
                 f"k={self.draft_k} proposed={self.proposed} accepted={self.accepted} "
                 f"accept_rate={self.accepted / max(self.proposed, 1):.3f} "
-                f"a1={a1:.3f} a2={a2:.3f} out={self.out_tokens} "
+                f"a1={a1:.3f} a2={a2:.3f} a3={a3:.3f} out={self.out_tokens} "
                 f"eff_tokens_per_step={self.out_tokens / self.cycles:.3f} "
                 f"gen_tps={self.out_tokens / elapsed:.2f}"
             )
@@ -383,9 +391,12 @@ class _MTPState:
         if x.shape[1] > 1:
             mask = create_attention_mask(x, self.mtp_cache[0], return_array=True)
         y = self.mtp.block(x, mask=mask, cache=self.mtp_cache)
-        h_out = y[:, -1:, :]
-        logits = self.lm_head(self.mtp.head_norm(h_out))
-        return mx.argmax(logits[..., -1, :], axis=-1).reshape(1), h_out
+        # Recycle the POST-final-norm hidden into the next chained step
+        # (vLLM PR #47448: pre-norm recycle mismatches hnorm, 3.6 -> 4.4
+        # accepted length on GLM-5.2). Same tensor feeds the LM head.
+        h_post = self.mtp.head_norm(y[:, -1:, :])
+        logits = self.lm_head(h_post)
+        return mx.argmax(logits[..., -1, :], axis=-1).reshape(1), h_post
 
     def draft(self, h_last: mx.array, next_tok: mx.array) -> mx.array:
         return self.draft_multi([(h_last, next_tok)])[0]
@@ -573,11 +584,13 @@ def _battle_step(state: _MTPState, prev_step: Any, batch: Any):
     state.mtp_backlog = []
     d1, h_mtp = state.draft_multi(pairs)
     drafts = [d1]
-    if k >= 2:
-        # chained proposal: the MTP block's own pre-norm output stands in for
-        # the (not yet computed) main-model hidden of d1 (vLLM/SGLang MTP k>1)
-        d2, _ = state.draft_multi([(h_mtp, d1)])
-        drafts.append(d2)
+    for _ in range(1, k):
+        # chained proposal: the MTP block's own post-norm output stands in
+        # for the (not yet computed) main-model hidden of the previous draft.
+        # GLM-5 trains the head with 3 parameter-shared steps, so the chain
+        # is in-distribution up to k=3.
+        d_next, h_mtp = state.draft_multi([(h_mtp, drafts[-1])])
+        drafts.append(d_next)
 
     verify_in = mx.concatenate(
         [y.reshape(-1)[0:1]] + [x.astype(y.dtype).reshape(-1)[0:1] for x in drafts]
@@ -587,20 +600,23 @@ def _battle_step(state: _MTPState, prev_step: Any, batch: Any):
     lp2 = logits2 - mx.logsumexp(logits2, axis=-1, keepdims=True)
     t_all = mx.argmax(lp2, axis=-1)                       # (1, k+1)
     t1 = t_all[:, 0]
-    acc1 = mx.equal(d1.astype(mx.int64), t1.astype(mx.int64))
-    if k >= 2:
-        acc2 = mx.logical_and(
-            acc1, mx.equal(drafts[1].astype(mx.int64), t_all[:, 1].astype(mx.int64))
-        )
-    else:
-        acc2 = None
+    accs = []
+    prev = None
+    for i in range(k):
+        hit = mx.equal(drafts[i].astype(mx.int64), t_all[:, i].astype(mx.int64))
+        prev = hit if prev is None else mx.logical_and(prev, hit)
+        accs.append(prev)
+    acc1 = accs[0]
 
     if state.prof:
         _t1 = time.perf_counter()
-    mx.eval(acc1, y) if acc2 is None else mx.eval(acc1, acc2, y)
-    m = int(acc1.reshape(-1)[0].item())
-    if acc2 is not None:
-        m += int(acc2.reshape(-1)[0].item())
+    mx.eval(*accs, y)
+    m = 0
+    for a in accs:
+        if int(a.reshape(-1)[0].item()):
+            m += 1
+        else:
+            break
     if state.prof:
         _t2 = time.perf_counter()
     d = d1
@@ -632,7 +648,7 @@ def _battle_step(state: _MTPState, prev_step: Any, batch: Any):
             c.trim(k + 1)
         if k >= 2 and state.mtp_cache is not None:
             for c in state.mtp_cache.caches:
-                c.trim(1)
+                c.trim(k - 1)
         _warn_once(
             state.logger, "no-hv",
             "[MTP] verify hidden not captured; battle disabled for request",
@@ -640,12 +656,12 @@ def _battle_step(state: _MTPState, prev_step: Any, batch: Any):
         state.request_greedy = False
         return prev_step(batch)
 
-    # The chained step-2 MTP entry was computed from the block's own hidden;
-    # drop it — accepted positions re-enter through the backlog with the
-    # true main-model hidden from this verify.
+    # The chained MTP entries (steps 2..k) were computed from the block's own
+    # hidden; drop them — accepted positions re-enter through the backlog
+    # with the true main-model hidden from this verify.
     if k >= 2 and state.mtp_cache is not None:
         for c in state.mtp_cache.caches:
-            c.trim(1)
+            c.trim(k - 1)
     if k - m:
         for c in batch.prompt_cache:
             c.trim(k - m)
@@ -874,7 +890,8 @@ def apply_glm52_mtp_patch(
     validate = _env_int(_ENV_VALIDATE, 0, 0, 1, logger) == 1
     trace_n = _env_int(_ENV_TRACE, 0, 0, 4096, logger)
     prof = _env_int(_ENV_PROF, 0, 0, 1, logger) == 1
-    draft_k = _env_int(_ENV_DRAFT_K, 1, 1, 2, logger)
+    draft_k = _env_int(_ENV_DRAFT_K, 1, 1, 3, logger)
+    hidden_mode = _env_choice(_ENV_HIDDEN, "post", {"post", "pre"}, logger)
 
     try:
         mtp = load_mtp_module(
@@ -889,9 +906,10 @@ def apply_glm52_mtp_patch(
 
     store: dict[str, Any] = {}
     if not isinstance(norm, _PreNormCapture):
-        inner.norm = _PreNormCapture(norm, store)
+        inner.norm = _PreNormCapture(norm, store, mode=hidden_mode)
     else:  # re-apply after a reload path: reuse the wrapper's store
         store = norm._store
+        norm._mode = hidden_mode
 
     state = _MTPState(
         mode=mode, concat=concat, mtp=mtp, embed=embed, lm_head=lm_head,
@@ -901,7 +919,8 @@ def apply_glm52_mtp_patch(
     model._exo_glm52_mtp_state = state
     _install_hooks(logger)
     logger.info(
-        f"[MTP] enabled mode={mode} k={draft_k} concat={concat} validate={int(validate)} "
+        f"[MTP] enabled mode={mode} k={draft_k} hidden={hidden_mode} concat={concat} "
+        f"validate={int(validate)} "
         f"weights={weights_path.name} layer_idx={layer_idx}"
     )
     return model
