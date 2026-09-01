@@ -317,7 +317,9 @@ def read_prefill_config(deepseek_v32: Any, *, logger: Any = default_logger) -> G
 
     sparse_mode = _normalize_toggle_choice(
         _env_raw("EXO_GLM52_SPARSE_PREFILL"),
-        default="off",
+        # Site default (this cluster): validated 2026-09-01 on 4x M3 Ultra,
+        # GLM-5.3-8bit-idxbf16. Upstream PR: revert to "off".
+        default="auto",
         enabled="on",
         allowed={"off", "on", "auto"},
         name="EXO_GLM52_SPARSE_PREFILL",
@@ -335,7 +337,9 @@ def read_prefill_config(deepseek_v32: Any, *, logger: Any = default_logger) -> G
             indexer_mode_raw = legacy_indexer_chunk
     indexer_mode = _normalize_toggle_choice(
         indexer_mode_raw,
-        default="off",
+        # Site default: streaming won the A/B on this cluster (-5.9% wall,
+        # -11GB peak on 157k cold prefill). Upstream PR: revert to "off".
+        default="streaming",
         enabled="reference",
         allowed={"off", "reference", "streaming"},
         name="EXO_GLM52_INDEXER_MODE",
@@ -361,7 +365,10 @@ def read_prefill_config(deepseek_v32: Any, *, logger: Any = default_logger) -> G
         ),
         sparse_min_kv=_parse_int(
             _env_raw("EXO_GLM52_SPARSE_MIN_KV"),
-            default=0,
+            # Site default: measured dense/sparse crossover between 8k and 16k
+            # (GLM-5.3-8bit-idxbf16, step=1024, 2026-09-01) -> midpoint.
+            # Upstream PR: revert to 0.
+            default=12288,
             minimum=0,
             maximum=4_194_304,
             name="EXO_GLM52_SPARSE_MIN_KV",

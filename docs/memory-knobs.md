@@ -92,11 +92,11 @@ MLX_METAL_FAST_SYNCH, MLX_RING_VERBOSE`.
 
 | Ручка | Дефолт | Действие |
 |---|---|---|
-| `EXO_GLM52_SPARSE_PREFILL` | `off` | `on` — sparse-префилл (×2.65 на 150k: 67→177 t/s); `auto` — sparse при kv ≥ MIN_KV |
-| `EXO_GLM52_SPARSE_MIN_KV` | `0` | кроссовер для auto; при 0 auto = off (ворнинг в лог). **Кроссовер не промерен** — замер 4k/8k/16k/32k on/off висит в бэклоге |
+| `EXO_GLM52_SPARSE_PREFILL` | `auto` | `on` — sparse-префилл всегда (×2.65 на 150k: 67→177 t/s); `auto` (дефолт) — sparse при kv ≥ MIN_KV; `off` — откат на dense |
+| `EXO_GLM52_SPARSE_MIN_KV` | `12288` | кроссовер для auto: замерен 2026-09-01 (GLM-5.3 idxbf16, step 1024; dense/sparse пересекаются между 8k и 16k). При 0 auto = off (ворнинг в лог) |
 | `EXO_GLM52_SPARSE_Q_CHUNK` | `256` | чанк запросов sparse-ветки |
 | `EXO_GLM52_SPARSE_EVAL_BLOCKS` | off | пер-блочный eval sparse-пути (диагностика) |
-| `EXO_GLM52_INDEXER_MODE` | `off` | `reference` (W2) / `streaming` (W3 — ждёт digit-accuracy валидации) |
+| `EXO_GLM52_INDEXER_MODE` | `streaming` | streaming принят по A/B 157k: −5.9% времени, −11GB пика vs off; `reference` — диагностический; digit-accuracy 150k всё ещё в долгах |
 | `EXO_GLM52_INDEXER_Q_CHUNK` | `256` | чанк запросов индексера |
 | `EXO_GLM52_INDEXER_K_CHUNK` | `16384` | чанк ключей индексера (легаси-алиас `EXO_GLM52_INDEXER_CHUNK`) |
 | `EXO_GLM52_INDEXER_EVAL_CHUNKS` | off | пер-чанковый eval индексера (диагностика) |
