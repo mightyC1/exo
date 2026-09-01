@@ -258,7 +258,8 @@ class _MTPState:
         self.matches = 0
         self.win: list[bool] = []
         # battle fields
-        self.request_greedy: bool | None = None
+        self.request_battle: bool | None = None
+        self.last_battle: bool | None = None  # last per-request decision (diagnostics)
         self.buffer: list[tuple[mx.array, mx.array]] = []
         self.h_last: mx.array | None = None
         self.mtp_backlog: list[tuple[mx.array, mx.array]] = []
@@ -281,7 +282,7 @@ class _MTPState:
         self.steps = 0
         self.matches = 0
         self.win = []
-        self.request_greedy = None
+        self.request_battle = None
         self.buffer = []
         self.h_last = None
         self.mtp_backlog = []
@@ -302,7 +303,7 @@ class _MTPState:
         self.mtp_cache = None
         self.pending_draft = None
         self.lazy_match = None
-        self.request_greedy = None
+        self.request_battle = None
         self.buffer = []
         self.h_last = None
         self.mtp_backlog = []
@@ -412,19 +413,20 @@ class _MTPState:
         return out
 
 
-def _request_is_greedy(batch: Any) -> bool:
+def _request_policy(batch: Any) -> dict[str, bool] | None:
+    """Explicit sampling policy carried by the request's sampler (ExoSampler
+    in exo's submit path). Never probe: with min_p filtering a stochastic
+    sampler is indistinguishable from greedy on a peaked probe, and probing
+    consumes RNG. Unknown sampler -> None (fail closed: no battle)."""
     sampler = None
     if getattr(batch, "samplers", None) and batch.samplers[0] is not None:
         sampler = batch.samplers[0]
     else:
-        sampler = batch.fallback_sampler
-    probe = mx.log(mx.array([[0.02, 0.96, 0.02]]))
-    try:
-        a = int(sampler(probe).reshape(-1)[0].item())
-        b = int(sampler(probe).reshape(-1)[0].item())
-    except Exception:
-        return False
-    return a == 1 and b == 1
+        sampler = getattr(batch, "fallback_sampler", None)
+    greedy = getattr(sampler, "greedy", None)
+    if greedy is None:
+        return None
+    return {"greedy": bool(greedy), "logprobs": bool(getattr(sampler, "logprobs", False))}
 
 
 def _dist_group() -> Any | None:
@@ -521,6 +523,28 @@ def _lp_row(lp: Any) -> mx.array:
     return mx.zeros((1,))
 
 
+def _apply_processors_rows(batch: Any, logits: mx.array, fed: list[mx.array]) -> mx.array:
+    """Apply the request's logits processors to each verify row exactly as
+    the serial decode step would: row j sees the history the step after
+    feeding fed[0..j-1] would see. Mirrors opt_batch_gen._patched_step, whose
+    history is ``mx.array(self.tokens[e])`` — the committed tokens *before*
+    the current input. Without processors the logits pass through untouched."""
+    procs = getattr(batch, "logits_processors", None)
+    procs = procs[0] if procs and procs[0] else None
+    if not procs:
+        return logits
+    hist = mx.array(batch.tokens[0], dtype=mx.int32)
+    rows = []
+    for j in range(logits.shape[1]):
+        row = logits[:, j, :]
+        for pr in procs:
+            row = pr(hist, row)
+        rows.append(row)
+        if j + 1 < logits.shape[1]:
+            hist = mx.concatenate([hist, fed[j].reshape(-1)[0:1].astype(mx.int32)])
+    return mx.stack(rows, axis=1)
+
+
 def _battle_step(state: _MTPState, prev_step: Any, batch: Any):
     from exo.worker.engines.mlx.patches.opt_batch_gen import (
         _advance_chain_arrays,
@@ -534,29 +558,8 @@ def _battle_step(state: _MTPState, prev_step: Any, batch: Any):
     if state.uid != uid:
         state.start_request(uid)
 
-    tb = getattr(batch, "_topk_buffer", None)
-    if tb is not None and getattr(tb, "needs_topk", False):
-        _warn_once(
-            state.logger, "topk",
-            "[MTP] logprobs requested; battle loop falls back to normal decode "
-            "for such requests in M1",
-        )
-        return prev_step(batch)
-
-    if state.request_greedy is None:
-        state.request_greedy = _request_is_greedy(batch)
-        if not state.request_greedy:
-            _warn_once(
-                state.logger, "nongreedy",
-                "[MTP] non-greedy request under mode=on: running shadow for it "
-                "(M2 rejection sampling lands in phase 3)",
-            )
-    if not state.request_greedy:
-        return _shadow_step(state, prev_step, batch)
-
-    state.cur_batch = batch
-
-    # ---- buffered emission (accepted draft from the previous cycle) -------
+    # ---- buffered emission first: a verified-but-unemitted draft must never
+    # be skipped by a dynamic gate (cache already holds its position) ------
     if state.buffer:
         tok, lp = state.buffer.pop(0)
         ti = int(tok.reshape(-1)[0].item())
@@ -564,6 +567,34 @@ def _battle_step(state: _MTPState, prev_step: Any, batch: Any):
         if not state.buffer:
             state.cycle_pack = None
         return [ti], [_lp_row(lp)]
+
+    # ---- request-level eligibility, decided once from explicit policy -----
+    if state.request_battle is None:
+        pol = _request_policy(batch)
+        state.request_battle = bool(pol and pol["greedy"] and not pol["logprobs"])
+        state.last_battle = state.request_battle
+        if not state.request_battle:
+            why = (
+                "unknown sampler policy" if pol is None
+                else "logprobs requested" if pol["logprobs"]
+                else "non-greedy request"
+            )
+            _warn_once(
+                state.logger, f"nobattle:{why}",
+                f"[MTP] {why} under mode=on: running shadow for it "
+                "(M2 rejection sampling lands in phase 3)",
+            )
+    if not state.request_battle:
+        return _shadow_step(state, prev_step, batch)
+
+    tb = getattr(batch, "_topk_buffer", None)
+    if tb is not None and getattr(tb, "needs_topk", False):
+        # policy already excludes logprobs requests; defensive only (cycle
+        # boundary: no buffered/outstanding state here).
+        _warn_once(state.logger, "topk", "[MTP] top-k requested mid-request; normal step")
+        return prev_step(batch)
+
+    state.cur_batch = batch
 
     # ---- speculation cycle -------------------------------------------------
     y = batch._next_tokens
@@ -597,6 +628,7 @@ def _battle_step(state: _MTPState, prev_step: Any, batch: Any):
     ).reshape(1, k + 1)
     logits2 = batch.model(verify_in, cache=batch.prompt_cache)
     hv = state.store.pop("h", None)
+    logits2 = _apply_processors_rows(batch, logits2, [y] + drafts)
     lp2 = logits2 - mx.logsumexp(logits2, axis=-1, keepdims=True)
     t_all = mx.argmax(lp2, axis=-1)                       # (1, k+1)
     t1 = t_all[:, 0]
@@ -653,7 +685,7 @@ def _battle_step(state: _MTPState, prev_step: Any, batch: Any):
             state.logger, "no-hv",
             "[MTP] verify hidden not captured; battle disabled for request",
         )
-        state.request_greedy = False
+        state.request_battle = False
         return prev_step(batch)
 
     # The chained MTP entries (steps 2..k) were computed from the block's own

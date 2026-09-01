@@ -13,6 +13,29 @@ from mlx_lm.generate import (
 )
 from mlx_lm.models.cache import RotatingKVCache
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
+
+
+class ExoSampler:
+    """Sampler callable carrying its explicit sampling policy.
+
+    Consumers (e.g. the GLM MTP battle loop) must decide eligibility from
+    these fields — never by probing the sampler, which consumes RNG and,
+    with min_p filtering, cannot distinguish greedy from sampling.
+    """
+
+    __slots__ = ("fn", "temperature", "logprobs")
+
+    def __init__(self, fn, *, temperature: float, logprobs: bool) -> None:
+        self.fn = fn
+        self.temperature = float(temperature)
+        self.logprobs = bool(logprobs)
+
+    @property
+    def greedy(self) -> bool:
+        return self.temperature == 0.0
+
+    def __call__(self, logprobs):
+        return self.fn(logprobs)
 from mlx_lm.tokenizer_utils import StreamingDetokenizer, TokenizerWrapper
 
 from exo.api.types import (
@@ -182,13 +205,18 @@ class ExoBatchGenerator:
         seed = task_params.seed if task_params.seed is not None else 42
         mx.random.seed(seed)
 
-        sampler = make_sampler(
-            temp=task_params.temperature
-            if task_params.temperature is not None
-            else 0.7,
-            top_p=task_params.top_p if task_params.top_p is not None else 1.0,
-            min_p=task_params.min_p if task_params.min_p is not None else 0.05,
-            top_k=task_params.top_k if task_params.top_k is not None else 0,
+        effective_temperature = (
+            task_params.temperature if task_params.temperature is not None else 0.7
+        )
+        sampler = ExoSampler(
+            make_sampler(
+                temp=effective_temperature,
+                top_p=task_params.top_p if task_params.top_p is not None else 1.0,
+                min_p=task_params.min_p if task_params.min_p is not None else 0.05,
+                top_k=task_params.top_k if task_params.top_k is not None else 0,
+            ),
+            temperature=float(effective_temperature),
+            logprobs=bool(task_params.logprobs),
         )
 
         vision_ctx = (
@@ -340,9 +368,16 @@ class ExoBatchGenerator:
             return []
 
         gb = self._mlx_gen._generation_batch
+        # Scope the top-k need to the uids actually in this generation batch:
+        # an unrelated logprobs request must not toggle the current batch.
+        gb_uids = set(getattr(gb, "uids", []) or [])
         set_needs_topk(
             gb,
-            any(t.task_params.logprobs for t in self._active_tasks.values()),
+            any(
+                t.task_params.logprobs
+                for uid, t in self._active_tasks.items()
+                if not gb_uids or uid in gb_uids
+            ),
         )
         _step_tic = time.perf_counter()
         _, responses = self._mlx_gen.next()

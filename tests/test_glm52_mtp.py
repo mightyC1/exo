@@ -279,16 +279,35 @@ def _tiny_model():
     return m
 
 
-def _run_bg(model, prompt, max_tokens):
+class _GreedyPolicySampler:
+    """argmax sampler carrying the explicit policy the MTP loop keys on."""
+
+    def __init__(self, greedy=True, logprobs=False, raise_on_call=False):
+        self.greedy, self.logprobs, self.raise_on_call = greedy, logprobs, raise_on_call
+        self.calls = 0
+
+    def __call__(self, lp):
+        self.calls += 1
+        if self.raise_on_call:
+            raise AssertionError("sampler must not be called on the battle path")
+        return mx.argmax(lp, axis=-1)
+
+
+def _run_bg(model, prompt, max_tokens, sampler=None, processors=None):
     """Real pin path: BatchGenerator.insert -> prompt batch -> graduation ->
-    GenerationBatch over BatchKVCache (what prod decodes on)."""
+    GenerationBatch over BatchKVCache (what prod decodes on), with the fork's
+    _patched_step as the base step."""
     from mlx_lm.generate import BatchGenerator
 
     bg = BatchGenerator(
         model, stop_tokens=None, prefill_step_size=64,
         completion_batch_size=4, prefill_batch_size=2,
     )
-    bg.insert([list(prompt)], max_tokens=[max_tokens])
+    bg.insert(
+        [list(prompt)], max_tokens=[max_tokens],
+        samplers=[sampler or _GreedyPolicySampler()],
+        logits_processors=[list(processors or [])],
+    )
     toks, last = [], None
     for _ in range(max_tokens * 3 + 32):
         out = bg.next()
@@ -368,6 +387,9 @@ N_GEN = 12
 
 @pytest.fixture(scope="module")
 def off_stream():
+    from exo.worker.engines.mlx.patches.opt_batch_gen import apply_batch_gen_patch
+
+    apply_batch_gen_patch()  # prod base step (history semantics, top-k buffer)
     model = _tiny_model()
     _install_hooks(_StubLogger())
     _detach(model)
@@ -390,7 +412,7 @@ def test_battle_byte_equal_all_accept(off_stream, sidecar):
             model, stop_tokens=None, prefill_step_size=64,
             completion_batch_size=4, prefill_batch_size=2,
         )
-        bg.insert([list(PROMPT)], max_tokens=[N_GEN])
+        bg.insert([list(PROMPT)], max_tokens=[N_GEN], samplers=[_GreedyPolicySampler()])
         toks, last = [], None
         for _ in range(N_GEN * 3 + 32):
             out = bg.next()
@@ -451,7 +473,7 @@ def test_battle_extract_trims_buffered_surplus(off_stream, sidecar):
                 model, stop_tokens=None, prefill_step_size=64,
                 completion_batch_size=4, prefill_batch_size=2,
             )
-            bg.insert([list(PROMPT)], max_tokens=[n])
+            bg.insert([list(PROMPT)], max_tokens=[n], samplers=[_GreedyPolicySampler()])
             last = None
             for _ in range(n * 3 + 32):
                 out = bg.next()
@@ -482,7 +504,7 @@ def test_flush_buffered_rolls_back_to_reject_state(off_stream, sidecar):
             model, stop_tokens=None, prefill_step_size=64,
             completion_batch_size=4, prefill_batch_size=2,
         )
-        bg.insert([list(PROMPT)], max_tokens=[N_GEN])
+        bg.insert([list(PROMPT)], max_tokens=[N_GEN], samplers=[_GreedyPolicySampler()])
         emitted = []
         for _ in range(64):
             out = bg.next()
@@ -545,7 +567,8 @@ def test_dense_prefill_predicate_by_actual_padding():
 # ---------------------------------------------------------------------------
 
 
-def _run_on(model, sidecar, n, draft_override, k, prompt=PROMPT):
+def _run_on(model, sidecar, n, draft_override, k, prompt=PROMPT,
+            sampler=None, processors=None):
     holder = []
     state = _battle_state(model, sidecar, draft_override=None, k=k)
     if draft_override is not None:
@@ -553,7 +576,7 @@ def _run_on(model, sidecar, n, draft_override, k, prompt=PROMPT):
     holder.append(state)
     _attach(model, state)
     try:
-        _, toks, last = _run_bg(model, prompt, n)
+        _, toks, last = _run_bg(model, prompt, n, sampler=sampler, processors=processors)
     finally:
         _detach(model)
     return state, toks, last
@@ -632,7 +655,7 @@ def test_k2_flush_rolls_back_r2_and_r1(off_stream, sidecar):
                 model, stop_tokens=None, prefill_step_size=64,
                 completion_batch_size=4, prefill_batch_size=2,
             )
-            bg.insert([list(PROMPT)], max_tokens=[N_GEN])
+            bg.insert([list(PROMPT)], max_tokens=[N_GEN], samplers=[_GreedyPolicySampler()])
             emitted = []
             for _ in range(64):
                 out = bg.next()
@@ -740,3 +763,86 @@ def test_chain_recycles_post_norm(sidecar):
     x = m.eh_proj(mx.concatenate([e, m.hnorm(h.astype(e.dtype))], axis=-1))
     y = m.block(x, mask=None, cache=st2.mtp_cache)
     assert mx.array_equal(h_rec, m.head_norm(y[:, -1:, :])).item()
+
+
+
+# ---------------------------------------------------------------------------
+# Audit P0.1 / P0.2 / P0.4: processors parity, explicit policy, eligibility
+# ---------------------------------------------------------------------------
+
+
+def _ban(tid):
+    def proc(_hist, logits):
+        logits[..., tid] = -1e9
+        return logits
+    return proc
+
+
+def _penalize_last(hist_dep):
+    """history-dependent processor: penalize the last token in history."""
+    def proc(hist, logits):
+        if hist.size == 0:
+            return logits
+        last = hist[-1]
+        return logits - mx.where(
+            mx.arange(logits.shape[-1]) == last, mx.array(6.0), mx.array(0.0)
+        )
+    return proc
+
+
+@pytest.mark.parametrize("k", [1, 2, 3])
+def test_processors_parity_eos_ban_like(off_stream, sidecar, k):
+    model, ref_plain = off_stream
+    banned = ref_plain[1]  # a token the plain run emits early
+    _detach(model)
+    _, ref, _ = _run_bg(model, PROMPT, N_GEN, processors=[_ban(banned)])
+    assert ref != ref_plain and banned not in ref
+    for name, reg in (("oracle", lambda h: _oracle_draftk(h, k)), ("real", None)):
+        state, toks, _ = _run_on(model, sidecar, N_GEN, reg, k=k, processors=[_ban(banned)])
+        assert state.cycles > 0
+        assert toks == ref, f"k={k} {name}: {toks} vs {ref}"
+        assert banned not in toks
+
+
+@pytest.mark.parametrize("k", [1, 2])
+def test_processors_parity_history_dependent(off_stream, sidecar, k):
+    model, _ = off_stream
+    _detach(model)
+    _, ref, _ = _run_bg(model, PROMPT, N_GEN, processors=[_penalize_last(True)])
+    for name, reg in (("oracle", lambda h: _oracle_draftk(h, k)), ("real", None)):
+        state, toks, _ = _run_on(
+            model, sidecar, N_GEN, reg, k=k, processors=[_penalize_last(True)]
+        )
+        assert state.cycles > 0
+        assert toks == ref, f"k={k} {name}: {toks} vs {ref}"
+
+
+def test_policy_unknown_sampler_fails_closed(off_stream, sidecar):
+    model, ref = off_stream
+    plain = lambda lp: mx.argmax(lp, axis=-1)  # no policy attributes
+    state, toks, _ = _run_on(model, sidecar, N_GEN, None, k=1, sampler=plain)
+    assert state.last_battle is False and state.cycles == 0
+    assert toks == ref
+
+
+def test_policy_temperature_not_greedy(off_stream, sidecar):
+    model, ref = off_stream
+    samp = _GreedyPolicySampler(greedy=False)  # argmax fn, but declared sampling
+    state, toks, _ = _run_on(model, sidecar, N_GEN, None, k=1, sampler=samp)
+    assert state.last_battle is False and state.cycles == 0
+    assert toks == ref
+
+
+def test_policy_logprobs_excluded(off_stream, sidecar):
+    model, ref = off_stream
+    samp = _GreedyPolicySampler(greedy=True, logprobs=True)
+    state, toks, _ = _run_on(model, sidecar, N_GEN, None, k=1, sampler=samp)
+    assert state.last_battle is False and state.cycles == 0 and toks == ref
+
+
+def test_battle_never_calls_sampler(off_stream, sidecar):
+    model, ref = off_stream
+    samp = _GreedyPolicySampler(greedy=True, raise_on_call=True)
+    state, toks, _ = _run_on(model, sidecar, N_GEN, None, k=1, sampler=samp)
+    assert state.last_battle is True and state.cycles > 0
+    assert samp.calls == 0 and toks == ref
