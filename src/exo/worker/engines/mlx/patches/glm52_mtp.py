@@ -1106,6 +1106,17 @@ def apply_glm52_mtp_patch(
         )
         return model
 
+    # The MTP block carries its own DSA indexer; give it the same half-split
+    # RoPE decision the main full-indexer layers get (matters once the MTP
+    # cache exceeds index_topk, i.e. after ~2048 generated tokens).
+    try:
+        from exo.worker.engines.mlx.patches.glm52_indexshare import apply_mtp_indexer_rope_fix
+
+        rope_fixed = apply_mtp_indexer_rope_fix(mtp.block.self_attn, config, logger=logger)
+    except Exception:
+        logger.opt(exception=True).warning("[MTP] indexer rope alignment failed; patch not applied")
+        return model
+
     store: dict[str, Any] = {}
     if isinstance(norm, _PreNormCapture):  # re-apply after a reload path
         store = norm._store
@@ -1125,7 +1136,7 @@ def apply_glm52_mtp_patch(
     _install_hooks(logger)
     logger.info(
         f"[MTP] enabled mode={mode} k={draft_k} hidden={hidden_mode} concat={concat} "
-        f"validate={int(validate)} "
+        f"validate={int(validate)} mtp_indexer_rope_fixed={int(rope_fixed)} "
         f"weights={weights_path.name} layer_idx={layer_idx}"
     )
     return model

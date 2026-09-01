@@ -675,6 +675,31 @@ def _fix_indexer_rope_noninterleaved(
     return True
 
 
+def indexer_rope_fix_for_config(config: dict[str, Any]) -> dict[str, Any] | None:
+    """The same half-split RoPE decision apply_glm52_indexshare_patch makes for
+    the main layers, exported so the MTP block's own indexer gets the identical
+    treatment (audit P1.1). Returns the rebuild kwargs or None (no fix)."""
+    fix = _env_bool(
+        "EXO_GLM52_INDEXER_HALF_SPLIT_ROPE",
+        "EXO_GLM_INDEXER_HALF_SPLIT_ROPE",
+        default=(config.get("indexer_rope_interleave") is False),
+    )
+    rope_params = config.get("rope_parameters") or {}
+    rope_type = rope_params.get("rope_type") or rope_params.get("type") or "default"
+    rope_theta = rope_params.get("rope_theta") or config.get("rope_theta")
+    qk_rope = config.get("qk_rope_head_dim")
+    if not (fix and str(rope_type) in {"default", ""} and rope_theta and qk_rope):
+        return None
+    return {"qk_rope_head_dim": int(qk_rope), "rope_theta": float(rope_theta)}
+
+
+def apply_mtp_indexer_rope_fix(attn: Any, config: dict[str, Any], *, logger: Any) -> bool:
+    params = indexer_rope_fix_for_config(config)
+    if params is None:
+        return False
+    return _fix_indexer_rope_noninterleaved(attn, logger=logger, **params)
+
+
 def apply_glm52_indexshare_patch(
     model: Any,
     model_path: Path,

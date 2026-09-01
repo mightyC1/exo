@@ -1010,3 +1010,29 @@ def test_sidecar_policy_mismatch_rejected(sidecar, tmp_path, monkeypatch):
     model = _tiny_model()
     applied, log = _apply_on_tiny(model, _model_dir_for(tmp_path, sidecar, bad_policy), monkeypatch)
     assert not applied and any("policy" in line for line in log.lines)
+
+
+def test_mtp_indexer_rope_follows_config(sidecar, tmp_path, monkeypatch):
+    """Audit P1.1: the MTP block's indexer gets the same half-split RoPE
+    decision as the main full-indexer layers."""
+    from exo.worker.engines.mlx.patches import glm52_mtp as gm
+
+    monkeypatch.setenv("EXO_GLM52_MTP", "on")
+    for interleave, expect_fixed in ((True, False), (False, True)):
+        def mut(d, interleave=interleave):
+            c = json.loads((d / "config.json").read_text())
+            c.update({"indexer_rope_interleave": interleave, "rope_theta": 10000.0,
+                      "qk_rope_head_dim": ROPE})
+            (d / "config.json").write_text(json.dumps(c))
+        d = _model_dir_for(tmp_path / f"m{int(interleave)}", sidecar, mut) if False else None
+        sub = tmp_path / f"m{int(interleave)}"; sub.mkdir()
+        d = _model_dir_for(sub, sidecar, mut)
+        model = _tiny_model()
+        log = _StubLogger()
+        gm.apply_glm52_mtp_patch(model, d, logger=log)
+        st = getattr(model, "_exo_glm52_mtp_state", None)
+        assert st is not None, log.lines
+        rope = st.mtp.block.self_attn.indexer.rope
+        assert bool(getattr(rope, "traditional", True)) is (not expect_fixed)
+        assert any(f"mtp_indexer_rope_fixed={int(expect_fixed)}" in line for line in log.lines)
+        _detach(model)
