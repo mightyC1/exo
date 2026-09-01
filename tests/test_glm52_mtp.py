@@ -288,7 +288,8 @@ class _GreedyPolicySampler:
 
     def __call__(self, lp):
         self.calls += 1
-        if self.raise_on_call:
+        if self.raise_on_call and self.calls > 1:
+            # exactly one call is allowed per request: the seed step (P1.2)
             raise AssertionError("sampler must not be called on the battle path")
         return mx.argmax(lp, axis=-1)
 
@@ -845,4 +846,99 @@ def test_battle_never_calls_sampler(off_stream, sidecar):
     samp = _GreedyPolicySampler(greedy=True, raise_on_call=True)
     state, toks, _ = _run_on(model, sidecar, N_GEN, None, k=1, sampler=samp)
     assert state.last_battle is True and state.cycles > 0
-    assert samp.calls == 0 and toks == ref
+    assert samp.calls == 1 and toks == ref  # seed step only
+
+
+# ---------------------------------------------------------------------------
+# Audit P0.3: exactly-once real step, transactional rollback, VALIDATE not masked
+# ---------------------------------------------------------------------------
+
+
+def _all_offsets(gb):
+    return [[_cur_off(c) for c in cl.caches] for cl in gb.prompt_cache]
+
+
+def _cur_off(c):
+    idx = getattr(c, "_idx", None)
+    return int(idx) if idx is not None else int(c.offset)
+
+
+@pytest.mark.parametrize("fail_after_mutation", [False, True])
+def test_fault_in_draft_rolls_back_and_continues(off_stream, sidecar, fail_after_mutation):
+    """An exception inside the cycle (before or after the MTP cache mutated)
+    must roll every cache back to the cycle entry and continue the request
+    with plain decode — byte-identical to MTP=off, real step run once."""
+    model, ref = off_stream
+    holder = []
+    state = _battle_state(model, sidecar, k=1)
+    real = state.draft_multi
+    hits = {"n": 0}
+
+    def faulty(pairs):
+        hits["n"] += 1
+        if hits["n"] == 3:
+            if fail_after_mutation:
+                real(pairs)            # MTP cache grows, then we blow up
+            raise RuntimeError("injected draft failure")
+        return real(pairs)
+
+    state.draft_multi = faulty  # type: ignore[method-assign]
+    holder.append(state)
+    _attach(model, state)
+    try:
+        from mlx_lm.generate import BatchGenerator
+
+        bg = BatchGenerator(model, stop_tokens=None, prefill_step_size=64,
+                            completion_batch_size=4, prefill_batch_size=2)
+        bg.insert([list(PROMPT)], max_tokens=[N_GEN], samplers=[_GreedyPolicySampler()])
+        toks, last = [], None
+        for _ in range(N_GEN * 3 + 32):
+            out = bg.next()
+            rs = out[1] if isinstance(out, tuple) else out
+            for r in rs or []:
+                toks.append(r.token); last = r
+            if last is not None and last.finish_reason is not None:
+                break
+            gb = bg._generation_batch
+            if len(gb):
+                # invariant after every call: main cache == committed tokens (+ buffered)
+                assert _all_offsets(gb)[0][0] == len(gb.tokens[0]) + len(state.buffer)
+    finally:
+        _detach(model)
+    assert hits["n"] >= 3 and state.last_battle is True
+    assert toks == ref, (toks, ref)
+    assert last.prompt_cache[0][0].offset == len(last.all_tokens)
+
+
+def test_validate_error_is_not_swallowed(off_stream, sidecar, monkeypatch):
+    from exo.worker.engines.mlx.patches import glm52_mtp as gm
+
+    model, _ = off_stream
+    state = _battle_state(model, sidecar, k=1)
+    state.validate = True
+
+    def boom(state_, batch, m):
+        raise gm._MTPValidateError("injected validate failure")
+
+    monkeypatch.setattr(gm, "_validate_cycle", boom)
+    _attach(model, state)
+    try:
+        with pytest.raises(gm._MTPValidateError):
+            _run_bg(model, PROMPT, N_GEN)
+    finally:
+        _detach(model)
+
+
+def test_norm_wrapper_keeps_parameter_tree(sidecar):
+    from mlx.utils import tree_flatten
+    from exo.worker.engines.mlx.patches import glm52_mtp as gm
+
+    model = _tiny_model()
+    before = sorted(k for k, _ in tree_flatten(model.parameters()))
+    x = mx.random.normal((1, 3, HID)).astype(mx.bfloat16)
+    ref = model.model.norm(x)
+    model.model.norm = gm._PreNormCapture(model.model.norm, {}, mode="post")
+    after = sorted(k for k, _ in tree_flatten(model.parameters()))
+    assert before == after
+    assert mx.array_equal(model.model.norm(x), ref).item()
+    mx.eval(model.parameters())

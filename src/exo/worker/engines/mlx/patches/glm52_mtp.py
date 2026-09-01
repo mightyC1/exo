@@ -186,30 +186,28 @@ def load_mtp_module(
 # ---------------------------------------------------------------------------
 
 
-class _PreNormCapture:
-    """Passthrough wrapper over the model's final norm.
+class _PreNormCapture(nn.RMSNorm):
+    """Drop-in replacement for the model's final RMSNorm that also stores the
+    hidden it produces (mode="post", vLLM convention: DeepseekV2Model.forward
+    returns the normed hidden and the MTP proposer consumes it) or consumes
+    (mode="pre", donor convention, kept for A/B).
 
-    mode="post" (default, matches vLLM: DeepseekV2Model.forward returns the
-    normed hidden and the MTP proposer consumes it) stores the norm output;
-    mode="pre" stores its input (donor convention, kept for A/B).
+    It *is* an nn.RMSNorm owning the same weight array, so the parameter
+    tree (model.norm.weight), children() and traversal stay intact — a
+    plain callable in that slot would drop the norm from the module tree.
     """
 
-    def __init__(self, orig: Any, store: dict[str, Any], mode: str = "post") -> None:
-        self._orig = orig
-        self._store = store
-        self._mode = mode
+    def __init__(self, orig: nn.RMSNorm, store: dict[str, Any], mode: str = "post") -> None:
+        nn.Module.__init__(self)
+        self.weight = orig.weight
+        self.eps = orig.eps
+        object.__setattr__(self, "_store", store)
+        object.__setattr__(self, "_mode", mode)
 
     def __call__(self, x: mx.array) -> mx.array:
-        out = self._orig(x)
+        out = mx.fast.rms_norm(x, self.weight, self.eps)
         self._store["h"] = out if self._mode == "post" else x
         return out
-
-    @property
-    def weight(self) -> Any:  # keep donors of .weight working
-        return self._orig.weight
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._orig, name)
 
 
 class _MTPState:
@@ -259,6 +257,8 @@ class _MTPState:
         self.win: list[bool] = []
         # battle fields
         self.request_battle: bool | None = None
+        self.shadow_disabled = False
+        self.prev_ran = False   # exactly-once guard for the real step
         self.last_battle: bool | None = None  # last per-request decision (diagnostics)
         self.buffer: list[tuple[mx.array, mx.array]] = []
         self.h_last: mx.array | None = None
@@ -274,7 +274,7 @@ class _MTPState:
 
     def start_request(self, uid: int) -> None:
         if self.uid is not None and (self.steps or self.cycles):
-            self._summary("switch")
+            self.finish()
         self.uid = uid
         self.mtp_cache = self._cache_cls()
         self.pending_draft = None
@@ -283,6 +283,7 @@ class _MTPState:
         self.matches = 0
         self.win = []
         self.request_battle = None
+        self.shadow_disabled = False
         self.buffer = []
         self.h_last = None
         self.mtp_backlog = []
@@ -296,8 +297,6 @@ class _MTPState:
         self.t0 = time.perf_counter()
 
     def reset(self) -> None:
-        if self.uid is not None and (self.steps or self.cycles):
-            self._summary("reset")
         self.uid = None
         self.cur_batch = None
         self.mtp_cache = None
@@ -311,6 +310,12 @@ class _MTPState:
         self.cycle_pack = None
 
     def finish(self) -> None:
+        if self.lazy_match is not None:  # materialize the last shadow comparison
+            try:
+                self.account(bool(self.lazy_match.item()))
+            except Exception:
+                pass
+            self.lazy_match = None
         if self.uid is not None and (self.steps or self.cycles):
             self._summary("finish")
         self.reset()
@@ -450,7 +455,7 @@ def _validate_cycle(state: _MTPState, batch: Any, m: int) -> None:
     off00, off01 = _off(cl0[0]), _off(cl0[1])
     offl0, offl1 = _off(cl_last[0]), _off(cl_last[1])
     if not (off00 == off01 == offl0 == offl1):
-        raise RuntimeError(
+        raise _MTPValidateError(
             f"[MTP][VALIDATE] slot/layer offset skew: "
             f"L0=({off00},{off01}) Ln=({offl0},{offl1})"
         )
@@ -463,7 +468,7 @@ def _validate_cycle(state: _MTPState, batch: Any, m: int) -> None:
     mx.eval(total)
     expected = vec * grp.size()
     if not mx.array_equal(total, expected).item():
-        raise RuntimeError(
+        raise _MTPValidateError(
             f"[MTP][VALIDATE] cross-rank divergence: local={vec.tolist()} "
             f"sum={total.tolist()} size={grp.size()}"
         )
@@ -474,28 +479,51 @@ def _validate_cycle(state: _MTPState, batch: Any, m: int) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _shadow_step(state: _MTPState, prev_step: Any, batch: Any):
+def _shadow_pre(state: _MTPState, batch: Any) -> bool:
     if len(batch.uids) != 1:
         state.reset()
-        return prev_step(batch)
+        return False
     uid = batch.uids[0]
     if state.uid != uid:
         state.start_request(uid)
-
     if state.lazy_match is not None:
         state.account(bool(state.lazy_match.item()))
         state.lazy_match = None
+    return True
 
+
+def _shadow_step(state: _MTPState, prev_step: Any, batch: Any):
+    """Shadow = the real step plus a side comparison. The real step runs
+    exactly once and never inside a try: a failure in the pre phase skips
+    shadow for this step, a failure in the post phase disables shadow for
+    the request; neither re-runs or masks the decode."""
+    try:
+        active = _shadow_pre(state, batch)
+    except Exception:
+        _warn_once(state.logger, "shadow-pre", "[MTP_SHADOW] pre-phase failed; idle")
+        active = False
     result = prev_step(batch)
+    if not active or state.shadow_disabled:
+        return result
+    try:
+        _shadow_post(state, batch)
+    except Exception:
+        state.logger.opt(exception=True).warning(
+            "[MTP_SHADOW] post-phase failed; shadow disabled for this request"
+        )
+        state.shadow_disabled = True
+    return result
 
+
+def _shadow_post(state: _MTPState, batch: Any) -> None:
     h = state.store.pop("h", None)
     next_tok = batch._next_tokens
     if h is None or next_tok is None:
         _warn_once(
             state.logger, "no-h",
-            "[MTP_SHADOW] pre-norm hidden not captured; shadow idle this step",
+            "[MTP_SHADOW] hidden not captured; shadow idle this step",
         )
-        return result
+        return
 
     if state.pending_draft is not None:
         state.lazy_match = mx.equal(
@@ -506,7 +534,6 @@ def _shadow_step(state: _MTPState, prev_step: Any, batch: Any):
     d = state.draft(h[:, -1:, :], next_tok.reshape(-1)[0:1])
     state.pending_draft = d.astype(mx.int64)
     mx.async_eval(state.pending_draft, *state.mtp_cache_arrays())
-    return result
 
 
 # ---------------------------------------------------------------------------
@@ -521,6 +548,56 @@ def _lp_row(lp: Any) -> mx.array:
         first = lp[0]
         return first[0] if isinstance(first, mx.array) and first.ndim == 2 else first
     return mx.zeros((1,))
+
+
+class _MTPBail(RuntimeError):
+    """Abort the current battle cycle; the guard rolls back and falls back."""
+
+
+class _MTPValidateError(RuntimeError):
+    """VALIDATE assertion: never swallowed, never converted into a fallback."""
+
+
+def _cur(c: Any) -> int:
+    idx = getattr(c, "_idx", None)
+    if idx is not None:
+        return int(idx)
+    return _off(c)
+
+
+def _snapshot(state: _MTPState, batch: Any) -> dict[str, Any]:
+    return {
+        "main": [[_cur(c) for c in cl.caches] for cl in batch.prompt_cache],
+        "mtp": [_cur(c) for c in state.mtp_cache.caches] if state.mtp_cache is not None else None,
+        "next_tokens": batch._next_tokens,
+        "next_logprobs": batch._next_logprobs,
+        "tokens_len": len(batch.tokens[0]) if batch.tokens else 0,
+        "h_last": state.h_last,
+        "backlog": list(state.mtp_backlog),
+        "buffer": list(state.buffer),
+        "cycle_pack": state.cycle_pack,
+    }
+
+
+def _rollback(state: _MTPState, batch: Any, snap: dict[str, Any]) -> None:
+    for cl, offs in zip(batch.prompt_cache, snap["main"]):
+        for c, before in zip(cl.caches, offs):
+            n = _cur(c) - before
+            if n > 0:
+                c.trim(n)
+    if snap["mtp"] is not None and state.mtp_cache is not None:
+        for c, before in zip(state.mtp_cache.caches, snap["mtp"]):
+            n = _cur(c) - before
+            if n > 0:
+                c.trim(n)
+    batch._next_tokens = snap["next_tokens"]
+    batch._next_logprobs = snap["next_logprobs"]
+    if batch.tokens:
+        del batch.tokens[0][snap["tokens_len"]:]
+    state.h_last = snap["h_last"]
+    state.mtp_backlog = snap["backlog"]
+    state.buffer = snap["buffer"]
+    state.cycle_pack = snap["cycle_pack"]
 
 
 def _apply_processors_rows(batch: Any, logits: mx.array, fed: list[mx.array]) -> mx.array:
@@ -599,17 +676,18 @@ def _battle_step(state: _MTPState, prev_step: Any, batch: Any):
     # ---- speculation cycle -------------------------------------------------
     y = batch._next_tokens
     y_lp = batch._next_logprobs
-    h_entry = state.store.pop("h", None)
-    if state.h_last is None:
-        if h_entry is None:
-            _warn_once(
-                state.logger, "no-h-battle",
-                "[MTP] pre-norm hidden unavailable; normal step (will seed next)",
-            )
-            return prev_step(batch)
-        state.h_last = h_entry[:, -1:, :]
 
     _t0 = time.perf_counter() if state.prof else 0.0
+    if state.h_last is None:
+        # Seed step: one normal decode step for this request. Its forward
+        # writes the hidden of *this* batch into the capture store, so the
+        # first draft never relies on a stale global capture (audit P1.2).
+        result = prev_step(batch)
+        h = state.store.pop("h", None)
+        if h is not None and h.shape[0] == 1:
+            state.h_last = h[:, -1:, :]
+        return result
+
     k = state.draft_k
     pairs = state.mtp_backlog + [(state.h_last, y.reshape(-1)[0:1])]
     state.mtp_backlog = []
@@ -675,18 +753,9 @@ def _battle_step(state: _MTPState, prev_step: Any, batch: Any):
         )
 
     if hv is None or hv.shape[1] < k + 1:
-        # capture broke mid-flight: undo the verify and decay to normal decode
-        for c in batch.prompt_cache:
-            c.trim(k + 1)
-        if k >= 2 and state.mtp_cache is not None:
-            for c in state.mtp_cache.caches:
-                c.trim(k - 1)
-        _warn_once(
-            state.logger, "no-hv",
-            "[MTP] verify hidden not captured; battle disabled for request",
-        )
-        state.request_battle = False
-        return prev_step(batch)
+        # capture broke mid-flight: the guard rolls every cache back to the
+        # cycle-entry snapshot and runs the normal step exactly once.
+        raise _MTPBail("verify hidden not captured")
 
     # The chained MTP entries (steps 2..k) were computed from the block's own
     # hidden; drop them — accepted positions re-enter through the backlog
@@ -784,22 +853,42 @@ def _install_hooks(logger: Any) -> None:
             f"({getattr(prev_step, '__name__', '?')}); wrapping anyway",
         )
 
+    def _prev_once(state: _MTPState, batch: Any):
+        state.prev_ran = True
+        return prev_step(batch)
+
     def _mtp_step(self: Any):
         state = getattr(self.model, "_exo_glm52_mtp_state", None)
         if state is None or state.mode == "off":
             return prev_step(self)
-        try:
-            if state.mode == "on":
-                return _battle_step(state, prev_step, self)
+        if state.mode != "on":
             return _shadow_step(state, prev_step, self)
-        except Exception:
-            _warn_once(
-                logger, "mtp-crash",
-                "[MTP] exception in MTP path; disabling for this model",
-            )
-            logger.opt(exception=True).warning("[MTP] traceback")
-            state.mode = "off"
-            return prev_step(self)
+
+        state.prev_ran = False
+        snap = None
+        if len(self.uids) == 1 and state.uid == self.uids[0] and state.h_last is not None:
+            snap = _snapshot(state, self)
+        try:
+            return _battle_step(state, lambda b: _prev_once(state, b), self)
+        except _MTPValidateError:
+            raise
+        except Exception as exc:
+            if state.prev_ran:
+                # the real step already executed for this call: never run it
+                # twice; surface the failure instead of masking it.
+                raise
+            if snap is not None:
+                _rollback(state, self, snap)
+            if isinstance(exc, _MTPBail):
+                _warn_once(logger, f"bail:{exc}", f"[MTP] {exc}; request continues without MTP")
+            else:
+                logger.opt(exception=True).warning(
+                    "[MTP] exception in battle cycle; rolled back, request continues without MTP"
+                )
+            state.request_battle = False
+            state.buffer = []
+            state.cycle_pack = None
+            return _prev_once(state, self)
 
     _mtp_step._exo_glm52_mtp_wrapper = True  # type: ignore[attr-defined]
     GenerationBatch._step = _mtp_step
@@ -937,11 +1026,14 @@ def apply_glm52_mtp_patch(
         return model
 
     store: dict[str, Any] = {}
-    if not isinstance(norm, _PreNormCapture):
-        inner.norm = _PreNormCapture(norm, store, mode=hidden_mode)
-    else:  # re-apply after a reload path: reuse the wrapper's store
+    if isinstance(norm, _PreNormCapture):  # re-apply after a reload path
         store = norm._store
-        norm._mode = hidden_mode
+        object.__setattr__(norm, "_mode", hidden_mode)
+    elif isinstance(norm, nn.RMSNorm):
+        inner.norm = _PreNormCapture(norm, store, mode=hidden_mode)
+    else:
+        logger.warning("[MTP] final norm is not RMSNorm; patch not applied")
+        return model
 
     state = _MTPState(
         mode=mode, concat=concat, mtp=mtp, embed=embed, lm_head=lm_head,
