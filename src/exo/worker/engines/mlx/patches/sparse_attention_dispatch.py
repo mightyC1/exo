@@ -49,6 +49,9 @@ from exo.worker.runner.bootstrap import logger as default_logger
 from exo.worker.engines.mlx.patches.glm52_indexshare import (
     apply_glm52_indexshare_patch,
 )
+from exo.worker.engines.mlx.patches.glm52_mtp import (
+    apply_glm52_mtp_patch,
+)
 
 _PatchFn = Callable[..., Any]
 
@@ -83,9 +86,11 @@ def _not_implemented(arch: str, needs: str) -> _PatchFn:
     return _stub
 
 
-# Exact ``model_type`` -> patch function.
-_PATCHES: dict[str, _PatchFn] = {
-    "glm_moe_dsa": apply_glm52_indexshare_patch,
+# Exact ``model_type`` -> patch function(s). A list is applied in order; each
+# entry self-gates on config/env and returns the model unchanged when not
+# applicable (glm52_mtp is env-gated, default off).
+_PATCHES: dict[str, _PatchFn | list[_PatchFn]] = {
+    "glm_moe_dsa": [apply_glm52_indexshare_patch, apply_glm52_mtp_patch],
 }
 
 # Prefix-matched placeholders for architectures whose mechanism differs and
@@ -101,13 +106,13 @@ _PLACEHOLDER_PREFIXES: dict[str, _PatchFn] = {
 }
 
 
-def _resolve(model_type: str) -> _PatchFn | None:
+def _resolve(model_type: str) -> list[_PatchFn] | None:
     patch = _PATCHES.get(model_type)
     if patch is not None:
-        return patch
+        return patch if isinstance(patch, list) else [patch]
     for prefix, stub in _PLACEHOLDER_PREFIXES.items():
         if model_type.startswith(prefix):
-            return stub
+            return [stub]
     return None
 
 
@@ -133,8 +138,10 @@ def apply_sparse_attention_patches(
     if model_type is None:
         return model
 
-    patch = _resolve(model_type)
-    if patch is None:
+    patches = _resolve(model_type)
+    if patches is None:
         return model
 
-    return patch(model, model_path, logger=logger)
+    for patch in patches:
+        model = patch(model, model_path, logger=logger)
+    return model
