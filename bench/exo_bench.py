@@ -360,12 +360,21 @@ def run_one_completion(
     }, pp_tokens
 
 
+LONG_FORM_TAIL = (
+    "\n\nТеперь игнорируй текст выше и напиши максимально длинное, "
+    "подробное эссе об истории вычислительной техники: от механических "
+    "машин до современных распределённых систем. Пиши развёрнуто, "
+    "раздел за разделом, не сокращай и не завершай ответ преждевременно."
+)
+
+
 class PromptSizer:
-    def __init__(self, tokenizer: Any, atom: str = "a "):
+    def __init__(self, tokenizer: Any, atom: str = "a ", tail: str = ""):
         self.tokenizer = tokenizer
         self.atom = atom
+        self.tail = tail
         self.count_fn = PromptSizer._make_counter(tokenizer)
-        self.base_tokens = self.count_fn("")
+        self.base_tokens = self.count_fn(tail)
 
     @staticmethod
     def _make_counter(tokenizer: Any) -> Callable[[str], int]:
@@ -412,13 +421,13 @@ class PromptSizer:
         low, high = 0, estimated_atoms * 2 + 100
         while low < high:
             mid = (low + high) // 2
-            tok = self.count_fn(self.atom * mid)
+            tok = self.count_fn(self.atom * mid + self.tail)
             if tok < target:
                 low = mid + 1
             else:
                 high = mid
 
-        content = self.atom * low
+        content = self.atom * low + self.tail
         tok = self.count_fn(content)
         logger.info(f"{tok=}")
 
@@ -470,6 +479,12 @@ def main() -> int:
         help="Write raw per-run results JSON to this path.",
     )
     ap.add_argument("--stdout", action="store_true", help="Write results to stdout")
+    ap.add_argument(
+        "--long-form", action="store_true",
+        help="Append an essay instruction to the filler prompt so greedy "
+        "(temperature 0) decoding produces long outputs instead of an early "
+        "EOS. Prompt token counts still match --pp exactly.",
+    )
     ap.add_argument(
         "--temperature", type=float, default=None,
         help="Sampling temperature passed through to the API "
@@ -551,7 +566,9 @@ def main() -> int:
         raise RuntimeError("[exo-bench] tokenizer load failed")
 
     try:
-        prompt_sizer = PromptSizer(tokenizer)
+        prompt_sizer = PromptSizer(
+            tokenizer, tail=(LONG_FORM_TAIL if args.long_form else "")
+        )
         logger.debug(f"[exo-bench] loaded tokenizer: {full_model_id} for prompt sizer")
     except Exception:
         logger.error("[exo-bench] tokenizer usable but prompt sizing failed")
