@@ -218,6 +218,7 @@ class _MTPState:
         validate: bool = False,
         trace_n: int = 0,
         prof: bool = False,
+        draft_k: int = 1,
     ) -> None:
         from mlx_lm.models.cache import CacheList, KVCache
 
@@ -231,6 +232,9 @@ class _MTPState:
         self.validate = validate
         self.trace_n = trace_n
         self.prof = prof
+        self.draft_k = draft_k
+        self.cycle_pack: tuple | None = None
+        self.acc_pos = [0, 0]  # accepted at draft position 1 / 2
         self.p_build = 0.0
         self.p_resolve = 0.0
         self.p_post = 0.0
@@ -274,6 +278,8 @@ class _MTPState:
         self.h_last = None
         self.mtp_backlog = []
         self.flush_pack = None
+        self.cycle_pack = None
+        self.acc_pos = [0, 0]
         self.cycles = 0
         self.proposed = 0
         self.accepted = 0
@@ -293,6 +299,7 @@ class _MTPState:
         self.h_last = None
         self.mtp_backlog = []
         self.flush_pack = None
+        self.cycle_pack = None
 
     def finish(self) -> None:
         if self.uid is not None and (self.steps or self.cycles):
@@ -317,26 +324,34 @@ class _MTPState:
 
     def account_cycle(self, m: int) -> None:
         self.cycles += 1
-        self.proposed += 1
+        self.proposed += self.draft_k
         self.accepted += m
         self.out_tokens += m + 1
+        if m >= 1:
+            self.acc_pos[0] += 1
+        if m >= 2:
+            self.acc_pos[1] += 1
         if self.cycles % _LOG_EVERY == 0:
+            a1 = self.acc_pos[0] / max(self.cycles, 1)
+            a2 = self.acc_pos[1] / max(self.acc_pos[0], 1)
             self.logger.info(
-                f"[MTP] uid={self.uid} cycles={self.cycles} "
+                f"[MTP] uid={self.uid} cycles={self.cycles} k={self.draft_k} "
                 f"proposed={self.proposed} accepted={self.accepted} "
                 f"accept_rate={self.accepted / self.proposed:.3f} "
-                f"out={self.out_tokens} "
+                f"a1={a1:.3f} a2={a2:.3f} out={self.out_tokens} "
                 f"eff_tokens_per_step={self.out_tokens / self.cycles:.3f}"
             )
 
     def _summary(self, why: str) -> None:
         elapsed = max(time.perf_counter() - self.t0, 1e-9)
         if self.cycles:
+            a1 = self.acc_pos[0] / max(self.cycles, 1)
+            a2 = self.acc_pos[1] / max(self.acc_pos[0], 1)
             self.logger.info(
                 f"[MTP_SUMMARY] ({why}) uid={self.uid} req_cycles={self.cycles} "
-                f"proposed={self.proposed} accepted={self.accepted} "
+                f"k={self.draft_k} proposed={self.proposed} accepted={self.accepted} "
                 f"accept_rate={self.accepted / max(self.proposed, 1):.3f} "
-                f"out={self.out_tokens} "
+                f"a1={a1:.3f} a2={a2:.3f} out={self.out_tokens} "
                 f"eff_tokens_per_step={self.out_tokens / self.cycles:.3f} "
                 f"gen_tps={self.out_tokens / elapsed:.2f}"
             )
@@ -368,11 +383,12 @@ class _MTPState:
         if x.shape[1] > 1:
             mask = create_attention_mask(x, self.mtp_cache[0], return_array=True)
         y = self.mtp.block(x, mask=mask, cache=self.mtp_cache)
-        logits = self.lm_head(self.mtp.head_norm(y[:, -1:, :]))
-        return mx.argmax(logits[..., -1, :], axis=-1).reshape(1)
+        h_out = y[:, -1:, :]
+        logits = self.lm_head(self.mtp.head_norm(h_out))
+        return mx.argmax(logits[..., -1, :], axis=-1).reshape(1), h_out
 
     def draft(self, h_last: mx.array, next_tok: mx.array) -> mx.array:
-        return self.draft_multi([(h_last, next_tok)])
+        return self.draft_multi([(h_last, next_tok)])[0]
 
     def mtp_cache_arrays(self) -> list[mx.array]:
         if self.mtp_cache is None:
@@ -534,7 +550,8 @@ def _battle_step(state: _MTPState, prev_step: Any, batch: Any):
         tok, lp = state.buffer.pop(0)
         ti = int(tok.reshape(-1)[0].item())
         batch.tokens[0].append(ti)
-        state.flush_pack = None
+        if not state.buffer:
+            state.cycle_pack = None
         return [ti], [_lp_row(lp)]
 
     # ---- speculation cycle -------------------------------------------------
@@ -551,25 +568,42 @@ def _battle_step(state: _MTPState, prev_step: Any, batch: Any):
         state.h_last = h_entry[:, -1:, :]
 
     _t0 = time.perf_counter() if state.prof else 0.0
+    k = state.draft_k
     pairs = state.mtp_backlog + [(state.h_last, y.reshape(-1)[0:1])]
     state.mtp_backlog = []
-    d = state.draft_multi(pairs)
+    d1, h_mtp = state.draft_multi(pairs)
+    drafts = [d1]
+    if k >= 2:
+        # chained proposal: the MTP block's own pre-norm output stands in for
+        # the (not yet computed) main-model hidden of d1 (vLLM/SGLang MTP k>1)
+        d2, _ = state.draft_multi([(h_mtp, d1)])
+        drafts.append(d2)
 
     verify_in = mx.concatenate(
-        [y.reshape(-1)[0:1], d.astype(y.dtype).reshape(-1)[0:1]]
-    ).reshape(1, 2)
+        [y.reshape(-1)[0:1]] + [x.astype(y.dtype).reshape(-1)[0:1] for x in drafts]
+    ).reshape(1, k + 1)
     logits2 = batch.model(verify_in, cache=batch.prompt_cache)
     hv = state.store.pop("h", None)
     lp2 = logits2 - mx.logsumexp(logits2, axis=-1, keepdims=True)
-    t1 = mx.argmax(lp2[:, 0, :], axis=-1)
-    acc = mx.equal(d.astype(mx.int64), t1.astype(mx.int64))
+    t_all = mx.argmax(lp2, axis=-1)                       # (1, k+1)
+    t1 = t_all[:, 0]
+    acc1 = mx.equal(d1.astype(mx.int64), t1.astype(mx.int64))
+    if k >= 2:
+        acc2 = mx.logical_and(
+            acc1, mx.equal(drafts[1].astype(mx.int64), t_all[:, 1].astype(mx.int64))
+        )
+    else:
+        acc2 = None
 
     if state.prof:
         _t1 = time.perf_counter()
-    mx.eval(acc, y)
-    m = int(acc.reshape(-1)[0].item())
+    mx.eval(acc1, y) if acc2 is None else mx.eval(acc1, acc2, y)
+    m = int(acc1.reshape(-1)[0].item())
+    if acc2 is not None:
+        m += int(acc2.reshape(-1)[0].item())
     if state.prof:
         _t2 = time.perf_counter()
+    d = d1
 
     if state.cycles < state.trace_n:
         row = lp2[0, 0, :].astype(mx.float32)
@@ -587,14 +621,18 @@ def _battle_step(state: _MTPState, prev_step: Any, batch: Any):
             extra = f" h0sum={float(mx.sum(h0.astype(mx.float32)).item()):.6f}"
         state.logger.info(
             f"[MTP_TRACE] uid={state.uid} c={state.cycles} "
-            f"y={int(y.reshape(-1)[0].item())} d={int(d.reshape(-1)[0].item())} "
+            f"y={int(y.reshape(-1)[0].item())} "
+            f"d={[int(x.reshape(-1)[0].item()) for x in drafts]} "
             f"t1={t1i} m={m} margin={margin:.6g}{extra}"
         )
 
-    if hv is None or hv.shape[1] < 2:
+    if hv is None or hv.shape[1] < k + 1:
         # capture broke mid-flight: undo the verify and decay to normal decode
         for c in batch.prompt_cache:
-            c.trim(2)
+            c.trim(k + 1)
+        if k >= 2 and state.mtp_cache is not None:
+            for c in state.mtp_cache.caches:
+                c.trim(1)
         _warn_once(
             state.logger, "no-hv",
             "[MTP] verify hidden not captured; battle disabled for request",
@@ -602,31 +640,28 @@ def _battle_step(state: _MTPState, prev_step: Any, batch: Any):
         state.request_greedy = False
         return prev_step(batch)
 
-    if m:
-        b_tok = mx.argmax(lp2[:, 1, :], axis=-1)
-        batch._next_tokens = b_tok.astype(y.dtype)
-        batch._next_logprobs = lp2[:, 1]
-        state.h_last = hv[:, 1:2, :]
-        state.mtp_backlog = [(hv[:, 0:1, :], d)]
-        state.buffer.append((d, lp2[:, 0]))
-        state.flush_pack = (t1.astype(y.dtype), lp2[:, 0], hv[:, 0:1, :])
-        mx.async_eval(
-            batch._next_tokens, batch._next_logprobs, d,
-            *_advance_chain_arrays(batch.prompt_cache),
-            *state.mtp_cache_arrays(),
-        )
-    else:
-        for c in batch.prompt_cache:
+    # The chained step-2 MTP entry was computed from the block's own hidden;
+    # drop it — accepted positions re-enter through the backlog with the
+    # true main-model hidden from this verify.
+    if k >= 2 and state.mtp_cache is not None:
+        for c in state.mtp_cache.caches:
             c.trim(1)
-        batch._next_tokens = t1.astype(y.dtype)
-        batch._next_logprobs = lp2[:, 0]
-        state.h_last = hv[:, 0:1, :]
-        state.flush_pack = None
-        mx.async_eval(
-            batch._next_tokens, batch._next_logprobs,
-            *_advance_chain_arrays(batch.prompt_cache),
-            *state.mtp_cache_arrays(),
-        )
+    if k - m:
+        for c in batch.prompt_cache:
+            c.trim(k - m)
+
+    batch._next_tokens = t_all[:, m].astype(y.dtype)
+    batch._next_logprobs = lp2[:, m]
+    state.h_last = hv[:, m:m + 1, :]
+    state.mtp_backlog = [(hv[:, i:i + 1, :], drafts[i]) for i in range(m)]
+    state.buffer = [(drafts[i], lp2[:, i]) for i in range(m)]
+    state.cycle_pack = (t_all, lp2, hv, drafts, m) if m else None
+    state.flush_pack = None
+    mx.async_eval(
+        batch._next_tokens, batch._next_logprobs, *drafts,
+        *_advance_chain_arrays(batch.prompt_cache),
+        *state.mtp_cache_arrays(),
+    )
 
     batch._current_tokens = y
     batch._current_logprobs = y_lp
@@ -654,21 +689,25 @@ def _battle_step(state: _MTPState, prev_step: Any, batch: Any):
 
 
 def _flush_buffered(state: _MTPState, batch: Any) -> None:
-    """Roll an accept-cycle back to its reject-equivalent (B==1 only)."""
-    if not state.buffer or state.flush_pack is None:
+    """Roll buffered (verified, unemitted) drafts back so the request ends
+    exactly where its emitted stream ends (B==1 only)."""
+    if not state.buffer or state.cycle_pack is None:
         state.buffer = []
         return
-    t1, t1_lp, h0 = state.flush_pack
+    t_all, lp2, hv, drafts, m = state.cycle_pack
+    r = len(state.buffer)          # still-buffered drafts to drop
+    kept = m - r                   # drafts already emitted stay committed
     for c in batch.prompt_cache:
-        c.trim(len(state.buffer))
-    batch._next_tokens = t1
-    batch._next_logprobs = t1_lp
-    state.h_last = h0
-    state.mtp_backlog = []
+        c.trim(r)
+    batch._next_tokens = t_all[:, kept].astype(batch._next_tokens.dtype)
+    batch._next_logprobs = lp2[:, kept]
+    state.h_last = hv[:, kept:kept + 1, :]
+    state.mtp_backlog = [(hv[:, i:i + 1, :], drafts[i]) for i in range(kept)]
     state.buffer = []
+    state.cycle_pack = None
     state.flush_pack = None
-    state.out_tokens = max(state.out_tokens - 1, 0)
-    state.accepted = max(state.accepted - 1, 0)
+    state.out_tokens = max(state.out_tokens - r, 0)
+    state.accepted = max(state.accepted - r, 0)
     state.logger.info(
         f"[MTP] uid={state.uid} buffered token flushed (batch merge/teardown); "
         f"rolled back to reject-equivalent state"
@@ -729,6 +768,7 @@ def _install_hooks(logger: Any) -> None:
                 c.trim(len(state.buffer))
             state.buffer = []
             state.flush_pack = None
+            state.cycle_pack = None
         if state is not None and self.uids and state.uid == self.uids[idx]:
             state.finish()
         return prev_extract(self, idx)
@@ -834,9 +874,7 @@ def apply_glm52_mtp_patch(
     validate = _env_int(_ENV_VALIDATE, 0, 0, 1, logger) == 1
     trace_n = _env_int(_ENV_TRACE, 0, 0, 4096, logger)
     prof = _env_int(_ENV_PROF, 0, 0, 1, logger) == 1
-    draft_k = _env_int(_ENV_DRAFT_K, 1, 1, 3, logger)
-    if draft_k > 1:
-        _warn_once(logger, "draft-k", "[MTP] DRAFT_K>1 is phase 4; using k=1")
+    draft_k = _env_int(_ENV_DRAFT_K, 1, 1, 2, logger)
 
     try:
         mtp = load_mtp_module(
@@ -858,12 +896,12 @@ def apply_glm52_mtp_patch(
     state = _MTPState(
         mode=mode, concat=concat, mtp=mtp, embed=embed, lm_head=lm_head,
         store=store, logger=logger, validate=validate, trace_n=trace_n,
-        prof=prof,
+        prof=prof, draft_k=draft_k,
     )
     model._exo_glm52_mtp_state = state
     _install_hooks(logger)
     logger.info(
-        f"[MTP] enabled mode={mode} concat={concat} validate={int(validate)} "
+        f"[MTP] enabled mode={mode} k={draft_k} concat={concat} validate={int(validate)} "
         f"weights={weights_path.name} layer_idx={layer_idx}"
     )
     return model

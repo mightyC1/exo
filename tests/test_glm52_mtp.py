@@ -301,12 +301,12 @@ def _run_bg(model, prompt, max_tokens):
     return bg, toks, last
 
 
-def _battle_state(model, sidecar, draft_override=None):
+def _battle_state(model, sidecar, draft_override=None, k=1):
     m = _load(sidecar)
     st = _State2(
         mode="on", concat="eh", mtp=m,
         embed=model.model.embed_tokens, lm_head=model.lm_head,
-        store={}, logger=_StubLogger(),
+        store={}, logger=_StubLogger(), draft_k=k,
     )
     if draft_override is not None:
         st.draft_multi = draft_override  # type: ignore[method-assign]
@@ -336,7 +336,29 @@ def _oracle_draft(state_holder):
         mx.eval(t)
         for cl in gb.prompt_cache:
             cl.trim(1)
-        return t
+        return t, pairs[-1][0]
+    return draft
+
+
+def _oracle_draft2(state_holder):
+    """k=2 oracle: step-1 peeks [y]; step-2 peeks [y, d1] (calls alternate)."""
+    mem = {"n": 0, "y": None}
+
+    def draft(pairs):
+        gb = state_holder[0].cur_batch
+        tok = pairs[-1][1].reshape(1, 1).astype(mx.uint32)
+        if mem["n"] % 2 == 0:
+            mem["y"] = tok
+            seq = tok
+        else:
+            seq = mx.concatenate([mem["y"], tok], axis=1)
+        mem["n"] += 1
+        lg = gb.model(seq, cache=gb.prompt_cache)
+        t = mx.argmax(lg[:, -1, :], axis=-1).reshape(1)
+        mx.eval(t)
+        for cl in gb.prompt_cache:
+            cl.trim(seq.shape[1])
+        return t, pairs[-1][0]
     return draft
 
 
@@ -387,7 +409,7 @@ def test_battle_byte_equal_all_accept(off_stream, sidecar):
 def test_battle_byte_equal_all_reject(off_stream, sidecar):
     model, ref = off_stream
     state = _battle_state(
-        model, sidecar, draft_override=lambda pairs: mx.array([3])
+        model, sidecar, draft_override=lambda pairs: (mx.array([3]), pairs[-1][0])
     )
     _attach(model, state)
     try:
@@ -468,11 +490,11 @@ def test_flush_buffered_rolls_back_to_reject_state(off_stream, sidecar):
             emitted.extend(r.token for r in responses or [])
             if state.buffer:
                 break
-        assert state.buffer and state.flush_pack is not None
+        assert state.buffer and state.cycle_pack is not None
         gb = bg._generation_batch
-        t1_expected = int(state.flush_pack[0].reshape(-1)[0].item())
+        t1_expected = int(state.cycle_pack[0][:, 0].reshape(-1)[0].item())
         _flush_buffered(state, gb)
-        assert state.buffer == [] and state.flush_pack is None
+        assert state.buffer == [] and state.cycle_pack is None
         assert _batch_off(gb) == len(gb.tokens[0])
         assert int(gb._next_tokens.reshape(-1)[0].item()) == t1_expected
         # the rolled-back request must continue byte-identically to plain decode
@@ -515,3 +537,124 @@ def test_dense_prefill_predicate_by_actual_padding():
     assert cache_requires_dense_prefill(c) is True
     c.left_padding = mx.array([0])
     assert cache_requires_dense_prefill(c) is False
+
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: k=2 chained drafts
+# ---------------------------------------------------------------------------
+
+
+def _run_on(model, sidecar, n, draft_override, k, prompt=PROMPT):
+    holder = []
+    state = _battle_state(model, sidecar, draft_override=None, k=k)
+    if draft_override is not None:
+        state.draft_multi = draft_override(holder)  # type: ignore[method-assign]
+    holder.append(state)
+    _attach(model, state)
+    try:
+        _, toks, last = _run_bg(model, prompt, n)
+    finally:
+        _detach(model)
+    return state, toks, last
+
+
+def test_k2_byte_equal_all_accept(off_stream, sidecar):
+    model, ref = off_stream
+    state, toks, _ = _run_on(model, sidecar, N_GEN, _oracle_draft2, k=2)
+    assert state.acc_pos[1] > 0, "oracle2 must produce m=2 cycles"
+    assert toks == ref, f"k2(all-accept) diverged: {toks} vs {ref}"
+
+
+def test_k2_byte_equal_all_reject(off_stream, sidecar):
+    model, ref = off_stream
+    state, toks, _ = _run_on(
+        model, sidecar, N_GEN, lambda h: (lambda pairs: (mx.array([3]), pairs[-1][0])), k=2
+    )
+    assert state.cycles > 0 and state.accepted == 0
+    assert toks == ref, f"k2(all-reject) diverged: {toks} vs {ref}"
+
+
+def test_k2_byte_equal_half(off_stream, sidecar):
+    """step-1 correct, step-2 wrong -> m=1 every cycle (trim 1, backlog 1)."""
+    model, ref = off_stream
+
+    def half(holder):
+        oracle = _oracle_draft2(holder)
+        mem = {"n": 0}
+
+        def draft(pairs):
+            t, h = oracle(pairs)
+            mem["n"] += 1
+            if mem["n"] % 2 == 0:  # step-2: sabotage
+                return mx.array([3]), h
+            return t, h
+        return draft
+
+    state, toks, _ = _run_on(model, sidecar, N_GEN, half, k=2)
+    assert state.acc_pos[0] > 0 and state.acc_pos[1] == 0
+    assert toks == ref, f"k2(half) diverged: {toks} vs {ref}"
+
+
+def test_k2_byte_equal_real_draft(off_stream, sidecar):
+    model, ref = off_stream
+    state, toks, _ = _run_on(model, sidecar, 40, None, k=2)
+    _, ref40, _ = ( _detach(model), None, None) and (None, None, None)
+    _detach(model)
+    _, ref40, _ = _run_bg(model, PROMPT, 40)
+    assert state.cycles > 0
+    assert toks == ref40, f"k2(real) diverged: {toks} vs {ref40}"
+
+
+def test_k2_extract_trims_buffered_surplus(off_stream, sidecar):
+    """finish landing on cycle / buffered-d1 / buffered-d2 emissions."""
+    model, _ = off_stream
+    for n in (5, 6, 7):
+        state, _, last = _run_on(model, sidecar, n, _oracle_draft2, k=2)
+        assert last is not None and last.finish_reason == "length"
+        cache = last.prompt_cache
+        assert cache[0][0].offset == len(last.all_tokens), n
+        assert cache[0][1].offset == cache[0][0].offset
+
+
+def test_k2_flush_rolls_back_r2_and_r1(off_stream, sidecar):
+    model, ref = off_stream
+    for pops in (0, 1):  # r=2 (nothing popped) and r=1 (one draft emitted)
+        holder = []
+        state = _battle_state(model, sidecar, k=2)
+        state.draft_multi = _oracle_draft2(holder)  # type: ignore[method-assign]
+        holder.append(state)
+        _attach(model, state)
+        try:
+            from mlx_lm.generate import BatchGenerator
+
+            bg = BatchGenerator(
+                model, stop_tokens=None, prefill_step_size=64,
+                completion_batch_size=4, prefill_batch_size=2,
+            )
+            bg.insert([list(PROMPT)], max_tokens=[N_GEN])
+            emitted = []
+            for _ in range(64):
+                out = bg.next()
+                responses = out[1] if isinstance(out, tuple) else out
+                emitted.extend(r.token for r in responses or [])
+                if len(state.buffer) == 2 - pops and state.cycle_pack is not None \
+                        and (pops == 0 or state.accepted >= 2):
+                    break
+            assert state.buffer, "expected buffered drafts"
+            gb = bg._generation_batch
+            _flush_buffered(state, gb)
+            assert state.buffer == [] and state.cycle_pack is None
+            assert _batch_off(gb) == len(gb.tokens[0])
+            toks_after, last = [], None
+            for _ in range(N_GEN * 3 + 32):
+                out = bg.next()
+                responses = out[1] if isinstance(out, tuple) else out
+                for r in responses or []:
+                    toks_after.append(r.token)
+                    last = r
+                if last is not None and last.finish_reason is not None:
+                    break
+        finally:
+            _detach(model)
+        assert (emitted + toks_after) == ref, (pops, emitted, toks_after, ref)
