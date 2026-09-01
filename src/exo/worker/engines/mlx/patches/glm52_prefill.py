@@ -650,6 +650,27 @@ def cache_has_active_right_padding(cache: Any) -> bool:
     return False
 
 
+def _max_left_padding(cache: Any) -> int:
+    """Max actual left padding of a batched cache, memoized on the cache.
+
+    ``left_padding`` is a small per-row mx.array; reading it costs a host
+    sync, so the value is cached and invalidated by array identity — the
+    pinned ``extend``/``filter``/``prepare`` paths reassign the array when
+    padding changes, so identity tracks structural changes exactly.
+    """
+
+    lp = cache.left_padding
+    memo = getattr(cache, "_exo_lp_memo", None)
+    if memo is not None and memo[0] is lp:
+        return memo[1]
+    try:
+        value = int(mx.max(lp).item()) if lp.size else 0
+    except Exception:  # pragma: no cover - fail closed on hostile shapes
+        value = 1
+    cache._exo_lp_memo = (lp, value)
+    return value
+
+
 def cache_requires_dense_prefill(cache: Any) -> bool:
     """Fail closed for batched padding whose all-masked rows are not sparse-equivalent.
 
@@ -660,12 +681,17 @@ def cache_requires_dense_prefill(cache: Any) -> bool:
     cannot guarantee the same output without full-N attention.  BatchKVCache and
     BatchRotatingKVCache expose ``left_padding``; active right padding is also
     checked explicitly for forward-compatible cache wrappers.
+
+    All-masked query rows can only exist when padding is actually present, so
+    an unpadded batched cache (the B==1 continuous-batching tail — e.g. the
+    MTP verify forward with L=2) keeps the sparse path.  ``left_padding`` is
+    inspected by value, memoized per array identity (:func:`_max_left_padding`).
     """
 
     if cache is None:
         return False
     try:
-        if hasattr(cache, "left_padding"):
+        if hasattr(cache, "left_padding") and _max_left_padding(cache) > 0:
             return True
     except Exception:  # pragma: no cover - hostile proxy objects are fail-safe
         return True

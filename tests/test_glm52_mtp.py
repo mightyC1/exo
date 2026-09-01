@@ -493,3 +493,25 @@ def test_flush_buffered_rolls_back_to_reject_state(off_stream, sidecar):
 def _batch_off(gb):
     o = gb.prompt_cache[0][0].offset
     return int(o.reshape(-1)[0].item()) if isinstance(o, mx.array) else int(o)
+
+
+def test_dense_prefill_predicate_by_actual_padding():
+    """B==1 unpadded BatchKVCache (the MTP verify case) must keep the sparse
+    path; real padding still forces the exact masked-dense fallback."""
+    from mlx_lm.models.cache import BatchKVCache
+    from exo.worker.engines.mlx.patches.glm52_prefill import (
+        cache_requires_dense_prefill,
+    )
+
+    c = BatchKVCache([0])
+    assert cache_requires_dense_prefill(c) is False
+    assert cache_requires_dense_prefill(c) is False  # memo hit
+
+    p = BatchKVCache([2, 0])
+    assert cache_requires_dense_prefill(p) is True
+
+    # identity-based memo invalidation: repadding via reassignment re-reads
+    c.left_padding = mx.array([3])
+    assert cache_requires_dense_prefill(c) is True
+    c.left_padding = mx.array([0])
+    assert cache_requires_dense_prefill(c) is False
