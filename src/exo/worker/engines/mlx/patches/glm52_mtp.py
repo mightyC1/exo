@@ -731,7 +731,10 @@ def _battle_step(state: _MTPState, prev_step: Any, batch: Any):
     verify_in = mx.concatenate(
         [y.reshape(-1)[0:1]] + [x.astype(y.dtype).reshape(-1)[0:1] for x in drafts]
     ).reshape(1, k + 1)
-    logits2 = batch.model(verify_in, cache=batch.prompt_cache)
+    from exo.worker.engines.mlx.patches.glm52_indexshare import mtp_verify_context
+
+    with mtp_verify_context():
+        logits2 = batch.model(verify_in, cache=batch.prompt_cache)
     hv = state.store.pop("h", None)
     logits2 = _apply_processors_rows(batch, logits2, [y] + drafts)
     lp2 = logits2 - mx.logsumexp(logits2, axis=-1, keepdims=True)

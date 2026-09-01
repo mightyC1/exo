@@ -46,9 +46,25 @@ _CLASSES_PATCHED = False
 _DEFAULT_PREFILL_CFG = GLM52PrefillConfig()
 
 # Query lengths up to this ride the sparse gather path whenever the indexer
-# produced top-k, bypassing the sparse_min_kv prefill-economics threshold.
-# Covers the MTP verify forward (L=2) and any future micro multi-token decode.
+# produced top-k, bypassing the sparse_min_kv prefill-economics threshold —
+# but only inside an explicit MTP verify context (see mtp_verify_context):
+# the W4 gate for ordinary prefill/decode is untouched (ТЗ invariant).
 _MICRO_DECODE_L = 4
+_MTP_VERIFY_CTX: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "exo_glm52_mtp_verify", default=False
+)
+
+
+class mtp_verify_context:
+    """Marks the enclosed model call as an MTP verify forward (B==1, L<=4)."""
+
+    def __enter__(self):
+        self._token = _MTP_VERIFY_CTX.set(True)
+        return self
+
+    def __exit__(self, *exc):
+        _MTP_VERIFY_CTX.reset(self._token)
+        return False
 
 
 def _env_raw(*names: str) -> str | None:
@@ -468,7 +484,12 @@ def _patch_mlx_lm_classes_once() -> None:
             # dense whenever the indexer produced indices, and — decisive —
             # it keeps the verify in the same topk math family as the L==1
             # decode branch, so t1/h match what MTP=off would compute.
-            micro_decode = topk_indices is not None and 1 < int(L) <= _MICRO_DECODE_L
+            micro_decode = (
+                topk_indices is not None
+                and 1 < int(L) <= _MICRO_DECODE_L
+                and int(B) == 1
+                and _MTP_VERIFY_CTX.get()
+            )
             sparse_requested = (
                 topk_indices is not None
                 and int(L) > 1
