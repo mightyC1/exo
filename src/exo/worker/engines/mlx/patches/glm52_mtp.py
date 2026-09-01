@@ -1,43 +1,45 @@
-"""GLM-5.2/5.3 MTP speculative decoding — phase 1: block + side-load + shadow.
+"""GLM-5.2/5.3 MTP speculative decoding — phases 1+2: shadow and greedy battle.
 
-Env-gated, default **off** (zero prod impact until enabled):
+Env (default **off**, zero prod impact until enabled):
 
-  EXO_GLM52_MTP=off|shadow|on   "on" is the phase-2 battle loop; in phase 1 it
-                                warns once and behaves as shadow (output is
-                                never altered by this module).
-  EXO_GLM52_MTP_WEIGHTS=auto|/path/to/mtp.safetensors  (auto: next to model)
-  EXO_GLM52_MTP_CONCAT=eh|he    eh_proj input order: eh = [enorm(embed),
-                                hnorm(hidden)] (DeepSeek-V3 reference order,
-                                default); he = swapped. Shadow A/B knob in
-                                case accept-rate points at the order.
+  EXO_GLM52_MTP=off|shadow|on
+      shadow: draft in parallel, compare, never alter output ([MTP_SHADOW]).
+      on:     M1 battle loop for *greedy* requests (verify L=2, accept m∈{0,1}
+              + bonus, trim rollback). Non-greedy (temp>0) requests fall back
+              to shadow until M2 lands — behaviour, not an error.
+  EXO_GLM52_MTP_WEIGHTS=auto|/path/to/mtp.safetensors
+  EXO_GLM52_MTP_CONCAT=eh|he      eh = [enorm(embed), hnorm(hidden)] — vendor
+                                  order per vLLM deepseek_mtp (default).
+  EXO_GLM52_MTP_VALIDATE=0|1      canary: per-cycle cross-rank all_sum asserts
+                                  on (m, offsets, buffer) + slot0/slot1 checks.
+  EXO_GLM52_MTP_DRAFT_K=1         parsed and clamped; >1 is phase 4.
 
-Shadow mode: on every decode step (B==1 only) the MTP head drafts the next
-token in parallel from (pre-final-norm hidden, sampled token) and the draft is
-compared against the token the main model actually samples one step later.
-Model output is bit-identical to MTP=off; the only artifacts are
-``[MTP_SHADOW]`` telemetry lines and one extra small forward per step.
+Battle-step mapping onto the pinned ``GenerationBatch._step`` pipelining
+(entry: ``_next_tokens`` = pending token y; exit: emit y, set new pending):
 
-Design notes (docs/glm52-mtp-recon.md D1–D7):
-  * block = pinned ``DeepseekV32DecoderLayer(args, layer_idx=num_hidden_layers)``
-    (MoE branch + own full indexer come from the pin) + enorm/hnorm/eh_proj +
-    shared_head.norm; embed_tokens / lm_head are shared with the main model
-    (tied in the checkpoint), replicated on every rank → zero new collectives.
-  * side-load is presence-driven: a submodule is quantized iff
-    ``<name>.scales`` exists in mtp.safetensors (config flags not consulted).
-  * hidden capture: the model's final ``norm`` is wrapped by a passthrough
-    object storing its input (pre-norm h). TP-safe: h is replicated.
-  * decode-step hook wraps whatever ``GenerationBatch._step`` is currently
-    installed (normally opt_batch_gen's ``_patched_step``); everything about
-    the wrapped step (topk buffer, cache drain, async chains, pipelining) is
-    preserved because shadow only *reads* ``_next_tokens`` lazily.
-  * accounting is one step delayed so no extra GPU syncs are introduced:
-    draft/eq arrays ride the existing async_eval train.
+  cycle:   d = MTP(backlog + (h_last, y));  verify = model([y, d], cache)
+           t1 = argmax(verify[0]); accept ⇔ d == t1
+           accept: emit y, buffer d (emitted next call, no forward),
+                   pending = argmax(verify[1]), backlog = [(h_y, d)]
+           reject: trim(1) on every CacheList (both slots), emit y,
+                   pending = t1
+  The MTP cache lags the main cache by the backlog and ingests it inside the
+  next draft (one L=len forward — bandwidth-bound, same weight read as L=1).
+
+Consistency hooks (installed with the step wrapper):
+  * ``GenerationBatch.extract_cache`` — on finish with a buffered token the
+    cache holds one uncommitted position; trim it so KVPrefixCache never
+    stores a cache longer than ``all_tokens`` (recon D4).
+  * ``GenerationBatch.extend`` — continuous-batching merge while a token is
+    buffered would strand it; pre-merge we roll the request back to the
+    reject-equivalent state (trim, pending = t1) while B is still 1.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -50,11 +52,13 @@ from exo.worker.runner.bootstrap import logger as default_logger
 _ENV_MODE = "EXO_GLM52_MTP"
 _ENV_WEIGHTS = "EXO_GLM52_MTP_WEIGHTS"
 _ENV_CONCAT = "EXO_GLM52_MTP_CONCAT"
+_ENV_VALIDATE = "EXO_GLM52_MTP_VALIDATE"
+_ENV_DRAFT_K = "EXO_GLM52_MTP_DRAFT_K"
 
 _LOG_EVERY = 64
 _WIN = 256
 
-_STEP_WRAPPED = False
+_HOOKS_INSTALLED = False
 _WARNED: set[str] = set()
 
 
@@ -76,6 +80,21 @@ def _env_choice(name: str, default: str, allowed: set[str], logger: Any) -> str:
         )
         return default
     return value
+
+
+def _env_int(name: str, default: int, lo: int, hi: int, logger: Any) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        v = int(raw.strip())
+    except (TypeError, ValueError):
+        _warn_once(logger, f"env:{name}", f"[MTP] invalid {name}={raw!r}; using {default}")
+        return default
+    if not lo <= v <= hi:
+        _warn_once(logger, f"env:{name}", f"[MTP] {name}={v} clamped to [{lo},{hi}]")
+        return max(lo, min(hi, v))
+    return v
 
 
 # ---------------------------------------------------------------------------
@@ -150,9 +169,7 @@ def load_mtp_module(
     module.load_weights(list(weights.items()), strict=True)
     mx.eval(module.parameters())
 
-    n_bytes = sum(
-        v.nbytes for _, v in tree_flatten(module.parameters())
-    )
+    n_bytes = sum(v.nbytes for _, v in tree_flatten(module.parameters()))
     logger.info(
         f"[MTP] side-loaded {weights_path.name}: {len(weights)} tensors, "
         f"{n_bytes / 1e9:.2f} GB (int{bits} g{group_size} {mode}, "
@@ -162,7 +179,7 @@ def load_mtp_module(
 
 
 # ---------------------------------------------------------------------------
-# Shadow state + step hook
+# Shared state
 # ---------------------------------------------------------------------------
 
 
@@ -196,6 +213,7 @@ class _MTPState:
         lm_head: Any,
         store: dict[str, Any],
         logger: Any,
+        validate: bool = False,
     ) -> None:
         from mlx_lm.models.cache import CacheList, KVCache
 
@@ -206,20 +224,34 @@ class _MTPState:
         self.lm_head = lm_head
         self.store = store
         self.logger = logger
+        self.validate = validate
         self._cache_cls = lambda: CacheList(KVCache(), KVCache())
 
         self.uid: int | None = None
+        self.cur_batch: Any = None
         self.mtp_cache: Any = None
+        # shadow fields
         self.pending_draft: mx.array | None = None
         self.lazy_match: mx.array | None = None
         self.steps = 0
         self.matches = 0
         self.win: list[bool] = []
+        # battle fields
+        self.request_greedy: bool | None = None
+        self.buffer: list[tuple[mx.array, mx.array]] = []
+        self.h_last: mx.array | None = None
+        self.mtp_backlog: list[tuple[mx.array, mx.array]] = []
+        self.flush_pack: tuple[mx.array, mx.array, mx.array] | None = None
+        self.cycles = 0
+        self.proposed = 0
+        self.accepted = 0
+        self.out_tokens = 0
+        self.t0 = 0.0
 
     # -- request lifecycle --------------------------------------------------
 
     def start_request(self, uid: int) -> None:
-        if self.uid is not None and self.steps:
+        if self.uid is not None and (self.steps or self.cycles):
             self._summary("switch")
         self.uid = uid
         self.mtp_cache = self._cache_cls()
@@ -228,14 +260,37 @@ class _MTPState:
         self.steps = 0
         self.matches = 0
         self.win = []
+        self.request_greedy = None
+        self.buffer = []
+        self.h_last = None
+        self.mtp_backlog = []
+        self.flush_pack = None
+        self.cycles = 0
+        self.proposed = 0
+        self.accepted = 0
+        self.out_tokens = 0
+        self.t0 = time.perf_counter()
 
     def reset(self) -> None:
-        if self.uid is not None and self.steps:
+        if self.uid is not None and (self.steps or self.cycles):
             self._summary("reset")
         self.uid = None
+        self.cur_batch = None
         self.mtp_cache = None
         self.pending_draft = None
         self.lazy_match = None
+        self.request_greedy = None
+        self.buffer = []
+        self.h_last = None
+        self.mtp_backlog = []
+        self.flush_pack = None
+
+    def finish(self) -> None:
+        if self.uid is not None and (self.steps or self.cycles):
+            self._summary("finish")
+        self.reset()
+
+    # -- shadow accounting ---------------------------------------------------
 
     def account(self, hit: bool) -> None:
         self.steps += 1
@@ -244,40 +299,71 @@ class _MTPState:
         if len(self.win) > _WIN:
             self.win.pop(0)
         if self.steps % _LOG_EVERY == 0:
-            self._line("")
+            wr = (sum(self.win) / len(self.win)) if self.win else 0.0
+            self.logger.info(
+                f"[MTP_SHADOW] uid={self.uid} steps={self.steps} "
+                f"match={self.matches} rate={self.matches / self.steps:.3f} "
+                f"win{len(self.win)}={wr:.3f}"
+            )
 
-    def _rate(self) -> float:
-        return self.matches / self.steps if self.steps else 0.0
-
-    def _line(self, tag: str) -> None:
-        wr = (sum(self.win) / len(self.win)) if self.win else 0.0
-        self.logger.info(
-            f"[MTP_SHADOW]{tag} uid={self.uid} steps={self.steps} "
-            f"match={self.matches} rate={self._rate():.3f} "
-            f"win{len(self.win)}={wr:.3f}"
-        )
+    def account_cycle(self, m: int) -> None:
+        self.cycles += 1
+        self.proposed += 1
+        self.accepted += m
+        self.out_tokens += m + 1
+        if self.cycles % _LOG_EVERY == 0:
+            self.logger.info(
+                f"[MTP] uid={self.uid} cycles={self.cycles} "
+                f"proposed={self.proposed} accepted={self.accepted} "
+                f"accept_rate={self.accepted / self.proposed:.3f} "
+                f"out={self.out_tokens} "
+                f"eff_tokens_per_step={self.out_tokens / self.cycles:.3f}"
+            )
 
     def _summary(self, why: str) -> None:
-        self._line(f" summary({why})")
+        elapsed = max(time.perf_counter() - self.t0, 1e-9)
+        if self.cycles:
+            self.logger.info(
+                f"[MTP_SUMMARY] ({why}) uid={self.uid} req_cycles={self.cycles} "
+                f"proposed={self.proposed} accepted={self.accepted} "
+                f"accept_rate={self.accepted / max(self.proposed, 1):.3f} "
+                f"out={self.out_tokens} "
+                f"eff_tokens_per_step={self.out_tokens / self.cycles:.3f} "
+                f"gen_tps={self.out_tokens / elapsed:.2f}"
+            )
+        if self.steps:
+            wr = (sum(self.win) / len(self.win)) if self.win else 0.0
+            self.logger.info(
+                f"[MTP_SHADOW] summary({why}) uid={self.uid} steps={self.steps} "
+                f"match={self.matches} rate={self.matches / self.steps:.3f} "
+                f"win{len(self.win)}={wr:.3f}"
+            )
 
     # -- math ---------------------------------------------------------------
 
-    def draft(self, h_last: mx.array, next_tok: mx.array) -> mx.array:
-        """One MTP forward: (pre-norm h at pos t, token t+1) -> argmax t+2."""
-        tok = next_tok.reshape(1, 1)
-        e = self.enorm_embed(tok)
-        h = self.mtp.hnorm(h_last)
+    def draft_multi(self, pairs: list[tuple[mx.array, mx.array]]) -> mx.array:
+        """MTP forward over (h, token) pairs; returns greedy draft for the
+        last position. Ingests every pair into the MTP cache (backlog+1)."""
+        from mlx_lm.models.base import create_attention_mask
+
+        h_in = mx.concatenate([h for h, _ in pairs], axis=1)
+        t_in = mx.concatenate([t.reshape(1, 1) for _, t in pairs], axis=1)
+        e = self.mtp.enorm(self.embed(t_in))
+        h = self.mtp.hnorm(h_in.astype(e.dtype))
         if self.concat == "eh":
             x = mx.concatenate([e, h], axis=-1)
         else:
             x = mx.concatenate([h, e], axis=-1)
         x = self.mtp.eh_proj(x)
-        y = self.mtp.block(x, mask=None, cache=self.mtp_cache)
-        logits = self.lm_head(self.mtp.head_norm(y))
+        mask = None
+        if x.shape[1] > 1:
+            mask = create_attention_mask(x, self.mtp_cache[0], return_array=True)
+        y = self.mtp.block(x, mask=mask, cache=self.mtp_cache)
+        logits = self.lm_head(self.mtp.head_norm(y[:, -1:, :]))
         return mx.argmax(logits[..., -1, :], axis=-1).reshape(1)
 
-    def enorm_embed(self, tok: mx.array) -> mx.array:
-        return self.mtp.enorm(self.embed(tok))
+    def draft(self, h_last: mx.array, next_tok: mx.array) -> mx.array:
+        return self.draft_multi([(h_last, next_tok)])
 
     def mtp_cache_arrays(self) -> list[mx.array]:
         if self.mtp_cache is None:
@@ -290,6 +376,66 @@ class _MTPState:
         return out
 
 
+def _request_is_greedy(batch: Any) -> bool:
+    sampler = None
+    if getattr(batch, "samplers", None) and batch.samplers[0] is not None:
+        sampler = batch.samplers[0]
+    else:
+        sampler = batch.fallback_sampler
+    probe = mx.log(mx.array([[0.02, 0.96, 0.02]]))
+    try:
+        a = int(sampler(probe).reshape(-1)[0].item())
+        b = int(sampler(probe).reshape(-1)[0].item())
+    except Exception:
+        return False
+    return a == 1 and b == 1
+
+
+def _dist_group() -> Any | None:
+    try:
+        g = mx.distributed.init()
+        return g if g is not None and g.size() > 1 else None
+    except Exception:
+        return None
+
+
+def _off(c: Any) -> int:
+    o = c.offset
+    if isinstance(o, mx.array):
+        return int(o.reshape(-1)[0].item())
+    return int(o)
+
+
+def _validate_cycle(state: _MTPState, batch: Any, m: int) -> None:
+    cl0 = batch.prompt_cache[0]
+    cl_last = batch.prompt_cache[-1]
+    off00, off01 = _off(cl0[0]), _off(cl0[1])
+    offl0, offl1 = _off(cl_last[0]), _off(cl_last[1])
+    if not (off00 == off01 == offl0 == offl1):
+        raise RuntimeError(
+            f"[MTP][VALIDATE] slot/layer offset skew: "
+            f"L0=({off00},{off01}) Ln=({offl0},{offl1})"
+        )
+    grp = _dist_group()
+    if grp is None:
+        return
+    mtp_off = _off(state.mtp_cache[0]) if state.mtp_cache is not None else 0
+    vec = mx.array([m, off00, mtp_off, len(state.buffer)], dtype=mx.int32)
+    total = mx.distributed.all_sum(vec, group=grp)
+    mx.eval(total)
+    expected = vec * grp.size()
+    if not mx.array_equal(total, expected).item():
+        raise RuntimeError(
+            f"[MTP][VALIDATE] cross-rank divergence: local={vec.tolist()} "
+            f"sum={total.tolist()} size={grp.size()}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Shadow step
+# ---------------------------------------------------------------------------
+
+
 def _shadow_step(state: _MTPState, prev_step: Any, batch: Any):
     if len(batch.uids) != 1:
         state.reset()
@@ -298,18 +444,14 @@ def _shadow_step(state: _MTPState, prev_step: Any, batch: Any):
     if state.uid != uid:
         state.start_request(uid)
 
-    # 1) harvest the comparison scheduled two calls ago (fully materialized
-    #    by now — its inputs rode the previous steps' async_eval trains).
     if state.lazy_match is not None:
         state.account(bool(state.lazy_match.item()))
         state.lazy_match = None
 
-    # 2) the real step (forward + sampling + emission). The norm wrapper
-    #    stores pre-norm h of this forward into state.store.
     result = prev_step(batch)
 
     h = state.store.pop("h", None)
-    next_tok = batch._next_tokens  # lazy: token sampled by this step
+    next_tok = batch._next_tokens
     if h is None or next_tok is None:
         _warn_once(
             state.logger, "no-h",
@@ -317,29 +459,189 @@ def _shadow_step(state: _MTPState, prev_step: Any, batch: Any):
         )
         return result
 
-    # 3) schedule comparison of the previous draft vs this step's sample.
     if state.pending_draft is not None:
         state.lazy_match = mx.equal(
             state.pending_draft, next_tok.reshape(-1)[0:1].astype(mx.int64)
         )
         mx.async_eval(state.lazy_match)
 
-    # 4) draft the next token; ride the async train, no syncs.
     d = state.draft(h[:, -1:, :], next_tok.reshape(-1)[0:1])
     state.pending_draft = d.astype(mx.int64)
     mx.async_eval(state.pending_draft, *state.mtp_cache_arrays())
     return result
 
 
-def _install_step_wrapper(logger: Any) -> None:
-    global _STEP_WRAPPED
-    if _STEP_WRAPPED:
+# ---------------------------------------------------------------------------
+# Battle step (M1, greedy)
+# ---------------------------------------------------------------------------
+
+
+def _lp_row(lp: Any) -> mx.array:
+    if isinstance(lp, mx.array):
+        return lp[0] if lp.ndim == 2 else lp
+    if isinstance(lp, list) and lp:
+        first = lp[0]
+        return first[0] if isinstance(first, mx.array) and first.ndim == 2 else first
+    return mx.zeros((1,))
+
+
+def _battle_step(state: _MTPState, prev_step: Any, batch: Any):
+    from exo.worker.engines.mlx.patches.opt_batch_gen import (
+        _advance_chain_arrays,
+        _drain_prompt_cache_if_needed,
+    )
+
+    if len(batch.uids) != 1:
+        state.reset()
+        return prev_step(batch)
+    uid = batch.uids[0]
+    if state.uid != uid:
+        state.start_request(uid)
+
+    tb = getattr(batch, "_topk_buffer", None)
+    if tb is not None and getattr(tb, "needs_topk", False):
+        _warn_once(
+            state.logger, "topk",
+            "[MTP] logprobs requested; battle loop falls back to normal decode "
+            "for such requests in M1",
+        )
+        return prev_step(batch)
+
+    if state.request_greedy is None:
+        state.request_greedy = _request_is_greedy(batch)
+        if not state.request_greedy:
+            _warn_once(
+                state.logger, "nongreedy",
+                "[MTP] non-greedy request under mode=on: running shadow for it "
+                "(M2 rejection sampling lands in phase 3)",
+            )
+    if not state.request_greedy:
+        return _shadow_step(state, prev_step, batch)
+
+    state.cur_batch = batch
+
+    # ---- buffered emission (accepted draft from the previous cycle) -------
+    if state.buffer:
+        tok, lp = state.buffer.pop(0)
+        ti = int(tok.reshape(-1)[0].item())
+        batch.tokens[0].append(ti)
+        state.flush_pack = None
+        return [ti], [_lp_row(lp)]
+
+    # ---- speculation cycle -------------------------------------------------
+    y = batch._next_tokens
+    y_lp = batch._next_logprobs
+    h_entry = state.store.pop("h", None)
+    if state.h_last is None:
+        if h_entry is None:
+            _warn_once(
+                state.logger, "no-h-battle",
+                "[MTP] pre-norm hidden unavailable; normal step (will seed next)",
+            )
+            return prev_step(batch)
+        state.h_last = h_entry[:, -1:, :]
+
+    pairs = state.mtp_backlog + [(state.h_last, y.reshape(-1)[0:1])]
+    state.mtp_backlog = []
+    d = state.draft_multi(pairs)
+
+    verify_in = mx.concatenate(
+        [y.reshape(-1)[0:1], d.astype(y.dtype).reshape(-1)[0:1]]
+    ).reshape(1, 2)
+    logits2 = batch.model(verify_in, cache=batch.prompt_cache)
+    hv = state.store.pop("h", None)
+    lp2 = logits2 - mx.logsumexp(logits2, axis=-1, keepdims=True)
+    t1 = mx.argmax(lp2[:, 0, :], axis=-1)
+    acc = mx.equal(d.astype(mx.int64), t1.astype(mx.int64))
+
+    mx.eval(acc, y)
+    m = int(acc.reshape(-1)[0].item())
+
+    if hv is None or hv.shape[1] < 2:
+        # capture broke mid-flight: undo the verify and decay to normal decode
+        for c in batch.prompt_cache:
+            c.trim(2)
+        _warn_once(
+            state.logger, "no-hv",
+            "[MTP] verify hidden not captured; battle disabled for request",
+        )
+        state.request_greedy = False
+        return prev_step(batch)
+
+    if m:
+        b_tok = mx.argmax(lp2[:, 1, :], axis=-1)
+        batch._next_tokens = b_tok.astype(y.dtype)
+        batch._next_logprobs = lp2[:, 1]
+        state.h_last = hv[:, 1:2, :]
+        state.mtp_backlog = [(hv[:, 0:1, :], d)]
+        state.buffer.append((d, lp2[:, 0]))
+        state.flush_pack = (t1.astype(y.dtype), lp2[:, 0], hv[:, 0:1, :])
+        mx.async_eval(
+            batch._next_tokens, batch._next_logprobs, d,
+            *_advance_chain_arrays(batch.prompt_cache),
+            *state.mtp_cache_arrays(),
+        )
+    else:
+        for c in batch.prompt_cache:
+            c.trim(1)
+        batch._next_tokens = t1.astype(y.dtype)
+        batch._next_logprobs = lp2[:, 0]
+        state.h_last = hv[:, 0:1, :]
+        state.flush_pack = None
+        mx.async_eval(
+            batch._next_tokens, batch._next_logprobs,
+            *_advance_chain_arrays(batch.prompt_cache),
+            *state.mtp_cache_arrays(),
+        )
+
+    batch._current_tokens = y
+    batch._current_logprobs = y_lp
+    _drain_prompt_cache_if_needed(batch)
+
+    ti = int(y.reshape(-1)[0].item())
+    batch.tokens[0].append(ti)
+    state.account_cycle(m)
+    if state.validate:
+        _validate_cycle(state, batch, m)
+    return [ti], [_lp_row(y_lp)]
+
+
+def _flush_buffered(state: _MTPState, batch: Any) -> None:
+    """Roll an accept-cycle back to its reject-equivalent (B==1 only)."""
+    if not state.buffer or state.flush_pack is None:
+        state.buffer = []
+        return
+    t1, t1_lp, h0 = state.flush_pack
+    for c in batch.prompt_cache:
+        c.trim(len(state.buffer))
+    batch._next_tokens = t1
+    batch._next_logprobs = t1_lp
+    state.h_last = h0
+    state.mtp_backlog = []
+    state.buffer = []
+    state.flush_pack = None
+    state.out_tokens = max(state.out_tokens - 1, 0)
+    state.accepted = max(state.accepted - 1, 0)
+    state.logger.info(
+        f"[MTP] uid={state.uid} buffered token flushed (batch merge/teardown); "
+        f"rolled back to reject-equivalent state"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Hook installation
+# ---------------------------------------------------------------------------
+
+
+def _install_hooks(logger: Any) -> None:
+    global _HOOKS_INSTALLED
+    if _HOOKS_INSTALLED:
         return
     from mlx_lm.generate import GenerationBatch
 
     prev_step = GenerationBatch._step
     if getattr(prev_step, "_exo_glm52_mtp_wrapper", False):
-        _STEP_WRAPPED = True
+        _HOOKS_INSTALLED = True
         return
     if getattr(prev_step, "__name__", "") not in ("_patched_step", "_step"):
         _warn_once(
@@ -353,21 +655,52 @@ def _install_step_wrapper(logger: Any) -> None:
         if state is None or state.mode == "off":
             return prev_step(self)
         try:
+            if state.mode == "on":
+                return _battle_step(state, prev_step, self)
             return _shadow_step(state, prev_step, self)
         except Exception:
             _warn_once(
-                logger, "shadow-crash",
-                "[MTP_SHADOW] exception in shadow path; disabling for this "
-                "model (output unaffected)",
+                logger, "mtp-crash",
+                "[MTP] exception in MTP path; disabling for this model",
             )
-            logger.opt(exception=True).warning("[MTP_SHADOW] traceback")
+            logger.opt(exception=True).warning("[MTP] traceback")
             state.mode = "off"
             return prev_step(self)
 
     _mtp_step._exo_glm52_mtp_wrapper = True  # type: ignore[attr-defined]
     GenerationBatch._step = _mtp_step
-    _STEP_WRAPPED = True
-    logger.info("[MTP] GenerationBatch._step wrapped (shadow-capable)")
+
+    prev_extract = GenerationBatch.extract_cache
+
+    def _mtp_extract_cache(self: Any, idx: int):
+        state = getattr(self.model, "_exo_glm52_mtp_state", None)
+        if state is not None and state.buffer and state.uid in self.uids:
+            # finish landed while a verified position sat in the buffer: the
+            # cache is one position ahead of the emitted stream — drop it so
+            # KVPrefixCache stores tokens/cache in lockstep (recon D4).
+            for c in self.prompt_cache:
+                c.trim(len(state.buffer))
+            state.buffer = []
+            state.flush_pack = None
+        if state is not None and self.uids and state.uid == self.uids[idx]:
+            state.finish()
+        return prev_extract(self, idx)
+
+    GenerationBatch.extract_cache = _mtp_extract_cache
+
+    prev_extend = GenerationBatch.extend
+
+    def _mtp_extend(self: Any, other: Any):
+        state = getattr(self.model, "_exo_glm52_mtp_state", None)
+        if state is not None and state.buffer and len(self.uids) == 1 \
+                and state.uid == self.uids[0]:
+            _flush_buffered(state, self)
+        return prev_extend(self, other)
+
+    GenerationBatch.extend = _mtp_extend
+
+    _HOOKS_INSTALLED = True
+    logger.info("[MTP] GenerationBatch hooks installed (_step/extract_cache/extend)")
 
 
 # ---------------------------------------------------------------------------
@@ -403,7 +736,7 @@ def apply_glm52_mtp_patch(
     *,
     logger: Any = default_logger,
 ) -> Any:
-    """Enable GLM-5.2/5.3 MTP shadow on a loaded glm_moe_dsa model.
+    """Enable GLM-5.2/5.3 MTP (shadow or battle) on a loaded glm_moe_dsa model.
 
     Fail-closed: any precondition miss logs one line and returns the model
     unchanged. Always returns the original model object.
@@ -411,13 +744,6 @@ def apply_glm52_mtp_patch(
     mode = _env_choice(_ENV_MODE, "off", {"off", "shadow", "on"}, logger)
     if mode == "off":
         return model
-    if mode == "on":
-        _warn_once(
-            logger, "mode-on",
-            "[MTP] EXO_GLM52_MTP=on: battle loop lands in phase 2; "
-            "running SHADOW (output unchanged)",
-        )
-        mode = "shadow"
 
     try:
         config = json.loads((model_path / "config.json").read_text())
@@ -458,6 +784,10 @@ def apply_glm52_mtp_patch(
         return model
 
     concat = _env_choice(_ENV_CONCAT, "eh", {"eh", "he"}, logger)
+    validate = _env_int(_ENV_VALIDATE, 0, 0, 1, logger) == 1
+    draft_k = _env_int(_ENV_DRAFT_K, 1, 1, 3, logger)
+    if draft_k > 1:
+        _warn_once(logger, "draft-k", "[MTP] DRAFT_K>1 is phase 4; using k=1")
 
     try:
         mtp = load_mtp_module(
@@ -478,12 +808,12 @@ def apply_glm52_mtp_patch(
 
     state = _MTPState(
         mode=mode, concat=concat, mtp=mtp, embed=embed, lm_head=lm_head,
-        store=store, logger=logger,
+        store=store, logger=logger, validate=validate,
     )
     model._exo_glm52_mtp_state = state
-    _install_step_wrapper(logger)
+    _install_hooks(logger)
     logger.info(
-        f"[MTP] enabled mode={mode} concat={concat} weights={weights_path.name} "
-        f"layer_idx={layer_idx} (shadow: output byte-identical to MTP=off)"
+        f"[MTP] enabled mode={mode} concat={concat} validate={int(validate)} "
+        f"weights={weights_path.name} layer_idx={layer_idx}"
     )
     return model

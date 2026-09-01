@@ -81,7 +81,7 @@ def _tiny_args():
 
     return ds.ModelArgs(
         model_type="deepseek_v32", vocab_size=97, hidden_size=HID,
-        index_head_dim=16, index_n_heads=2, index_topk=8,
+        index_head_dim=16, index_n_heads=2, index_topk=64,
         intermediate_size=64, moe_intermediate_size=64,
         num_hidden_layers=LAYER, num_attention_heads=HEADS,
         num_key_value_heads=HEADS, n_shared_experts=1,
@@ -256,3 +256,240 @@ def test_apply_fail_closed(tmp_path: Path, monkeypatch) -> None:
     assert apply_glm52_mtp_patch(model, tmp_path, logger=log) is model
     assert not hasattr(model, "_exo_glm52_mtp_state")
     assert any("patch not applied" in line for line in log.lines)
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: battle loop (greedy M1)
+# ---------------------------------------------------------------------------
+
+from exo.worker.engines.mlx.patches.glm52_mtp import (  # noqa: E402
+    _MTPState as _State2,
+    _PreNormCapture,
+    _flush_buffered,
+    _install_hooks,
+)
+
+
+def _tiny_model():
+    from mlx_lm.models import deepseek_v32 as ds
+
+    mx.random.seed(11)
+    m = ds.Model(_tiny_args())
+    mx.eval(m.parameters())
+    return m
+
+
+def _run_bg(model, prompt, max_tokens):
+    """Real pin path: BatchGenerator.insert -> prompt batch -> graduation ->
+    GenerationBatch over BatchKVCache (what prod decodes on)."""
+    from mlx_lm.generate import BatchGenerator
+
+    bg = BatchGenerator(
+        model, stop_tokens=None, prefill_step_size=64,
+        completion_batch_size=4, prefill_batch_size=2,
+    )
+    bg.insert([list(prompt)], max_tokens=[max_tokens])
+    toks, last = [], None
+    for _ in range(max_tokens * 3 + 32):
+        out = bg.next()
+        responses = out[1] if isinstance(out, tuple) else out
+        for r in responses or []:
+            toks.append(r.token)
+            last = r
+        if last is not None and last.finish_reason is not None:
+            break
+    return bg, toks, last
+
+
+def _battle_state(model, sidecar, draft_override=None):
+    m = _load(sidecar)
+    st = _State2(
+        mode="on", concat="eh", mtp=m,
+        embed=model.model.embed_tokens, lm_head=model.lm_head,
+        store={}, logger=_StubLogger(),
+    )
+    if draft_override is not None:
+        st.draft_multi = draft_override  # type: ignore[method-assign]
+    return st
+
+
+def _attach(model, state):
+    if not isinstance(model.model.norm, _PreNormCapture):
+        model.model.norm = _PreNormCapture(model.model.norm, state.store)
+    else:
+        state.store = model.model.norm._store
+    model._exo_glm52_mtp_state = state
+
+
+def _detach(model):
+    if hasattr(model, "_exo_glm52_mtp_state"):
+        delattr(model, "_exo_glm52_mtp_state")
+
+
+def _oracle_draft(state_holder):
+    """Peek the true next token via the live generation cache, then trim."""
+    def draft(pairs):
+        gb = state_holder[0].cur_batch
+        y = pairs[-1][1].reshape(1, 1).astype(mx.uint32)
+        lg = gb.model(y, cache=gb.prompt_cache)
+        t = mx.argmax(lg[:, -1, :], axis=-1).reshape(1)
+        mx.eval(t)
+        for cl in gb.prompt_cache:
+            cl.trim(1)
+        return t
+    return draft
+
+
+PROMPT = [5, 17, 42, 9, 88, 3, 61, 24]
+N_GEN = 12
+
+
+@pytest.fixture(scope="module")
+def off_stream():
+    model = _tiny_model()
+    _install_hooks(_StubLogger())
+    _detach(model)
+    _, toks, last = _run_bg(model, PROMPT, N_GEN)
+    assert last is not None and last.finish_reason == "length"
+    assert len(toks) >= N_GEN
+    return model, toks
+
+
+def test_battle_byte_equal_all_accept(off_stream, sidecar):
+    model, ref = off_stream
+    holder = []
+    state = _battle_state(model, sidecar, draft_override=_oracle_draft(holder))
+    holder.append(state)
+    _attach(model, state)
+    try:
+        from mlx_lm.generate import BatchGenerator
+
+        bg = BatchGenerator(
+            model, stop_tokens=None, prefill_step_size=64,
+            completion_batch_size=4, prefill_batch_size=2,
+        )
+        bg.insert([list(PROMPT)], max_tokens=[N_GEN])
+        toks, last = [], None
+        for _ in range(N_GEN * 3 + 32):
+            out = bg.next()
+            responses = out[1] if isinstance(out, tuple) else out
+            for r in responses or []:
+                toks.append(r.token)
+                last = r
+            if last is not None and last.finish_reason is not None:
+                break
+    finally:
+        _detach(model)
+    assert state.accepted > 0, "oracle draft must produce accepts"
+    assert toks == ref, f"battle(all-accept) diverged: {toks} vs {ref}"
+
+
+def test_battle_byte_equal_all_reject(off_stream, sidecar):
+    model, ref = off_stream
+    state = _battle_state(
+        model, sidecar, draft_override=lambda pairs: mx.array([3])
+    )
+    _attach(model, state)
+    try:
+        _, toks, last = _run_bg(model, PROMPT, N_GEN)
+    finally:
+        _detach(model)
+    assert state.cycles > 0
+    assert toks == ref, f"battle(all-reject) diverged: {toks} vs {ref}"
+    assert last.finish_reason == "length"
+
+
+def test_battle_real_draft_byte_equal(off_stream, sidecar):
+    """Random-weight MTP head: drafts are essentially arbitrary; the stream
+    must still be byte-identical (mixed accept/reject exercise)."""
+    model, ref = off_stream
+    state = _battle_state(model, sidecar)
+    _attach(model, state)
+    try:
+        _, toks, _ = _run_bg(model, PROMPT, N_GEN)
+    finally:
+        _detach(model)
+    assert state.cycles > 0
+    assert toks == ref, f"battle(real draft) diverged: {toks} vs {ref}"
+
+
+def test_battle_extract_trims_buffered_surplus(off_stream, sidecar):
+    model, _ = off_stream
+    for n in (5, 6):  # parity: finish on cycle vs on buffered emission
+        holder = []
+        state = _battle_state(
+            model, sidecar, draft_override=_oracle_draft(holder)
+        )
+        holder.append(state)
+        _attach(model, state)
+        try:
+            from mlx_lm.generate import BatchGenerator
+
+            bg = BatchGenerator(
+                model, stop_tokens=None, prefill_step_size=64,
+                completion_batch_size=4, prefill_batch_size=2,
+            )
+            bg.insert([list(PROMPT)], max_tokens=[n])
+            last = None
+            for _ in range(n * 3 + 32):
+                out = bg.next()
+                responses = out[1] if isinstance(out, tuple) else out
+                for r in responses or []:
+                    last = r
+                if last is not None and last.finish_reason is not None:
+                    break
+        finally:
+            _detach(model)
+        assert last is not None and last.finish_reason == "length"
+        cache = last.prompt_cache
+        assert cache is not None
+        assert cache[0][0].offset == len(last.all_tokens), n
+        assert cache[0][1].offset == cache[0][0].offset
+
+
+def test_flush_buffered_rolls_back_to_reject_state(off_stream, sidecar):
+    model, ref = off_stream
+    holder = []
+    state = _battle_state(model, sidecar, draft_override=_oracle_draft(holder))
+    holder.append(state)
+    _attach(model, state)
+    try:
+        from mlx_lm.generate import BatchGenerator
+
+        bg = BatchGenerator(
+            model, stop_tokens=None, prefill_step_size=64,
+            completion_batch_size=4, prefill_batch_size=2,
+        )
+        bg.insert([list(PROMPT)], max_tokens=[N_GEN])
+        emitted = []
+        for _ in range(64):
+            out = bg.next()
+            responses = out[1] if isinstance(out, tuple) else out
+            emitted.extend(r.token for r in responses or [])
+            if state.buffer:
+                break
+        assert state.buffer and state.flush_pack is not None
+        gb = bg._generation_batch
+        t1_expected = int(state.flush_pack[0].reshape(-1)[0].item())
+        _flush_buffered(state, gb)
+        assert state.buffer == [] and state.flush_pack is None
+        assert _batch_off(gb) == len(gb.tokens[0])
+        assert int(gb._next_tokens.reshape(-1)[0].item()) == t1_expected
+        # the rolled-back request must continue byte-identically to plain decode
+        toks_after, last = [], None
+        for _ in range(N_GEN * 3 + 32):
+            out = bg.next()
+            responses = out[1] if isinstance(out, tuple) else out
+            for r in responses or []:
+                toks_after.append(r.token)
+                last = r
+            if last is not None and last.finish_reason is not None:
+                break
+    finally:
+        _detach(model)
+    assert (emitted + toks_after) == ref, (emitted, toks_after, ref)
+
+
+def _batch_off(gb):
+    o = gb.prompt_cache[0][0].offset
+    return int(o.reshape(-1)[0].item()) if isinstance(o, mx.array) else int(o)
