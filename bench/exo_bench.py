@@ -278,6 +278,8 @@ def run_one_completion(
     *,
     use_prefix_cache: bool = False,
     stream: bool = False,
+    temperature: float | None = None,
+    seed: int | None = None,
 ) -> tuple[dict[str, Any], int]:
     content, pp_tokens = prompt_sizer.build(pp_hint)
     payload: dict[str, Any] = {
@@ -287,6 +289,10 @@ def run_one_completion(
         "logprobs": False,
         "use_prefix_cache": use_prefix_cache,
     }
+    if temperature is not None:
+        payload["temperature"] = temperature
+    if seed is not None:
+        payload["seed"] = seed
 
     if not stream:
         payload["stream"] = False
@@ -464,6 +470,15 @@ def main() -> int:
         help="Write raw per-run results JSON to this path.",
     )
     ap.add_argument("--stdout", action="store_true", help="Write results to stdout")
+    ap.add_argument(
+        "--temperature", type=float, default=None,
+        help="Sampling temperature passed through to the API "
+        "(0 = greedy; default: server default).",
+    )
+    ap.add_argument(
+        "--seed", type=int, default=None,
+        help="Sampling seed passed through to the API (default: server default).",
+    )
     ap.add_argument(
         "--dry-run", action="store_true", help="List selected placements and exit."
     )
@@ -677,6 +692,8 @@ def main() -> int:
                 prompt_sizer,
                 use_prefix_cache=args.use_prefix_cache,
                 stream=args.stream,
+                temperature=args.temperature,
+                seed=args.seed,
             )
 
         try:
@@ -741,6 +758,10 @@ def main() -> int:
                                 "logprobs": False,
                                 "use_prefix_cache": args.use_prefix_cache,
                             }
+                            if args.temperature is not None:
+                                pre_built_payload["temperature"] = args.temperature
+                            if args.seed is not None:
+                                pre_built_payload["seed"] = args.seed
                             barrier = threading.Barrier(concurrency)
                             batch_start = threading.Event()
                             batch_t0: float = 0.0
