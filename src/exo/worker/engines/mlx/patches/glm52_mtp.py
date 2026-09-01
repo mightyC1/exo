@@ -54,6 +54,7 @@ _ENV_WEIGHTS = "EXO_GLM52_MTP_WEIGHTS"
 _ENV_CONCAT = "EXO_GLM52_MTP_CONCAT"
 _ENV_VALIDATE = "EXO_GLM52_MTP_VALIDATE"
 _ENV_DRAFT_K = "EXO_GLM52_MTP_DRAFT_K"
+_ENV_TRACE = "EXO_GLM52_MTP_TRACE"
 
 _LOG_EVERY = 64
 _WIN = 256
@@ -214,6 +215,7 @@ class _MTPState:
         store: dict[str, Any],
         logger: Any,
         validate: bool = False,
+        trace_n: int = 0,
     ) -> None:
         from mlx_lm.models.cache import CacheList, KVCache
 
@@ -225,6 +227,7 @@ class _MTPState:
         self.store = store
         self.logger = logger
         self.validate = validate
+        self.trace_n = trace_n
         self._cache_cls = lambda: CacheList(KVCache(), KVCache())
 
         self.uid: int | None = None
@@ -557,6 +560,26 @@ def _battle_step(state: _MTPState, prev_step: Any, batch: Any):
     mx.eval(acc, y)
     m = int(acc.reshape(-1)[0].item())
 
+    if state.cycles < state.trace_n:
+        row = lp2[0, 0, :].astype(mx.float32)
+        top1 = mx.max(row)
+        t1i = int(t1.reshape(-1)[0].item())
+        second = mx.max(
+            mx.where(
+                mx.arange(row.shape[0]) == t1i, mx.array(-3.4e38), row
+            )
+        )
+        margin = float((top1 - second).item())
+        extra = ""
+        if state.cycles == 0:
+            h0 = state.h_last if state.h_last is not None else hv[:, 0:1, :]
+            extra = f" h0sum={float(mx.sum(h0.astype(mx.float32)).item()):.6f}"
+        state.logger.info(
+            f"[MTP_TRACE] uid={state.uid} c={state.cycles} "
+            f"y={int(y.reshape(-1)[0].item())} d={int(d.reshape(-1)[0].item())} "
+            f"t1={t1i} m={m} margin={margin:.6g}{extra}"
+        )
+
     if hv is None or hv.shape[1] < 2:
         # capture broke mid-flight: undo the verify and decay to normal decode
         for c in batch.prompt_cache:
@@ -785,6 +808,7 @@ def apply_glm52_mtp_patch(
 
     concat = _env_choice(_ENV_CONCAT, "eh", {"eh", "he"}, logger)
     validate = _env_int(_ENV_VALIDATE, 0, 0, 1, logger) == 1
+    trace_n = _env_int(_ENV_TRACE, 0, 0, 4096, logger)
     draft_k = _env_int(_ENV_DRAFT_K, 1, 1, 3, logger)
     if draft_k > 1:
         _warn_once(logger, "draft-k", "[MTP] DRAFT_K>1 is phase 4; using k=1")
@@ -808,7 +832,7 @@ def apply_glm52_mtp_patch(
 
     state = _MTPState(
         mode=mode, concat=concat, mtp=mtp, embed=embed, lm_head=lm_head,
-        store=store, logger=logger, validate=validate,
+        store=store, logger=logger, validate=validate, trace_n=trace_n,
     )
     model._exo_glm52_mtp_state = state
     _install_hooks(logger)
