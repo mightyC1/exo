@@ -360,6 +360,24 @@ def run_one_completion(
     }, pp_tokens
 
 
+def _corpus_build(sizer: "PromptSizer", target: int) -> tuple[str, int]:
+    text = sizer.corpus or ""
+    # Tile the document until a full-corpus prompt overshoots the target.
+    while sizer.count_fn(text + sizer.tail) < target:
+        text += "\n\n" + (sizer.corpus or "")
+    lo, hi = 0, len(text)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if sizer.count_fn(text[:mid] + sizer.tail) < target:
+            lo = mid + 1
+        else:
+            hi = mid
+    content = text[:lo] + sizer.tail
+    tok = sizer.count_fn(content)
+    logger.info(f"{tok=} (corpus mode)")
+    return content, tok
+
+
 LONG_FORM_TAIL = (
     "\n\nТеперь игнорируй текст выше и напиши максимально длинное, "
     "подробное эссе об истории вычислительной техники: от механических "
@@ -369,10 +387,14 @@ LONG_FORM_TAIL = (
 
 
 class PromptSizer:
-    def __init__(self, tokenizer: Any, atom: str = "a ", tail: str = ""):
+    def __init__(
+        self, tokenizer: Any, atom: str = "a ", tail: str = "",
+        corpus: str | None = None,
+    ):
         self.tokenizer = tokenizer
         self.atom = atom
         self.tail = tail
+        self.corpus = corpus
         self.count_fn = PromptSizer._make_counter(tokenizer)
         self.base_tokens = self.count_fn(tail)
 
@@ -406,6 +428,9 @@ class PromptSizer:
             raise RuntimeError(
                 f"Target ({target}) is smaller than template overhead ({self.base_tokens})."
             )
+
+        if self.corpus is not None:
+            return _corpus_build(self, target)
 
         # Estimate tokens per atom using a sample
         sample_count = 100
@@ -479,6 +504,13 @@ def main() -> int:
         help="Write raw per-run results JSON to this path.",
     )
     ap.add_argument("--stdout", action="store_true", help="Write results to stdout")
+    ap.add_argument(
+        "--prompt-corpus", type=str, default=None,
+        help="Path to a text file; the prompt is a prefix of this document "
+        "(tiled if too short), sized to --pp exactly. Replaces the 'a a a' "
+        "filler with real text: no degenerate-input EOS, representative "
+        "accept rates.",
+    )
     ap.add_argument(
         "--long-form", action="store_true",
         help="Append an essay instruction to the filler prompt so greedy "
@@ -566,8 +598,13 @@ def main() -> int:
         raise RuntimeError("[exo-bench] tokenizer load failed")
 
     try:
+        corpus_text = None
+        if args.prompt_corpus:
+            corpus_text = Path(args.prompt_corpus).read_text(encoding="utf-8")
         prompt_sizer = PromptSizer(
-            tokenizer, tail=(LONG_FORM_TAIL if args.long_form else "")
+            tokenizer,
+            tail=(LONG_FORM_TAIL if args.long_form else ""),
+            corpus=corpus_text,
         )
         logger.debug(f"[exo-bench] loaded tokenizer: {full_model_id} for prompt sizer")
     except Exception:
