@@ -248,6 +248,7 @@ class _MTPState:
         # battle fields
         self.request_greedy: bool | None = None
         self.buffer: list[tuple[mx.array, mx.array]] = []
+        self.spec: Any = None            # issued-but-unresolved next cycle
         self.h_last: mx.array | None = None
         self.mtp_backlog: list[tuple[mx.array, mx.array]] = []
         self.flush_pack: tuple[mx.array, mx.array, mx.array] | None = None
@@ -271,6 +272,7 @@ class _MTPState:
         self.win = []
         self.request_greedy = None
         self.buffer = []
+        self.spec = None
         self.h_last = None
         self.mtp_backlog = []
         self.flush_pack = None
@@ -290,6 +292,7 @@ class _MTPState:
         self.lazy_match = None
         self.request_greedy = None
         self.buffer = []
+        self.spec = None
         self.h_last = None
         self.mtp_backlog = []
         self.flush_pack = None
@@ -494,6 +497,73 @@ def _lp_row(lp: Any) -> mx.array:
     return mx.zeros((1,))
 
 
+class _Spec:
+    __slots__ = (
+        "y", "y_lp", "d", "lp2", "t1", "acc", "hv",
+        "n_pairs", "snap_h", "snap_backlog",
+    )
+
+
+def _issue(state: _MTPState, batch: Any, y: mx.array, y_lp: Any) -> _Spec:
+    """Build+enqueue one speculative cycle (draft + verify) for pending y.
+
+    Mutates the MTP cache (len(pairs) entries), the main cache (2 positions)
+    and the accept-branch h/backlog state; the pre-issue snapshot rides in
+    the returned package so a reject can restore it exactly."""
+    sp = _Spec()
+    sp.y = y.reshape(-1)[0:1]
+    sp.y_lp = y_lp
+    sp.snap_h = state.h_last
+    sp.snap_backlog = state.mtp_backlog
+
+    pairs = state.mtp_backlog + [(state.h_last, sp.y)]
+    sp.n_pairs = len(pairs)
+    state.mtp_backlog = []
+    d = state.draft_multi(pairs)
+    sp.d = d
+
+    verify_in = mx.concatenate(
+        [sp.y, d.astype(y.dtype).reshape(-1)[0:1]]
+    ).reshape(1, 2)
+    logits2 = batch.model(verify_in, cache=batch.prompt_cache)
+    hv = state.store.pop("h", None)
+    sp.hv = hv
+    lp2 = logits2 - mx.logsumexp(logits2, axis=-1, keepdims=True)
+    sp.lp2 = lp2
+    sp.t1 = mx.argmax(lp2[:, 0, :], axis=-1)
+    sp.acc = mx.equal(d.astype(mx.int64), sp.t1.astype(mx.int64))
+
+    if hv is not None and hv.shape[1] >= 2:
+        state.h_last = hv[:, 1:2, :]
+        state.mtp_backlog = [(hv[:, 0:1, :], d)]
+    from exo.worker.engines.mlx.patches.opt_batch_gen import (
+        _advance_chain_arrays,
+    )
+    mx.async_eval(
+        sp.acc, sp.t1, d,
+        *_advance_chain_arrays(batch.prompt_cache),
+        *state.mtp_cache_arrays(),
+    )
+    return sp
+
+
+def _unwind_spec(state: _MTPState, batch: Any) -> None:
+    """Drop an issued-but-unresolved speculative cycle (2 main positions,
+    its MTP entries, its captured h) and restore pre-issue h/backlog."""
+    sp = state.spec
+    if sp is None:
+        return
+    state.spec = None
+    for c in batch.prompt_cache:
+        c.trim(2)
+    if state.mtp_cache is not None:
+        for c in state.mtp_cache.caches:
+            c.trim(sp.n_pairs)
+    state.h_last = sp.snap_h
+    state.mtp_backlog = sp.snap_backlog
+    state.store.pop("h", None)
+
+
 def _battle_step(state: _MTPState, prev_step: Any, batch: Any):
     from exo.worker.engines.mlx.patches.opt_batch_gen import (
         _advance_chain_arrays,
@@ -537,32 +607,35 @@ def _battle_step(state: _MTPState, prev_step: Any, batch: Any):
         state.flush_pack = None
         return [ti], [_lp_row(lp)]
 
-    # ---- speculation cycle -------------------------------------------------
-    y = batch._next_tokens
-    y_lp = batch._next_logprobs
-    h_entry = state.store.pop("h", None)
-    if state.h_last is None:
-        if h_entry is None:
-            _warn_once(
-                state.logger, "no-h-battle",
-                "[MTP] pre-norm hidden unavailable; normal step (will seed next)",
-            )
-            return prev_step(batch)
-        state.h_last = h_entry[:, -1:, :]
-
+    # ---- speculation cycle: resolve an issued spec (or issue fresh) --------
     _t0 = time.perf_counter() if state.prof else 0.0
-    pairs = state.mtp_backlog + [(state.h_last, y.reshape(-1)[0:1])]
-    state.mtp_backlog = []
-    d = state.draft_multi(pairs)
+    if state.spec is None:
+        y0 = batch._next_tokens
+        h_entry = state.store.pop("h", None)
+        if state.h_last is None:
+            if h_entry is None:
+                _warn_once(
+                    state.logger, "no-h-battle",
+                    "[MTP] pre-norm hidden unavailable; normal step (will seed next)",
+                )
+                return prev_step(batch)
+            state.h_last = h_entry[:, -1:, :]
+        state.spec = _issue(state, batch, y0, batch._next_logprobs)
 
-    verify_in = mx.concatenate(
-        [y.reshape(-1)[0:1], d.astype(y.dtype).reshape(-1)[0:1]]
-    ).reshape(1, 2)
-    logits2 = batch.model(verify_in, cache=batch.prompt_cache)
-    hv = state.store.pop("h", None)
-    lp2 = logits2 - mx.logsumexp(logits2, axis=-1, keepdims=True)
-    t1 = mx.argmax(lp2[:, 0, :], axis=-1)
-    acc = mx.equal(d.astype(mx.int64), t1.astype(mx.int64))
+    sp = state.spec
+    state.spec = None
+    y = sp.y
+    y_lp = sp.y_lp
+    d, lp2, t1, acc, hv = sp.d, sp.lp2, sp.t1, sp.acc, sp.hv
+
+    # optimistic chaining: enqueue the accept-branch follow-up before the
+    # host learns m — the GPU runs verifies back-to-back. On reject both
+    # of its cache mutations are unwound (trim choreography, byte-gated
+    # by the equality tests).
+    next_spec = None
+    if hv is not None and hv.shape[1] >= 2:
+        b_tok = mx.argmax(lp2[:, 1, :], axis=-1).astype(y.dtype)
+        next_spec = _issue(state, batch, b_tok, lp2[:, 1])
 
     if state.prof:
         _t1 = time.perf_counter()
@@ -603,30 +676,31 @@ def _battle_step(state: _MTPState, prev_step: Any, batch: Any):
         return prev_step(batch)
 
     if m:
-        b_tok = mx.argmax(lp2[:, 1, :], axis=-1)
-        batch._next_tokens = b_tok.astype(y.dtype)
+        batch._next_tokens = next_spec.y if next_spec is not None else t1.astype(y.dtype)
         batch._next_logprobs = lp2[:, 1]
-        state.h_last = hv[:, 1:2, :]
-        state.mtp_backlog = [(hv[:, 0:1, :], d)]
         state.buffer.append((d, lp2[:, 0]))
         state.flush_pack = (t1.astype(y.dtype), lp2[:, 0], hv[:, 0:1, :])
-        mx.async_eval(
-            batch._next_tokens, batch._next_logprobs, d,
-            *_advance_chain_arrays(batch.prompt_cache),
-            *state.mtp_cache_arrays(),
-        )
+        state.spec = next_spec
     else:
+        # unwind the optimistic follow-up first (2 positions + its MTP
+        # entries + its captured h), then the rejected draft position.
+        state.spec = next_spec
+        _unwind_spec(state, batch)
         for c in batch.prompt_cache:
             c.trim(1)
         batch._next_tokens = t1.astype(y.dtype)
         batch._next_logprobs = lp2[:, 0]
         state.h_last = hv[:, 0:1, :]
+        state.mtp_backlog = []
         state.flush_pack = None
-        mx.async_eval(
-            batch._next_tokens, batch._next_logprobs,
-            *_advance_chain_arrays(batch.prompt_cache),
-            *state.mtp_cache_arrays(),
-        )
+    from exo.worker.engines.mlx.patches.opt_batch_gen import (
+        _advance_chain_arrays,
+    )
+    mx.async_eval(
+        batch._next_tokens,
+        *_advance_chain_arrays(batch.prompt_cache),
+        *state.mtp_cache_arrays(),
+    )
 
     batch._current_tokens = y
     batch._current_logprobs = y_lp
@@ -655,6 +729,7 @@ def _battle_step(state: _MTPState, prev_step: Any, batch: Any):
 
 def _flush_buffered(state: _MTPState, batch: Any) -> None:
     """Roll an accept-cycle back to its reject-equivalent (B==1 only)."""
+    _unwind_spec(state, batch)
     if not state.buffer or state.flush_pack is None:
         state.buffer = []
         return
@@ -721,6 +796,8 @@ def _install_hooks(logger: Any) -> None:
 
     def _mtp_extract_cache(self: Any, idx: int):
         state = getattr(self.model, "_exo_glm52_mtp_state", None)
+        if state is not None and state.spec is not None and state.uid in self.uids:
+            _unwind_spec(state, self)
         if state is not None and state.buffer and state.uid in self.uids:
             # finish landed while a verified position sat in the buffer: the
             # cache is one position ahead of the emitted stream — drop it so
