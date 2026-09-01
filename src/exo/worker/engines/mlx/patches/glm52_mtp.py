@@ -55,6 +55,7 @@ _ENV_CONCAT = "EXO_GLM52_MTP_CONCAT"
 _ENV_VALIDATE = "EXO_GLM52_MTP_VALIDATE"
 _ENV_DRAFT_K = "EXO_GLM52_MTP_DRAFT_K"
 _ENV_TRACE = "EXO_GLM52_MTP_TRACE"
+_ENV_PROF = "EXO_GLM52_MTP_PROF"
 
 _LOG_EVERY = 64
 _WIN = 256
@@ -216,6 +217,7 @@ class _MTPState:
         logger: Any,
         validate: bool = False,
         trace_n: int = 0,
+        prof: bool = False,
     ) -> None:
         from mlx_lm.models.cache import CacheList, KVCache
 
@@ -228,6 +230,10 @@ class _MTPState:
         self.logger = logger
         self.validate = validate
         self.trace_n = trace_n
+        self.prof = prof
+        self.p_build = 0.0
+        self.p_resolve = 0.0
+        self.p_post = 0.0
         self._cache_cls = lambda: CacheList(KVCache(), KVCache())
 
         self.uid: int | None = None
@@ -544,6 +550,7 @@ def _battle_step(state: _MTPState, prev_step: Any, batch: Any):
             return prev_step(batch)
         state.h_last = h_entry[:, -1:, :]
 
+    _t0 = time.perf_counter() if state.prof else 0.0
     pairs = state.mtp_backlog + [(state.h_last, y.reshape(-1)[0:1])]
     state.mtp_backlog = []
     d = state.draft_multi(pairs)
@@ -557,8 +564,12 @@ def _battle_step(state: _MTPState, prev_step: Any, batch: Any):
     t1 = mx.argmax(lp2[:, 0, :], axis=-1)
     acc = mx.equal(d.astype(mx.int64), t1.astype(mx.int64))
 
+    if state.prof:
+        _t1 = time.perf_counter()
     mx.eval(acc, y)
     m = int(acc.reshape(-1)[0].item())
+    if state.prof:
+        _t2 = time.perf_counter()
 
     if state.cycles < state.trace_n:
         row = lp2[0, 0, :].astype(mx.float32)
@@ -623,6 +634,19 @@ def _battle_step(state: _MTPState, prev_step: Any, batch: Any):
 
     ti = int(y.reshape(-1)[0].item())
     batch.tokens[0].append(ti)
+    if state.prof:
+        state.p_build += _t1 - _t0
+        state.p_resolve += _t2 - _t1
+        state.p_post += time.perf_counter() - _t2
+        if state.cycles % _LOG_EVERY == _LOG_EVERY - 1:
+            n = _LOG_EVERY
+            state.logger.info(
+                f"[MTP_PROF] uid={state.uid} win={n} "
+                f"build_ms={1e3 * state.p_build / n:.2f} "
+                f"resolve_ms={1e3 * state.p_resolve / n:.2f} "
+                f"post_ms={1e3 * state.p_post / n:.2f}"
+            )
+            state.p_build = state.p_resolve = state.p_post = 0.0
     state.account_cycle(m)
     if state.validate:
         _validate_cycle(state, batch, m)
@@ -809,6 +833,7 @@ def apply_glm52_mtp_patch(
     concat = _env_choice(_ENV_CONCAT, "eh", {"eh", "he"}, logger)
     validate = _env_int(_ENV_VALIDATE, 0, 0, 1, logger) == 1
     trace_n = _env_int(_ENV_TRACE, 0, 0, 4096, logger)
+    prof = _env_int(_ENV_PROF, 0, 0, 1, logger) == 1
     draft_k = _env_int(_ENV_DRAFT_K, 1, 1, 3, logger)
     if draft_k > 1:
         _warn_once(logger, "draft-k", "[MTP] DRAFT_K>1 is phase 4; using k=1")
@@ -833,6 +858,7 @@ def apply_glm52_mtp_patch(
     state = _MTPState(
         mode=mode, concat=concat, mtp=mtp, embed=embed, lm_head=lm_head,
         store=store, logger=logger, validate=validate, trace_n=trace_n,
+        prof=prof,
     )
     model._exo_glm52_mtp_state = state
     _install_hooks(logger)
