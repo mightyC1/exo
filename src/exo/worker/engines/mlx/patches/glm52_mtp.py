@@ -1437,9 +1437,13 @@ def apply_glm52_mtp_patch(
     # RoPE decision the main full-indexer layers get (matters once the MTP
     # cache exceeds index_topk, i.e. after ~2048 generated tokens). Pure
     # config-driven host work — identical on every rank, no collective needed.
-    from exo.worker.engines.mlx.patches.glm52_indexshare import apply_mtp_indexer_rope_fix
+    from exo.worker.engines.mlx.patches.glm52_indexshare import (
+        annotate_mtp_attention,
+        apply_mtp_indexer_rope_fix,
+    )
 
     rope_fixed = apply_mtp_indexer_rope_fix(mtp.block.self_attn, config, logger=logger)
+    fast_attn = annotate_mtp_attention(mtp.block.self_attn, list(layers), layer_idx)
 
     store: dict[str, Any] = {}
     if isinstance(norm, _PreNormCapture):  # re-apply after a reload path
@@ -1464,7 +1468,7 @@ def apply_glm52_mtp_patch(
     model._exo_glm52_mtp_state = state
     logger.info(
         f"[MTP] enabled mode={mode} k={draft_k} hidden={hidden_mode} recycle={recycle_mode} "
-        f"prompt_prefill={int(prefill_enabled)} concat={concat} "
+        f"prompt_prefill={int(prefill_enabled)} fast_attn={int(fast_attn)} concat={concat} "
         f"validate={int(validate)} mtp_indexer_rope_fixed={int(rope_fixed)} "
         f"weights={weights_path.name} layer_idx={layer_idx}"
     )

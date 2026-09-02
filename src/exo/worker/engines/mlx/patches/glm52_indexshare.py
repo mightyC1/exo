@@ -706,6 +706,31 @@ def indexer_rope_fix_for_config(config: dict[str, Any]) -> dict[str, Any] | None
     return {"qk_rope_head_dim": int(qk_rope), "rope_theta": float(rope_theta)}
 
 
+def annotate_mtp_attention(attn: Any, layers: list[Any], layer_idx: int) -> bool:
+    """Give the MTP block's attention the same IndexShare annotation as a
+    main 'full' layer (own indexer, no source, unique layer index) so it
+    takes the fork's optimized decode/prefill branches instead of the raw
+    pinned path — over a prompt-sized MTP cache the raw path costs ~60ms per
+    draft. No ctx side effects: drafts/ingest run outside the model-forward
+    context, so topk_by_layer is never written by this layer."""
+    template = None
+    for layer in layers:
+        a = getattr(layer, "self_attn", None)
+        if a is not None and getattr(a, "_exo_glm52_indexshare_enabled", False):
+            template = a
+            break
+    if template is None:
+        return False
+    setattr(attn, "_exo_glm52_indexshare_enabled", True)
+    setattr(attn, "_exo_glm52_layer_idx", layer_idx)
+    setattr(attn, "_exo_glm52_indexer_type", "full")
+    setattr(attn, "_exo_glm52_indexshare_source", None)
+    setattr(attn, "_exo_glm52_index_head_dim", getattr(template, "_exo_glm52_index_head_dim"))
+    setattr(attn, "_exo_glm52_prefill_cfg", getattr(template, "_exo_glm52_prefill_cfg"))
+    setattr(attn, "_exo_glm52_profile_selected", False)
+    return True
+
+
 def apply_mtp_indexer_rope_fix(attn: Any, config: dict[str, Any], *, logger: Any) -> bool:
     params = indexer_rope_fix_for_config(config)
     if params is None:
