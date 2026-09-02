@@ -58,6 +58,7 @@ _ENV_DRAFT_K = "EXO_GLM52_MTP_DRAFT_K"
 _ENV_TRACE = "EXO_GLM52_MTP_TRACE"
 _ENV_PROF = "EXO_GLM52_MTP_PROF"
 _ENV_HIDDEN = "EXO_GLM52_MTP_HIDDEN"
+_ENV_RECYCLE = "EXO_GLM52_MTP_RECYCLE"
 
 _LOG_EVERY = 64
 _WIN = 256
@@ -233,6 +234,7 @@ class _MTPState:
 
         self.mode = mode
         self.concat = concat
+        self.recycle = "post"
         self.mtp = mtp
         self.embed = embed
         self.lm_head = lm_head
@@ -400,12 +402,15 @@ class _MTPState:
         if x.shape[1] > 1:
             mask = create_attention_mask(x, self.mtp_cache[0], return_array=True)
         y = self.mtp.block(x, mask=mask, cache=self.mtp_cache)
-        # Recycle the POST-final-norm hidden into the next chained step
-        # (vLLM PR #47448: pre-norm recycle mismatches hnorm, 3.6 -> 4.4
-        # accepted length on GLM-5.2). Same tensor feeds the LM head.
-        h_post = self.mtp.head_norm(y[:, -1:, :])
+        # Hidden recycled into the next chained step: "post" = after
+        # shared_head.norm (vLLM PR #47448, measured with a post-norm target
+        # hidden); "pre" = the block's raw residual output (consistent with
+        # our measured-better pre-norm *target* hidden). A/B via env.
+        h_raw = y[:, -1:, :]
+        h_post = self.mtp.head_norm(h_raw)
         logits = self.lm_head(h_post)
-        return mx.argmax(logits[..., -1, :], axis=-1).reshape(1), h_post
+        h_rec = h_post if self.recycle == "post" else h_raw
+        return mx.argmax(logits[..., -1, :], axis=-1).reshape(1), h_rec
 
     def draft(self, h_last: mx.array, next_tok: mx.array) -> mx.array:
         return self.draft_multi([(h_last, next_tok)])[0]
@@ -1098,6 +1103,7 @@ def apply_glm52_mtp_patch(
     # post-norm convention loses on this head/quant; keep 'post' as the A/B
     # knob. (The chained-step recycle stays post-norm — measured separately.)
     hidden_mode = _env_choice(_ENV_HIDDEN, "pre", {"post", "pre"}, logger)
+    recycle_mode = _env_choice(_ENV_RECYCLE, "post", {"post", "pre"}, logger)
 
     try:
         mtp = load_mtp_module(
@@ -1136,10 +1142,11 @@ def apply_glm52_mtp_patch(
         store=store, logger=logger, validate=validate, trace_n=trace_n,
         prof=prof, draft_k=draft_k,
     )
+    state.recycle = recycle_mode
     model._exo_glm52_mtp_state = state
     _install_hooks(logger)
     logger.info(
-        f"[MTP] enabled mode={mode} k={draft_k} hidden={hidden_mode} concat={concat} "
+        f"[MTP] enabled mode={mode} k={draft_k} hidden={hidden_mode} recycle={recycle_mode} concat={concat} "
         f"validate={int(validate)} mtp_indexer_rope_fixed={int(rope_fixed)} "
         f"weights={weights_path.name} layer_idx={layer_idx}"
     )

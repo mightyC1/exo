@@ -763,7 +763,7 @@ def test_chain_recycles_post_norm(sidecar):
     e = m.enorm(embed(mx.array([[5]], dtype=mx.uint32)))
     x = m.eh_proj(mx.concatenate([e, m.hnorm(h.astype(e.dtype))], axis=-1))
     y = m.block(x, mask=None, cache=st2.mtp_cache)
-    assert mx.array_equal(h_rec, m.head_norm(y[:, -1:, :])).item()
+    assert mx.array_equal(h_rec, m.head_norm(y[:, -1:, :])).item()  # default recycle=post
 
 
 
