@@ -275,6 +275,7 @@ class _MTPState:
         self.prefill_cycles = 64             # drop prompt context after N cycles (0 = keep)
         self.prompt_ctx = False              # MTP cache currently holds prompt context
         self.gen_pairs: list[tuple[mx.array, mx.array]] = []
+        self.retired: list[Any] = []         # caches swapped out mid-request; freed at finish
         self.pending: dict[str, Any] | None = None  # MTP cache built during prompt prefill
         self.shadow_disabled = False
         self.prev_ran = False   # exactly-once guard for the real step
@@ -310,6 +311,7 @@ class _MTPState:
         self.hist_len = 0
         self.prompt_ctx = False
         self.gen_pairs = []
+        self.retired = []                    # nothing in flight between requests: safe to free
         self.shadow_disabled = False
         self.buffer = []
         self.h_last = None
@@ -1318,6 +1320,10 @@ def _drop_prompt_context(state: _MTPState) -> None:
                 b = min(a + _PREFILL_SUBCHUNK, len(pairs))
                 state.ingest(fresh, h_seq[:, a:b, :], t_seq[:, a:b])
         mx.eval(*[arr for c in fresh.caches for arr in (c.keys, c.values) if arr is not None])
+        # Do not free the prompt-backed cache mid-request: an async train and
+        # the TP collectives are in flight; keep it referenced until finish().
+        if state.mtp_cache is not None:
+            state.retired.append(state.mtp_cache)
         state.mtp_cache = fresh
         state.logger.info(
             f"[MTP] uid={state.uid} prompt context dropped after {state.cycles} cycles "
