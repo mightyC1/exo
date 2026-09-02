@@ -1199,12 +1199,12 @@ def test_rs_flush_preserves_accepted_draft_and_consumes_no_rng(off_stream, sidec
         mx.random.seed(21)
         bg = BatchGenerator(model, stop_tokens=None, prefill_step_size=64,
                             completion_batch_size=4, prefill_batch_size=2)
-        bg.insert([list(PROMPT)], max_tokens=[N_GEN], samplers=[samp], logits_processors=[[]])
-        for _ in range(64):
+        bg.insert([list(PROMPT)], max_tokens=[80], samplers=[samp], logits_processors=[[]])
+        for _ in range(300):
             bg.next()
             if len(state.buffer) == 2:
                 break
-        assert len(state.buffer) == 2 and state.cycle_pack is not None
+        assert len(state.buffer) == 2 and state.cycle_pack is not None, "no m=2 cycle observed"
         gb = bg._generation_batch
         t_all, lp2, hv, drafts, m = state.cycle_pack
         expected = int(drafts[0].reshape(-1)[0].item())
@@ -1299,3 +1299,47 @@ def test_lp_row_hard_fails_on_unexpected_structure():
     assert _lp_row([]).shape == (1,)
     with pytest.raises(RuntimeError):
         _lp_row({"bad": 1})
+
+
+# ---------------------------------------------------------------------------
+# 0029: history buffer + vectorized RS
+# ---------------------------------------------------------------------------
+
+
+def test_history_buffer_tracks_tokens_list(off_stream, sidecar):
+    from exo.worker.engines.mlx.patches.glm52_mtp import _history
+
+    model, _ = off_stream
+    state = _battle_state(model, sidecar, k=1)
+    state.start_request(uid=1)
+
+    class B:
+        tokens = [[5, 17, 42]]
+    b = B()
+    assert _history(state, b).tolist() == [5, 17, 42]
+    b.tokens[0].extend([9, 88])
+    assert _history(state, b).tolist() == [5, 17, 42, 9, 88]         # O(delta) append
+    del b.tokens[0][3:]
+    assert _history(state, b).tolist() == [5, 17, 42]                # shrink -> rebuild
+    b.tokens[0].extend(list(range(9000)))                            # growth beyond capacity
+    assert _history(state, b).tolist() == b.tokens[0]
+
+
+def test_vectorized_target_and_accept_match_reference():
+    from exo.worker.engines.mlx.patches.glm52_mtp import (
+        _rs_accepts, _rs_accepts_vec, _target_logits,
+    )
+
+    mx.random.seed(2)
+    k, V = 3, 97
+    rows = mx.log(mx.softmax(mx.random.normal((k + 1, V)) * 2.0, axis=-1))
+    pol = {"temperature": 0.7, "top_p": 0.9, "min_p": 0.05, "top_k": 40}
+    z_rows = _target_logits(rows, pol)
+    per_row = mx.concatenate([_target_logits(rows[j:j + 1], pol) for j in range(k + 1)], axis=0)
+    assert mx.array_equal(z_rows, per_row).item()
+    drafts = [mx.array([int(mx.argsort(-rows[j])[i % 3].item())]) for i, j in enumerate(range(k))]
+    for trial in range(20):
+        u = mx.random.uniform(shape=(k,))
+        ref = _rs_accepts([z_rows[j:j + 1] for j in range(k + 1)], drafts, [u[j:j + 1] for j in range(k)])
+        vec = _rs_accepts_vec(z_rows, drafts, u)
+        assert [bool(a.item()) for a in ref] == [bool(a.item()) for a in vec], trial

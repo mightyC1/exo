@@ -264,6 +264,8 @@ class _MTPState:
         self.request_battle: bool | None = None
         self.request_sampling = False
         self.policy: dict[str, Any] | None = None
+        self.hist_buf: mx.array | None = None   # committed tokens (int32), amortized growth
+        self.hist_len = 0
         self.shadow_disabled = False
         self.prev_ran = False   # exactly-once guard for the real step
         self.in_resolve = False # inside the target verify eval / collectives
@@ -294,6 +296,8 @@ class _MTPState:
         self.request_battle = None
         self.request_sampling = False
         self.policy = None
+        self.hist_buf = None
+        self.hist_len = 0
         self.shadow_disabled = False
         self.buffer = []
         self.h_last = None
@@ -460,7 +464,9 @@ def _request_policy(batch: Any) -> dict[str, bool] | None:
 def _target_logits(row_logprobs: mx.array, pol: dict[str, Any]) -> mx.array:
     """Tempered, filtered logits whose softmax is exactly the distribution the
     normal step samples from: make_sampler applies top_p -> min_p -> top_k to
-    the (untempered) logprobs and then categorical(logits / temp)."""
+    the (untempered) logprobs and then categorical(logits / temp). Works on
+    any leading batch shape (the pin's filters act along the last axis), so
+    all k+1 verify rows are filtered in one pass."""
     from mlx_lm.sample_utils import apply_min_p, apply_top_k, apply_top_p
 
     x = row_logprobs
@@ -487,6 +493,19 @@ def _rs_accepts(zs: list[mx.array], drafts: list[mx.array], us: list[mx.array]) 
         prev = hit if prev is None else mx.logical_and(prev, hit)
         accs.append(prev)
     return accs
+
+
+def _rs_accepts_vec(z_rows: mx.array, drafts: list[mx.array], u: mx.array) -> list[mx.array]:
+    """Vectorized form of _rs_accepts: z_rows is (k+1, V) tempered+filtered
+    logits, u is (k,) uniforms. log p_j(d_j) = z[j, d_j] - logsumexp(z[j]) —
+    no full-vocab softmax; the prefix-and is a cumulative product."""
+    k = len(drafts)
+    zk = z_rows[:k]
+    d = mx.concatenate([x.reshape(1).astype(mx.int32) for x in drafts]).reshape(k, 1)
+    log_pd = mx.take_along_axis(zk, d, axis=-1).reshape(k) - mx.logsumexp(zk, axis=-1)
+    hits = (mx.log(u) < log_pd).astype(mx.int32)
+    prefix = mx.cumprod(hits)
+    return [prefix[j:j + 1].astype(mx.bool_) for j in range(k)]
 
 
 def _rs_residual_logits(z: mx.array, d: mx.array) -> mx.array:
@@ -712,7 +731,33 @@ def _rollback(state: _MTPState, batch: Any, snap: dict[str, Any]) -> None:
     state.cycle_pack = snap["cycle_pack"]
 
 
-def _apply_processors_rows(batch: Any, logits: mx.array, fed: list[mx.array]) -> mx.array:
+def _history(state: _MTPState, batch: Any) -> mx.array:
+    """The committed-token history as an int32 array, kept in lockstep with
+    ``batch.tokens[0]`` by appending only the delta each cycle (the serial
+    step rebuilds ``mx.array(self.tokens[e])`` from the Python list every
+    token — O(n) per token, 150k ints at deep context; here it is O(k))."""
+    toks = batch.tokens[0]
+    n = len(toks)
+    if state.hist_buf is None or state.hist_len > n:
+        cap = max(n + 4096, 8192)
+        buf = mx.zeros((cap,), dtype=mx.int32)
+        if n:
+            buf[:n] = mx.array(toks, dtype=mx.int32)
+        state.hist_buf, state.hist_len = buf, n
+        return buf[:n]
+    if state.hist_len < n:
+        if n > state.hist_buf.shape[0]:
+            grown = mx.zeros((max(2 * state.hist_buf.shape[0], n + 4096),), dtype=mx.int32)
+            grown[: state.hist_len] = state.hist_buf[: state.hist_len]
+            state.hist_buf = grown
+        state.hist_buf[state.hist_len:n] = mx.array(toks[state.hist_len:], dtype=mx.int32)
+        state.hist_len = n
+    return state.hist_buf[:n]
+
+
+def _apply_processors_rows(
+    batch: Any, logits: mx.array, fed: list[mx.array], state: _MTPState | None = None
+) -> mx.array:
     """Apply the request's logits processors to each verify row exactly as
     the serial decode step would: row j sees the history the step after
     feeding fed[0..j-1] would see. Mirrors opt_batch_gen._patched_step, whose
@@ -722,7 +767,7 @@ def _apply_processors_rows(batch: Any, logits: mx.array, fed: list[mx.array]) ->
     procs = procs[0] if procs and procs[0] else None
     if not procs:
         return logits
-    hist = mx.array(batch.tokens[0], dtype=mx.int32)
+    hist = _history(state, batch) if state is not None else mx.array(batch.tokens[0], dtype=mx.int32)
     rows = []
     for j in range(logits.shape[1]):
         row = logits[:, j, :]
@@ -821,7 +866,7 @@ def _battle_step(state: _MTPState, prev_step: Any, batch: Any):
     with mtp_verify_context():
         logits2 = batch.model(verify_in, cache=batch.prompt_cache)
     hv = state.store.pop("h", None)
-    logits2 = _apply_processors_rows(batch, logits2, [y] + drafts)
+    logits2 = _apply_processors_rows(batch, logits2, [y] + drafts, state)
     lp2 = logits2 - mx.logsumexp(logits2, axis=-1, keepdims=True)
     t_all = mx.argmax(lp2, axis=-1)                       # (1, k+1)
     t1 = t_all[:, 0]
@@ -830,9 +875,10 @@ def _battle_step(state: _MTPState, prev_step: Any, batch: Any):
         # M2: speculative sampling — accept d_j w.p. p_j(d_j) under the exact
         # target distribution (temperature/top_p/min_p/top_k of the request);
         # the uniforms are drawn in program order from the replicated RNG.
-        zs = [_target_logits(lp2[:, j, :], state.policy) for j in range(k + 1)]
-        us = [mx.random.uniform(shape=(1,)) for _ in range(k)]
-        accs = _rs_accepts(zs, drafts, us)
+        z_rows = _target_logits(lp2[0], state.policy)          # (k+1, V) in one pass
+        zs = [z_rows[j:j + 1] for j in range(k + 1)]
+        u = mx.random.uniform(shape=(k,))
+        accs = _rs_accepts_vec(z_rows, drafts, u)
     else:
         accs = []
         prev = None
@@ -915,6 +961,7 @@ def _battle_step(state: _MTPState, prev_step: Any, batch: Any):
         batch._next_tokens, batch._next_logprobs, *drafts,
         *_advance_chain_arrays(batch.prompt_cache),
         *state.mtp_cache_arrays(),
+        *([state.hist_buf] if state.hist_buf is not None else []),
     )
 
     batch._current_tokens = y
