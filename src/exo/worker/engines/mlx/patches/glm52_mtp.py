@@ -59,6 +59,8 @@ _ENV_TRACE = "EXO_GLM52_MTP_TRACE"
 _ENV_PROF = "EXO_GLM52_MTP_PROF"
 _ENV_HIDDEN = "EXO_GLM52_MTP_HIDDEN"
 _ENV_RECYCLE = "EXO_GLM52_MTP_RECYCLE"
+_ENV_PREFILL = "EXO_GLM52_MTP_PREFILL"
+_PREFILL_SUBCHUNK = 256
 
 _LOG_EVERY = 64
 _WIN = 256
@@ -266,6 +268,8 @@ class _MTPState:
         self.policy: dict[str, Any] | None = None
         self.hist_buf: mx.array | None = None   # committed tokens (int32), amortized growth
         self.hist_len = 0
+        self.prefill_enabled = True
+        self.pending: dict[str, Any] | None = None  # MTP cache built during prompt prefill
         self.shadow_disabled = False
         self.prev_ran = False   # exactly-once guard for the real step
         self.in_resolve = False # inside the target verify eval / collectives
@@ -426,6 +430,19 @@ class _MTPState:
 
     def draft(self, h_last: mx.array, next_tok: mx.array) -> mx.array:
         return self.draft_multi([(h_last, next_tok)])[0]
+
+    def ingest(self, cache: Any, h_seq: mx.array, tok_seq: mx.array) -> None:
+        """Feed (h_i, t_{i+1}) pairs through the MTP block into ``cache`` with
+        no LM head — used to give the head the prompt context before the
+        first draft. h_seq: (1, L, H) pre-norm hiddens, tok_seq: (1, L)."""
+        from mlx_lm.models.base import create_attention_mask
+
+        e = self.mtp.enorm(self.embed(tok_seq))
+        h = self.mtp.hnorm(h_seq.astype(e.dtype))
+        x = mx.concatenate([e, h] if self.concat == "eh" else [h, e], axis=-1)
+        x = self.mtp.eh_proj(x)
+        mask = create_attention_mask(x, cache[0], return_array=True) if x.shape[1] > 1 else None
+        self.mtp.block(x, mask=mask, cache=cache)
 
     def mtp_cache_arrays(self) -> list[mx.array]:
         if self.mtp_cache is None:
@@ -833,6 +850,7 @@ def _battle_step(state: _MTPState, prev_step: Any, batch: Any):
 
     _t0 = time.perf_counter() if state.prof else 0.0
     if state.h_last is None:
+        _adopt_prefill(state, batch)
         # Seed step: one normal decode step for this request. Its forward
         # writes the hidden of *this* batch into the capture store, so the
         # first draft never relies on a stale global capture (audit P1.2).
@@ -1207,6 +1225,94 @@ def _validate_sidecar_local(
     return raw, "ok", digest
 
 
+def mtp_prefill_begin(model: Any, start_offset: int, n_tokens: int) -> None:
+    """Called by exo's prefill() before the chunk loop. Arms prompt ingestion
+    for a cold prompt (cache starts at 0); a prefix-cache hit leaves the head
+    without the missing context (v1: skip — the MTP cache would need to be
+    stored in the prefix cache alongside the main one)."""
+    state = getattr(model, "_exo_glm52_mtp_state", None)
+    if state is None or state.mode != "on" or not state.prefill_enabled:
+        return
+    if start_offset != 0 or n_tokens < 2:
+        state.pending = None
+        return
+    from mlx_lm.models.cache import CacheList, KVCache
+
+    state.pending = {
+        "cache": CacheList(KVCache(), KVCache()), "carry_h": None,
+        "n": 0, "ingested": 0, "toks": [], "t0": time.perf_counter(),
+    }
+
+
+def mtp_prefill_chunk(model: Any, chunk_tokens: list[int]) -> None:
+    """Called after each prompt chunk forward: the capture store holds the
+    chunk's hiddens. Ingests (h_i, t_{i+1}) pairs, carrying the last hidden
+    to pair with the next chunk's first token."""
+    state = getattr(model, "_exo_glm52_mtp_state", None)
+    if state is None or state.pending is None or not chunk_tokens:
+        return
+    pend = state.pending
+    try:
+        h = state.store.pop("h", None)
+        L = len(chunk_tokens)
+        if h is None or h.shape[0] != 1 or h.shape[1] != L:
+            raise RuntimeError(f"prefill capture mismatch: h={None if h is None else h.shape} L={L}")
+        toks = mx.array(chunk_tokens, dtype=mx.uint32)
+        if pend["carry_h"] is not None:
+            h_seq = mx.concatenate([pend["carry_h"], h[:, :-1, :]], axis=1)   # h_{s-1}..h_{e-2}
+            tok_seq = toks.reshape(1, L)                                        # t_s..t_{e-1}
+        else:
+            h_seq = h[:, :-1, :]                                                # h_s..h_{e-2}
+            tok_seq = toks[1:].reshape(1, L - 1)                                # t_{s+1}..t_{e-1}
+        n_pairs = tok_seq.shape[1]
+        for a in range(0, n_pairs, _PREFILL_SUBCHUNK):
+            b = min(a + _PREFILL_SUBCHUNK, n_pairs)
+            state.ingest(pend["cache"], h_seq[:, a:b, :], tok_seq[:, a:b])
+            mx.eval(*[arr for c in pend["cache"].caches for arr in (c.keys, c.values) if arr is not None])
+        pend["carry_h"] = h[:, -1:, :]
+        pend["n"] += L
+        pend["ingested"] += n_pairs
+        pend["toks"].extend(int(t) for t in chunk_tokens)
+    except Exception:
+        state.logger.opt(exception=True).warning("[MTP] prompt ingest failed; head starts cold")
+        state.pending = None
+
+
+def _adopt_prefill(state: _MTPState, batch: Any) -> None:
+    """At request start: attach the prompt-prefilled MTP cache if it belongs
+    to this request's prompt, ingesting the final carried pair."""
+    pend = state.pending
+    state.pending = None
+    if pend is None or pend["carry_h"] is None:
+        return
+    prompt = list(batch.tokens[0])
+    n = pend["n"]
+    # At the seed step the pin has committed prompt[:n] and holds the last
+    # prompt token as the pending input (_next_tokens); some paths already
+    # list it in tokens. Either way the final pair token is prompt[n].
+    if len(prompt) == n + 1:
+        last_tok = int(prompt[n])
+    elif len(prompt) == n and batch._next_tokens is not None:
+        last_tok = int(batch._next_tokens.reshape(-1)[0].item())
+    else:
+        last_tok = None
+    if last_tok is None or prompt[:n] != pend["toks"]:
+        state.logger.info("[MTP] prompt ingest discarded: prompt mismatch")
+        return
+    try:
+        state.ingest(
+            pend["cache"], pend["carry_h"],
+            mx.array([[last_tok]], dtype=mx.uint32),
+        )
+        state.mtp_cache = pend["cache"]
+        state.logger.info(
+            f"[MTP] uid={state.uid} prompt ingested: {pend['ingested'] + 1} pairs "
+            f"(mtp_offset={_cur(state.mtp_cache[0])}) in {time.perf_counter() - pend['t0']:.1f}s"
+        )
+    except Exception:
+        state.logger.opt(exception=True).warning("[MTP] prompt ingest adopt failed; head starts cold")
+
+
 def finalize_glm52_mtp_request(model: Any, uid: int | None, *, reason: str) -> None:
     """Terminal teardown of the MTP state for a request that exo removes from
     the generator (custom text stop, cancel, close). The generator drops the
@@ -1294,6 +1400,7 @@ def apply_glm52_mtp_patch(
     # knob. (The chained-step recycle stays post-norm — measured separately.)
     hidden_mode = _env_choice(_ENV_HIDDEN, "pre", {"post", "pre"}, logger)
     recycle_mode = _env_choice(_ENV_RECYCLE, "post", {"post", "pre"}, logger)
+    prefill_enabled = _env_int(_ENV_PREFILL, 1, 0, 1, logger) == 1
 
     mtp = None
     try:
@@ -1338,12 +1445,14 @@ def apply_glm52_mtp_patch(
         prof=prof, draft_k=draft_k,
     )
     state.recycle = recycle_mode
+    state.prefill_enabled = prefill_enabled
     state.group = grp
     if not _install_hooks(logger):
         return model
     model._exo_glm52_mtp_state = state
     logger.info(
-        f"[MTP] enabled mode={mode} k={draft_k} hidden={hidden_mode} recycle={recycle_mode} concat={concat} "
+        f"[MTP] enabled mode={mode} k={draft_k} hidden={hidden_mode} recycle={recycle_mode} "
+        f"prompt_prefill={int(prefill_enabled)} concat={concat} "
         f"validate={int(validate)} mtp_indexer_rope_fixed={int(rope_fixed)} "
         f"weights={weights_path.name} layer_idx={layer_idx}"
     )

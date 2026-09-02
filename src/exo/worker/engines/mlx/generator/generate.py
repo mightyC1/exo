@@ -344,7 +344,22 @@ def prefill(
         if on_prefill_progress is not None:
             on_prefill_progress(processed, total)
 
+    _mtp_prev = [0]
+
+    def _mtp_chunk_hook(processed: int) -> None:
+        # GLM MTP prompt ingestion: the capture store holds this chunk's hiddens
+        if processed <= _mtp_prev[0]:
+            return
+        try:
+            from exo.worker.engines.mlx.patches.glm52_mtp import mtp_prefill_chunk
+
+            chunk = prompt_tokens[_mtp_prev[0]:processed]
+            mtp_prefill_chunk(model, chunk.tolist() if hasattr(chunk, "tolist") else list(chunk))
+        finally:
+            _mtp_prev[0] = processed
+
     def combined_progress_callback(processed: int, total: int) -> None:
+        _mtp_chunk_hook(processed)
         if distributed_prompt_progress_callback is not None:
             distributed_prompt_progress_callback()
         progress_callback(processed, total)
@@ -359,6 +374,16 @@ def prefill(
         f"config_fingerprint={prefill_fingerprint[:16]}"
     )
 
+    try:
+        from exo.worker.engines.mlx.patches.glm52_mtp import mtp_prefill_begin
+
+        mtp_prefill_begin(
+            model,
+            start_offset=(0 if pipeline_prefill_active else int(getattr(cache[0][0], "offset", 0))) if cache else 0,
+            n_tokens=(0 if pipeline_prefill_active else num_tokens),
+        )
+    except Exception:
+        logger.opt(exception=True).warning("[MTP] prompt ingest arm failed")
     try:
         if pipeline_prefill_active:
             set_pipeline_queue_sends(model, queue_sends=True)

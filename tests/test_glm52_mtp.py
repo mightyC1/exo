@@ -1343,3 +1343,104 @@ def test_vectorized_target_and_accept_match_reference():
         ref = _rs_accepts([z_rows[j:j + 1] for j in range(k + 1)], drafts, [u[j:j + 1] for j in range(k)])
         vec = _rs_accepts_vec(z_rows, drafts, u)
         assert [bool(a.item()) for a in ref] == [bool(a.item()) for a in vec], trial
+
+
+# ---------------------------------------------------------------------------
+# D2: prompt ingestion into the MTP cache
+# ---------------------------------------------------------------------------
+
+
+def _capture_prompt_hidden(model, prompt_prefix):
+    """Forward the prompt prefix through the model so the capture store holds
+    its hiddens (what exo's prefill does chunk by chunk)."""
+    cache = model.make_cache()
+    model(mx.array([prompt_prefix], dtype=mx.uint32), cache=cache)
+
+
+def test_prompt_ingest_chunked_equals_single(off_stream, sidecar):
+    from exo.worker.engines.mlx.patches import glm52_mtp as gm
+
+    model, _ = off_stream
+    prompt = [5, 17, 42, 9, 88, 3, 61, 24, 12, 7, 33]
+    prefix = prompt[:-1]
+    # reference: one-shot ingest of all (h_i, t_{i+1}) pairs
+    st_a = _battle_state(model, sidecar, k=1); _attach(model, st_a)
+    try:
+        _capture_prompt_hidden(model, prefix)
+        h = st_a.store.pop("h")
+        st_a.start_request(uid=1)
+        st_a.ingest(st_a.mtp_cache, h[:, :-1, :], mx.array([prefix[1:]], dtype=mx.uint32))
+        ref_off = st_a.mtp_cache[0].offset
+        ref_k = st_a.mtp_cache[0].keys[..., :ref_off, :]
+        mx.eval(ref_k)
+        # chunked path with carry: chunks of 4, 3, 3 tokens
+        st_b = _battle_state(model, sidecar, k=1); _attach(model, st_b)
+        gm.mtp_prefill_begin(model, 0, len(prefix))
+        for a, b in ((0, 4), (4, 7), (7, 10)):
+            _capture_prompt_hidden(model, prefix)            # store gets full-prefix h
+            full = st_b.store.pop("h")
+            st_b.store["h"] = full[:, a:b, :]                # emulate the chunk's capture
+            gm.mtp_prefill_chunk(model, prefix[a:b])
+        pend = st_b.pending
+        assert pend is not None and pend["ingested"] == len(prefix) - 1 and pend["toks"] == prefix
+        got_off = pend["cache"][0].offset
+        got_k = pend["cache"][0].keys[..., :got_off, :]
+        assert got_off == ref_off
+        assert mx.allclose(got_k, ref_k, atol=1e-6, rtol=1e-5).item()
+    finally:
+        _detach(model)
+
+
+def test_prompt_ingest_end_to_end_byte_equal(off_stream, sidecar):
+    from exo.worker.engines.mlx.patches import glm52_mtp as gm
+    from mlx_lm.generate import BatchGenerator
+
+    model, ref = off_stream
+    prefix = PROMPT[:-1]
+    state = _battle_state(model, sidecar, k=1)
+    _attach(model, state)
+    try:
+        gm.mtp_prefill_begin(model, 0, len(prefix))
+        _capture_prompt_hidden(model, prefix)
+        gm.mtp_prefill_chunk(model, prefix)
+        assert state.pending is not None
+        bg = BatchGenerator(model, stop_tokens=None, prefill_step_size=64,
+                            completion_batch_size=4, prefill_batch_size=2)
+        bg.insert([list(PROMPT)], max_tokens=[N_GEN], samplers=[_GreedyPolicySampler()])
+        toks, last = [], None
+        for _ in range(N_GEN * 3 + 32):
+            out = bg.next()
+            rs = out[1] if isinstance(out, tuple) else out
+            for r in rs or []:
+                toks.append(r.token); last = r
+            if last is not None and last.finish_reason is not None:
+                break
+    finally:
+        _detach(model)
+    assert state.pending is None
+    assert any("prompt ingested" in line for line in state.logger.lines), state.logger.lines[-3:]
+    assert state.cycles > 0
+    assert toks == ref, (toks, ref)        # mechanics untouched by the warm head
+
+
+def test_prompt_ingest_skipped_on_prefix_hit_or_mismatch(off_stream, sidecar):
+    from exo.worker.engines.mlx.patches import glm52_mtp as gm
+
+    model, _ = off_stream
+    state = _battle_state(model, sidecar, k=1); _attach(model, state)
+    try:
+        gm.mtp_prefill_begin(model, 13, 100)      # prefix-cache hit -> not armed
+        assert state.pending is None
+        gm.mtp_prefill_begin(model, 0, 8)
+        _capture_prompt_hidden(model, PROMPT[:-1])
+        gm.mtp_prefill_chunk(model, PROMPT[:-1])
+        assert state.pending is not None
+
+        class B:
+            tokens = [[1, 2, 3, 4, 5, 6, 7, 8]]   # a different prompt
+        state.start_request(uid=9)
+        gm._adopt_prefill(state, B())
+        assert state.pending is None and state.mtp_cache[0].offset == 0
+        assert any("prompt mismatch" in line for line in state.logger.lines)
+    finally:
+        _detach(model)
