@@ -266,6 +266,8 @@ class _MTPState:
         self.policy: dict[str, Any] | None = None
         self.shadow_disabled = False
         self.prev_ran = False   # exactly-once guard for the real step
+        self.in_resolve = False # inside the target verify eval / collectives
+        self.group: Any = None  # distributed group, resolved once at apply
         self.last_battle: bool | None = None  # last per-request decision (diagnostics)
         self.buffer: list[tuple[mx.array, mx.array]] = []
         self.h_last: mx.array | None = None
@@ -497,11 +499,22 @@ def _rs_residual_logits(z: mx.array, d: mx.array) -> mx.array:
 
 
 def _dist_group() -> Any | None:
-    try:
-        g = mx.distributed.init()
-        return g if g is not None and g.size() > 1 else None
-    except Exception:
-        return None
+    """Resolve the distributed group. Any failure is loud: a silently
+    absent group would turn every cross-rank check into a no-op."""
+    g = mx.distributed.init()
+    return g if g is not None and g.size() > 1 else None
+
+
+def _rank_consensus(grp: Any, local: list[int]) -> tuple[bool, list[int]]:
+    """Every rank ALWAYS enters this collective with a fixed-size vector;
+    returns (all ranks agree on every element, the summed vector)."""
+    vec = mx.array(local, dtype=mx.int32)
+    if grp is None:
+        return True, local
+    total = mx.distributed.all_sum(vec, group=grp)
+    mx.eval(total)
+    agree = bool(mx.array_equal(total, vec * grp.size()).item())
+    return agree, [int(x) for x in total.tolist()]
 
 
 def _off(c: Any) -> int:
@@ -513,7 +526,7 @@ def _off(c: Any) -> int:
 
 def _validate_pre_verify(state: _MTPState, y: mx.array, drafts: list[mx.array]) -> None:
     """Cross-rank agreement on the tokens about to enter the TP verify."""
-    grp = _dist_group()
+    grp = state.group
     if grp is None:
         return
     toks = [y.reshape(-1)[0:1].astype(mx.int32)] + [d.reshape(-1)[0:1].astype(mx.int32) for d in drafts]
@@ -528,33 +541,36 @@ def _validate_pre_verify(state: _MTPState, y: mx.array, drafts: list[mx.array]) 
 
 
 def _validate_cycle(state: _MTPState, batch: Any, m: int, base: int | None = None) -> None:
+    """Local checks produce an error code; every rank then joins ONE collective
+    carrying [err, m, offsets, buffer, pending]; the decision (raise or not) is
+    made from the summed vector, so all ranks raise together — a rank that
+    raised before the collective would leave the others waiting forever."""
     offs = [[_cur(c) for c in cl.caches] for cl in batch.prompt_cache]
+    err = 0
+    detail = ""
     flat = {o for row in offs for o in row}
     if len(flat) != 1:
         bad = [(i, row) for i, row in enumerate(offs) if len(set(row)) != 1 or row[0] != offs[0][0]]
-        raise _MTPValidateError(f"[MTP][VALIDATE] slot/layer offset skew at layers {bad[:3]}")
-    if base is not None and offs[0][0] != base + 1 + m:
-        raise _MTPValidateError(
-            f"[MTP][VALIDATE] committed delta {offs[0][0] - base} != 1+m={1 + m}"
-        )
-    if state.mtp_cache is not None:
+        err, detail = 1, f"slot/layer offset skew at layers {bad[:3]}"
+    elif base is not None and offs[0][0] != base + 1 + m:
+        err, detail = 2, f"committed delta {offs[0][0] - base} != 1+m={1 + m}"
+    elif state.mtp_cache is not None:
         mo = [_cur(c) for c in state.mtp_cache.caches]
         if len(set(mo)) != 1:
-            raise _MTPValidateError(f"[MTP][VALIDATE] MTP slot skew {mo}")
+            err, detail = 3, f"MTP slot skew {mo}"
     off00 = offs[0][0]
-    grp = _dist_group()
-    if grp is None:
-        return
     mtp_off = _cur(state.mtp_cache[0]) if state.mtp_cache is not None else 0
     pend = int(batch._next_tokens.reshape(-1)[0].item()) if batch._next_tokens is not None else -1
-    vec = mx.array([m, off00, mtp_off, len(state.buffer), pend], dtype=mx.int32)
-    total = mx.distributed.all_sum(vec, group=grp)
-    mx.eval(total)
-    expected = vec * grp.size()
-    if not mx.array_equal(total, expected).item():
+    local = [err, m, off00, mtp_off, len(state.buffer), pend]
+    agree, total = _rank_consensus(state.group, local)
+    if total[0] != 0:
         raise _MTPValidateError(
-            f"[MTP][VALIDATE] cross-rank divergence: local={vec.tolist()} "
-            f"sum={total.tolist()} size={grp.size()}"
+            f"[MTP][VALIDATE] local check failed on some rank (err sum={total[0]}): {detail or 'remote'}"
+        )
+    if not agree:
+        size = state.group.size() if state.group is not None else 1
+        raise _MTPValidateError(
+            f"[MTP][VALIDATE] cross-rank divergence: local={local} sum={total} size={size}"
         )
 
 
@@ -630,8 +646,11 @@ def _lp_row(lp: Any) -> mx.array:
         return lp[0] if lp.ndim == 2 else lp
     if isinstance(lp, list) and lp:
         first = lp[0]
-        return first[0] if isinstance(first, mx.array) and first.ndim == 2 else first
-    return mx.zeros((1,))
+        if isinstance(first, mx.array):
+            return first[0] if first.ndim == 2 else first
+    if isinstance(lp, list) and not lp:
+        return mx.zeros((1,))  # constructor step: no logprobs yet (pin semantics)
+    raise RuntimeError(f"[MTP] unexpected logprobs structure: {type(lp).__name__}")
 
 
 class _MTPBail(RuntimeError):
@@ -663,17 +682,26 @@ def _snapshot(state: _MTPState, batch: Any) -> dict[str, Any]:
     }
 
 
+def _trim_to_exact(cache: Any, target: int) -> None:
+    """Trim a cache to an exact position; any inconsistency is fatal."""
+    current = _cur(cache)
+    if current < target:
+        raise RuntimeError(f"[MTP] cache behind target: current={current} target={target}")
+    delta = current - target
+    if delta:
+        cache.trim(delta)
+    restored = _cur(cache)
+    if restored != target:
+        raise RuntimeError(f"[MTP] cache restore mismatch: got={restored} expected={target}")
+
+
 def _rollback(state: _MTPState, batch: Any, snap: dict[str, Any]) -> None:
     for cl, offs in zip(batch.prompt_cache, snap["main"]):
         for c, before in zip(cl.caches, offs):
-            n = _cur(c) - before
-            if n > 0:
-                c.trim(n)
+            _trim_to_exact(c, before)
     if snap["mtp"] is not None and state.mtp_cache is not None:
         for c, before in zip(state.mtp_cache.caches, snap["mtp"]):
-            n = _cur(c) - before
-            if n > 0:
-                c.trim(n)
+            _trim_to_exact(c, before)
     batch._next_tokens = snap["next_tokens"]
     batch._next_logprobs = snap["next_logprobs"]
     if batch.tokens:
@@ -816,7 +844,11 @@ def _battle_step(state: _MTPState, prev_step: Any, batch: Any):
 
     if state.prof:
         _t1 = time.perf_counter()
-    mx.eval(*accs, y)
+    state.in_resolve = True
+    try:
+        mx.eval(*accs, y)
+    finally:
+        state.in_resolve = False
     m = 0
     for a in accs:
         if int(a.reshape(-1)[0].item()):
@@ -919,14 +951,14 @@ def _flush_buffered(state: _MTPState, batch: Any) -> None:
     t_all, lp2, hv, drafts, m = state.cycle_pack
     r = len(state.buffer)          # still-buffered drafts to drop
     kept = m - r                   # drafts already emitted stay committed
-    for c in batch.prompt_cache:
-        c.trim(r)
-    if state.request_sampling and state.policy is not None:
-        z = _target_logits(lp2[:, kept, :], state.policy)
-        pend = mx.random.categorical(_rs_residual_logits(z, drafts[kept]))
-        batch._next_tokens = pend.reshape(1).astype(batch._next_tokens.dtype)
-    else:
-        batch._next_tokens = t_all[:, kept].astype(batch._next_tokens.dtype)
+    for cl in batch.prompt_cache:
+        for c in cl.caches:
+            _trim_to_exact(c, _cur(c) - r)
+    # The buffered drafts were already accepted — under sampling they are
+    # valid samples of the target. The first of them simply becomes the
+    # pending token; no new draw (a residual re-sample would exclude it and
+    # skew the distribution whenever a merge lands after an accept).
+    batch._next_tokens = drafts[kept].reshape(1).astype(batch._next_tokens.dtype)
     batch._next_logprobs = lp2[:, kept]
     state.h_last = hv[:, kept:kept + 1, :]
     state.mtp_backlog = [(hv[:, i:i + 1, :], drafts[i]) for i in range(kept)]
@@ -946,22 +978,22 @@ def _flush_buffered(state: _MTPState, batch: Any) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _install_hooks(logger: Any) -> None:
+def _install_hooks(logger: Any) -> bool:
     global _HOOKS_INSTALLED
     if _HOOKS_INSTALLED:
-        return
+        return True
     from mlx_lm.generate import GenerationBatch
 
     prev_step = GenerationBatch._step
     if getattr(prev_step, "_exo_glm52_mtp_wrapper", False):
         _HOOKS_INSTALLED = True
-        return
+        return True
     if getattr(prev_step, "__name__", "") not in ("_patched_step", "_step"):
-        _warn_once(
-            logger, "base-step",
+        logger.warning(
             f"[MTP] unexpected base GenerationBatch._step "
-            f"({getattr(prev_step, '__name__', '?')}); wrapping anyway",
+            f"({getattr(prev_step, '__name__', '?')}); MTP not installed"
         )
+        return False
 
     def _prev_once(state: _MTPState, batch: Any):
         state.prev_ran = True
@@ -983,9 +1015,11 @@ def _install_hooks(logger: Any) -> None:
         except _MTPValidateError:
             raise
         except Exception as exc:
-            if state.prev_ran:
-                # the real step already executed for this call: never run it
-                # twice; surface the failure instead of masking it.
+            if state.prev_ran or state.in_resolve:
+                # the real step already executed, or the failure came from the
+                # target verify / a collective: never run a second target
+                # forward on top of that — surface the failure.
+                state.in_resolve = False
                 raise
             if snap is not None:
                 _rollback(state, self, snap)
@@ -1011,8 +1045,11 @@ def _install_hooks(logger: Any) -> None:
             # finish landed while a verified position sat in the buffer: the
             # cache is one position ahead of the emitted stream — drop it so
             # KVPrefixCache stores tokens/cache in lockstep (recon D4).
-            for c in self.prompt_cache:
-                c.trim(len(state.buffer))
+            for cl in self.prompt_cache:
+                for c in cl.caches:
+                    _trim_to_exact(c, _cur(c) - len(state.buffer))
+            state.out_tokens = max(state.out_tokens - len(state.buffer), 0)
+            state.accepted = max(state.accepted - len(state.buffer), 0)
             state.buffer = []
             state.flush_pack = None
             state.cycle_pack = None
@@ -1035,6 +1072,7 @@ def _install_hooks(logger: Any) -> None:
 
     _HOOKS_INSTALLED = True
     logger.info("[MTP] GenerationBatch hooks installed (_step/extract_cache/extend)")
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -1059,58 +1097,83 @@ def _sha256_file(path: Path) -> str:
 
 
 def _validate_sidecar(
-    weights_path: Path, layer_idx: int, *, quant: dict[str, Any] | None, logger: Any
+    weights_path: Path, layer_idx: int, *, quant: dict[str, Any] | None, logger: Any,
+    grp: Any = None,
 ) -> tuple[dict[str, mx.array] | None, str]:
+    """Rank-safe wrapper: run the local checks, then ALWAYS join one collective
+    with [ok, digest words]; a rank that failed locally still participates (with
+    zeros), so no rank can be left waiting in all_sum. Every rank then makes the
+    same decision."""
+    raw, reason, digest = _validate_sidecar_local(weights_path, layer_idx, quant=quant, logger=logger)
+    ok = raw is not None
+    words = [int(digest[i:i + 8], 16) & 0x7FFFFFFF for i in range(0, 64, 8)] if ok else [0] * 8
+    agree, total = _rank_consensus(grp, [1 if ok else 0] + words)
+    size = grp.size() if grp is not None else 1
+    if total[0] != size:
+        return None, (reason if not ok else f"side-car rejected on {size - total[0]} rank(s)")
+    if not agree:
+        return None, "side-car digest differs across ranks"
+    return raw, "ok"
+
+
+def _validate_sidecar_local(
+    weights_path: Path, layer_idx: int, *, quant: dict[str, Any] | None, logger: Any
+) -> tuple[dict[str, mx.array] | None, str, str]:
     """Fail-closed side-car validation: manifest present, byte size and
     SHA-256 match, policy fields agree with the model, required tensor
     families present, and — under TP — the digest identical on every rank
     (different side-cars would feed different draft tokens into the TP
     verify before VALIDATE could see it). Returns the loaded tensors."""
     if not weights_path.is_file():
-        return None, f"{weights_path} not found"
+        return None, f"{weights_path} not found", ""
     manifest_path = weights_path.with_name("mtp.manifest.json")
     if not manifest_path.is_file():
-        return None, f"{manifest_path.name} missing next to side-car"
+        return None, f"{manifest_path.name} missing next to side-car", ""
     try:
         manifest = json.loads(manifest_path.read_text())
     except Exception as e:  # noqa: BLE001
-        return None, f"cannot read manifest: {e!r}"
+        return None, f"cannot read manifest: {e!r}", ""
     size = weights_path.stat().st_size
     if int(manifest.get("bytes", -1)) != size:
-        return None, f"side-car size {size} != manifest {manifest.get('bytes')}"
+        return None, f"side-car size {size} != manifest {manifest.get('bytes')}", ""
     if int(manifest.get("layer", layer_idx)) != layer_idx:
-        return None, f"manifest layer {manifest.get('layer')} != {layer_idx}"
+        return None, f"manifest layer {manifest.get('layer')} != {layer_idx}", ""
     q = quant or {}
     pol = ((manifest.get("policy", {}) or {}).get("quant", {}) or {})
     for key, want in (("bits", int(q.get("bits", 8))), ("group_size", int(q.get("group_size", 64)))):
         have = pol.get(key)
         if have is not None and int(have) != want:
-            return None, f"manifest policy {key}={have} != model {want}"
+            return None, f"manifest policy {key}={have} != model {want}", ""
     t0 = time.perf_counter()
     digest = _sha256_file(weights_path)
     if digest != str(manifest.get("sha256", "")):
-        return None, "side-car SHA-256 does not match manifest"
+        return None, "side-car SHA-256 does not match manifest", ""
     logger.info(f"[MTP] side-car sha256 verified ({digest[:16]}…) in {time.perf_counter() - t0:.1f}s")
-
-    grp = _dist_group()
-    if grp is not None:
-        words = mx.array(
-            [int(digest[i:i + 8], 16) & 0x7FFFFFFF for i in range(0, 64, 8)], dtype=mx.int32
-        )
-        total = mx.distributed.all_sum(words, group=grp)
-        mx.eval(total)
-        if not mx.array_equal(total, words * grp.size()).item():
-            return None, "side-car digest differs across ranks"
-
     try:
         raw = mx.load(str(weights_path))
     except Exception as e:  # noqa: BLE001 — fail-closed with reason
-        return None, f"cannot read {weights_path}: {e!r}"
+        return None, f"cannot read {weights_path}: {e!r}", ""
     renamed = {_rename_sidecar_key(k, layer_idx) for k in raw.keys()}
     missing = [f for f in _REQUIRED_FAMILIES if f not in renamed]
     if missing:
-        return None, f"sidecar missing families: {missing[:4]}"
-    return raw, "ok"
+        return None, f"sidecar missing families: {missing[:4]}", ""
+    return raw, "ok", digest
+
+
+def finalize_glm52_mtp_request(model: Any, uid: int | None, *, reason: str) -> None:
+    """Terminal teardown of the MTP state for a request that exo removes from
+    the generator (custom text stop, cancel, close). The generator drops the
+    request's cache wholesale, so only the state needs finalizing; uid=None
+    finalizes whatever request is active."""
+    state = getattr(model, "_exo_glm52_mtp_state", None)
+    if state is None or state.uid is None:
+        return
+    if uid is None or state.uid == uid:
+        if state.buffer:
+            state.out_tokens = max(state.out_tokens - len(state.buffer), 0)
+            state.accepted = max(state.accepted - len(state.buffer), 0)
+        state.logger.info(f"[MTP] uid={state.uid} finalized ({reason})")
+        state.finish()
 
 
 def apply_glm52_mtp_patch(
@@ -1161,8 +1224,13 @@ def apply_glm52_mtp_patch(
         model_path / "mtp.safetensors" if raw_weights in ("", "auto")
         else Path(raw_weights).expanduser()
     )
+    try:
+        grp = _dist_group()
+    except Exception:
+        logger.opt(exception=True).warning("[MTP] distributed group unavailable; patch not applied")
+        return model
     raw, reason = _validate_sidecar(
-        weights_path, layer_idx, quant=config.get("quantization"), logger=logger
+        weights_path, layer_idx, quant=config.get("quantization"), logger=logger, grp=grp
     )
     if raw is None:
         logger.warning(f"[MTP] {reason}; patch not applied")
@@ -1180,27 +1248,32 @@ def apply_glm52_mtp_patch(
     hidden_mode = _env_choice(_ENV_HIDDEN, "pre", {"post", "pre"}, logger)
     recycle_mode = _env_choice(_ENV_RECYCLE, "post", {"post", "pre"}, logger)
 
+    mtp = None
     try:
         mtp = load_mtp_module(
             args, weights_path, layer_idx=layer_idx,
             quant=config.get("quantization"), logger=logger, raw=raw,
         )
+        rope_fixed = None
     except Exception:
-        logger.opt(exception=True).warning(
-            "[MTP] side-load failed; patch not applied"
-        )
+        logger.opt(exception=True).warning("[MTP] side-load failed")
+    # Second rank-safe collective: MTP is installed only if EVERY rank built
+    # the module — a rank decoding L=1 while the others verify L=k+1 would
+    # break the TP collectives.
+    n_params = sum(v.size for _, v in tree_flatten(mtp.parameters())) if mtp is not None else 0
+    agree, total = _rank_consensus(grp, [1 if mtp is not None else 0, int(n_params & 0x7FFFFFFF)])
+    size = grp.size() if grp is not None else 1
+    if total[0] != size or not agree:
+        logger.warning(f"[MTP] module not ready on all ranks (ready={total[0]}/{size}); patch not applied")
         return model
 
     # The MTP block carries its own DSA indexer; give it the same half-split
     # RoPE decision the main full-indexer layers get (matters once the MTP
-    # cache exceeds index_topk, i.e. after ~2048 generated tokens).
-    try:
-        from exo.worker.engines.mlx.patches.glm52_indexshare import apply_mtp_indexer_rope_fix
+    # cache exceeds index_topk, i.e. after ~2048 generated tokens). Pure
+    # config-driven host work — identical on every rank, no collective needed.
+    from exo.worker.engines.mlx.patches.glm52_indexshare import apply_mtp_indexer_rope_fix
 
-        rope_fixed = apply_mtp_indexer_rope_fix(mtp.block.self_attn, config, logger=logger)
-    except Exception:
-        logger.opt(exception=True).warning("[MTP] indexer rope alignment failed; patch not applied")
-        return model
+    rope_fixed = apply_mtp_indexer_rope_fix(mtp.block.self_attn, config, logger=logger)
 
     store: dict[str, Any] = {}
     if isinstance(norm, _PreNormCapture):  # re-apply after a reload path
@@ -1218,8 +1291,10 @@ def apply_glm52_mtp_patch(
         prof=prof, draft_k=draft_k,
     )
     state.recycle = recycle_mode
+    state.group = grp
+    if not _install_hooks(logger):
+        return model
     model._exo_glm52_mtp_state = state
-    _install_hooks(logger)
     logger.info(
         f"[MTP] enabled mode={mode} k={draft_k} hidden={hidden_mode} recycle={recycle_mode} concat={concat} "
         f"validate={int(validate)} mtp_indexer_rope_fixed={int(rope_fixed)} "

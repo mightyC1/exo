@@ -390,6 +390,7 @@ class ExoBatchGenerator:
             ),
         )
         _step_tic = time.perf_counter()
+        custom_stopped: list[int] = []
         _, responses = self._mlx_gen.next()
         from exo.worker.engines.mlx.patches.resource_guard import tick as _rg_tick; _rg_tick()
         _next_elapsed = time.perf_counter() - _step_tic
@@ -518,6 +519,10 @@ class ExoBatchGenerator:
 
             if is_done:
                 del self._active_tasks[response.uid]
+                if response.finish_reason is None:
+                    # finished by a custom text stop: the generator still holds
+                    # the sequence and would keep decoding it to EOS/max_tokens
+                    custom_stopped.append(response.uid)
             elif (
                 max_stop_len > 0
                 and len(state.potential_stop_sequence_text) > max_stop_len
@@ -525,6 +530,13 @@ class ExoBatchGenerator:
                 state.potential_stop_sequence_text = state.potential_stop_sequence_text[
                     -max_stop_len:
                 ]
+
+        if custom_stopped:
+            from exo.worker.engines.mlx.patches.glm52_mtp import finalize_glm52_mtp_request
+
+            for uid in custom_stopped:
+                finalize_glm52_mtp_request(self.model, uid, reason="text-stop")
+            self._mlx_gen.remove(custom_stopped)
 
         _step_elapsed = time.perf_counter() - _step_tic
         _overhead = _step_elapsed - _next_elapsed
@@ -537,11 +549,18 @@ class ExoBatchGenerator:
         return results
 
     def cancel(self, uids: list[int]) -> None:
+        from exo.worker.engines.mlx.patches.glm52_mtp import finalize_glm52_mtp_request
+
+        for uid in uids:
+            finalize_glm52_mtp_request(self.model, uid, reason="cancel")
         self._mlx_gen.remove(uids)
         for uid in uids:
             self._active_tasks.pop(uid, None)
 
     def close(self) -> None:
+        from exo.worker.engines.mlx.patches.glm52_mtp import finalize_glm52_mtp_request
+
+        finalize_glm52_mtp_request(self.model, None, reason="close")
         self._mlx_gen.close()
         mx.clear_cache()
 

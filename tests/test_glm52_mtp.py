@@ -1177,3 +1177,125 @@ def test_rs_second_token_matches_exact_target(off_stream, sidecar):
         emp = emp.at[t].add(c / len(second))
     tv = 0.5 * float(mx.sum(mx.abs(emp - p)).item())
     assert tv < 0.2, (tv, len(second))
+
+
+# ---------------------------------------------------------------------------
+# Audit #2: merge-flush keeps the accepted sample, exact trims, rank-safe
+# VALIDATE ordering, terminal finalize
+# ---------------------------------------------------------------------------
+
+
+def test_rs_flush_preserves_accepted_draft_and_consumes_no_rng(off_stream, sidecar, monkeypatch):
+    model, _ = off_stream
+    holder = []
+    state = _battle_state(model, sidecar, k=2)
+    state.draft_multi = _oracle_draftk(holder, 2)  # type: ignore[method-assign]
+    holder.append(state)
+    samp = _GreedyPolicySampler(greedy=False, temperature=0.5)
+    _attach(model, state)
+    try:
+        from mlx_lm.generate import BatchGenerator
+
+        mx.random.seed(21)
+        bg = BatchGenerator(model, stop_tokens=None, prefill_step_size=64,
+                            completion_batch_size=4, prefill_batch_size=2)
+        bg.insert([list(PROMPT)], max_tokens=[N_GEN], samplers=[samp], logits_processors=[[]])
+        for _ in range(64):
+            bg.next()
+            if len(state.buffer) == 2:
+                break
+        assert len(state.buffer) == 2 and state.cycle_pack is not None
+        gb = bg._generation_batch
+        t_all, lp2, hv, drafts, m = state.cycle_pack
+        expected = int(drafts[0].reshape(-1)[0].item())
+
+        def boom(*a, **k):
+            raise AssertionError("merge flush must not draw from the RNG")
+
+        monkeypatch.setattr(mx.random, "categorical", boom)
+        monkeypatch.setattr(mx.random, "uniform", boom)
+        _flush_buffered(state, gb)
+        monkeypatch.undo()
+        assert int(gb._next_tokens.reshape(-1)[0].item()) == expected
+        assert state.buffer == [] and _batch_off(gb) == len(gb.tokens[0])
+        # the request keeps decoding normally afterwards
+        last = None
+        for _ in range(N_GEN * 3 + 32):
+            out = bg.next()
+            rs = out[1] if isinstance(out, tuple) else out
+            for r in rs or []:
+                last = r
+            if last is not None and last.finish_reason is not None:
+                break
+        assert last is not None and last.finish_reason == "length"
+        assert last.prompt_cache[0][0].offset == len(last.all_tokens)
+    finally:
+        _detach(model)
+
+
+def test_trim_to_exact_is_strict():
+    from exo.worker.engines.mlx.patches.glm52_mtp import _trim_to_exact
+
+    class Fake:
+        def __init__(self, idx, broken=False):
+            self._idx, self.broken = idx, broken
+        def trim(self, n):
+            if not self.broken:
+                self._idx -= n
+            return n
+    c = Fake(10); _trim_to_exact(c, 7); assert c._idx == 7
+    with pytest.raises(RuntimeError):
+        _trim_to_exact(Fake(5), 7)              # behind target
+    with pytest.raises(RuntimeError):
+        _trim_to_exact(Fake(10, broken=True), 7)  # trim did nothing
+
+
+def test_validate_cycle_reports_local_error_after_consensus(off_stream, sidecar):
+    from exo.worker.engines.mlx.patches import glm52_mtp as gm
+
+    model, _ = off_stream
+    state = _battle_state(model, sidecar, k=1)
+    state.group = None  # single process: consensus degenerates to local
+    from mlx_lm.generate import BatchGenerator
+
+    _attach(model, state)
+    try:
+        bg = BatchGenerator(model, stop_tokens=None, prefill_step_size=64,
+                            completion_batch_size=4, prefill_batch_size=2)
+        bg.insert([list(PROMPT)], max_tokens=[N_GEN], samplers=[_GreedyPolicySampler()])
+        for _ in range(3):
+            bg.next()
+        gb = bg._generation_batch
+        gb.prompt_cache[37].caches[1].trim(1)  # skew one slot of layer 37
+        with pytest.raises(gm._MTPValidateError) as ei:
+            gm._validate_cycle(state, gb, 0)
+        assert "local check failed" in str(ei.value)
+    finally:
+        _detach(model)
+
+
+def test_finalize_request_resets_state_and_counters(off_stream, sidecar):
+    from exo.worker.engines.mlx.patches import glm52_mtp as gm
+
+    model, _ = off_stream
+    state = _battle_state(model, sidecar, k=1)
+    state.start_request(uid=5)
+    state.cycles, state.accepted, state.out_tokens = 4, 3, 7
+    state.buffer = [(mx.array([1]), mx.zeros((1, 97)))]
+    _attach(model, state)
+    try:
+        gm.finalize_glm52_mtp_request(model, 4, reason="other")   # other uid: untouched
+        assert state.uid == 5
+        gm.finalize_glm52_mtp_request(model, 5, reason="text-stop")
+        assert state.uid is None and state.buffer == []
+    finally:
+        _detach(model)
+
+
+def test_lp_row_hard_fails_on_unexpected_structure():
+    from exo.worker.engines.mlx.patches.glm52_mtp import _lp_row
+
+    assert _lp_row(mx.zeros((1, 4))).shape == (4,)
+    assert _lp_row([]).shape == (1,)
+    with pytest.raises(RuntimeError):
+        _lp_row({"bad": 1})
