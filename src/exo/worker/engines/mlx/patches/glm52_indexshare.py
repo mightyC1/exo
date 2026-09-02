@@ -429,15 +429,28 @@ def _patch_mlx_lm_classes_once() -> None:
                         )
             else:
                 if int(L) > 1 and cfg.indexer_enabled:
-                    topk_indices = tiled_indexer_call(
-                        self.indexer,
-                        x,
-                        qr,
-                        mask,
-                        cache[1],
-                        cfg,
-                        profiler=profiler,
-                    )
+                    if (
+                        _MTP_VERIFY_CTX.get()
+                        and 1 < int(L) <= _MICRO_DECODE_L
+                        and int(B) == 1
+                    ):
+                        # MTP verify (B==1, L<=4): the streaming/tiled indexer
+                        # is prefill machinery — its k-chunk loop (9 chunks at
+                        # kv=147k) is pure per-token overhead here, while the
+                        # full score block for L<=4 is a few MB. Monolithic
+                        # pinned call, no fallback: a failure surfaces like
+                        # every other MTP-path failure (rollback + no MTP).
+                        topk_indices = self.indexer(x, qr, mask, cache=cache[1])
+                    else:
+                        topk_indices = tiled_indexer_call(
+                            self.indexer,
+                            x,
+                            qr,
+                            mask,
+                            cache[1],
+                            cfg,
+                            profiler=profiler,
+                        )
                 elif profiler is not None:
                     topk_indices = profiled_monolithic_indexer_call(
                         self.indexer,
