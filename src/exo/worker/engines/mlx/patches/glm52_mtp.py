@@ -1240,14 +1240,15 @@ def _validate_sidecar_local(
 
 
 def mtp_prefill_begin(model: Any, start_offset: int, n_tokens: int) -> None:
-    """Called by exo's prefill() before the chunk loop. Arms prompt ingestion
-    for a cold prompt (cache starts at 0); a prefix-cache hit leaves the head
-    without the missing context (v1: skip — the MTP cache would need to be
-    stored in the prefix cache alongside the main one)."""
+    """Called by exo's prefill() before the chunk loop. Arms ingestion of the
+    tokens this prefill will actually compute: the whole prompt for a cold
+    request, or the uncached suffix after a prefix-cache hit (multi-turn
+    chat: the latest turn). The MTP cache is position-relative, so a suffix
+    starting at `start_offset` is ingested from MTP position 0."""
     state = getattr(model, "_exo_glm52_mtp_state", None)
     if state is None or state.mode != "on" or not state.prefill_enabled:
         return
-    if start_offset != 0 or n_tokens < 2:
+    if n_tokens < 2:
         state.pending = None
         return
     from mlx_lm.models.cache import CacheList, KVCache
@@ -1258,7 +1259,7 @@ def mtp_prefill_begin(model: Any, start_offset: int, n_tokens: int) -> None:
     state.pending = {
         "cache": CacheList(KVCache(), KVCache()), "carry_h": None,
         "n": 0, "ingested": 0, "toks": [], "t0": time.perf_counter(),
-        "start": start,
+        "start": start, "base": int(start_offset),
     }
 
 
@@ -1367,10 +1368,11 @@ def _adopt_prefill(state: _MTPState, batch: Any) -> None:
         last_tok = int(batch._next_tokens.reshape(-1)[0].item())
     else:
         tail_ok, last_tok = False, None
-    if last_tok is None or not tail_ok or (main_pos is not None and main_pos != n):
+    expect_pos = pend.get("base", 0) + n
+    if last_tok is None or not tail_ok or (main_pos is not None and main_pos != expect_pos):
         state.logger.info(
             f"[MTP] prompt ingest discarded: prompt mismatch "
-            f"(tokens={len(t)} n={n} main_pos={main_pos})"
+            f"(tokens={len(t)} n={n} base={pend.get('base', 0)} main_pos={main_pos})"
         )
         return
     try:
@@ -1383,7 +1385,8 @@ def _adopt_prefill(state: _MTPState, batch: Any) -> None:
         state.gen_pairs = []
         state.logger.info(
             f"[MTP] uid={state.uid} prompt ingested: {pend['ingested'] + 1} pairs "
-            f"(mtp_offset={_cur(state.mtp_cache[0])}) in {time.perf_counter() - pend['t0']:.1f}s"
+            f"(base={pend.get('base', 0)} mtp_offset={_cur(state.mtp_cache[0])}) "
+            f"in {time.perf_counter() - pend['t0']:.1f}s"
         )
     except Exception:
         state.logger.opt(exception=True).warning("[MTP] prompt ingest adopt failed; head starts cold")

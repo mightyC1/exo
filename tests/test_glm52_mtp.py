@@ -1429,7 +1429,7 @@ def test_prompt_ingest_skipped_on_prefix_hit_or_mismatch(off_stream, sidecar):
     model, _ = off_stream
     state = _battle_state(model, sidecar, k=1); _attach(model, state)
     try:
-        gm.mtp_prefill_begin(model, 13, 100)      # prefix-cache hit -> not armed
+        gm.mtp_prefill_begin(model, 13, 1)        # nothing to ingest -> not armed
         assert state.pending is None
         gm.mtp_prefill_begin(model, 0, 8)
         _capture_prompt_hidden(model, PROMPT[:-1])
@@ -1542,3 +1542,43 @@ def test_prompt_context_dropped_after_n_cycles(off_stream, sidecar):
     line = next(l for l in state.logger.lines if "prompt context dropped" in l)
     assert "re-ingested 4 generated pairs" in line, line   # one committed pair per cycle (k=1)
     assert toks == ref                                    # mechanics untouched
+
+
+
+def test_prompt_ingest_after_prefix_cache_hit(off_stream, sidecar):
+    """Multi-turn chat: the prefix is cached, prefill computes only the new
+    suffix at base=hit; the suffix pairs are ingested and adopted when the
+    main cache sits at base+n."""
+    from exo.worker.engines.mlx.patches import glm52_mtp as gm
+    from mlx_lm.models.cache import CacheList, KVCache
+
+    model, _ = off_stream
+    full = list(PROMPT) + [7, 3, 9, 1, 4, 6]        # cached prefix + new turn
+    hit = len(PROMPT)
+    suffix = full[hit:]                              # exo's remaining_tokens
+    prefill_toks = suffix[:-1]                       # what prefill() computes
+    state = _battle_state(model, sidecar, k=1); _attach(model, state)
+    try:
+        gm.mtp_prefill_begin(model, hit, len(prefill_toks))
+        assert state.pending is not None and state.pending["base"] == hit
+        # hiddens for the suffix positions come from a forward over the full prompt
+        cache = model.make_cache()
+        model(mx.array([full[:-1]], dtype=mx.uint32), cache=cache)
+        h_all = state.store.pop("h")
+        state.store["h"] = h_all[:, hit:hit + len(prefill_toks), :]
+        gm.mtp_prefill_chunk(model, prefill_toks)
+        n = state.pending["n"]
+        main = CacheList(KVCache(), KVCache())
+        main.caches[0].offset = hit + n
+        main.caches[1].offset = hit + n
+
+        class B:
+            tokens = [[full[-2]]]
+            _next_tokens = mx.array([full[-1]], dtype=mx.uint32)
+            prompt_cache = [main]
+        state.start_request(uid=4)
+        gm._adopt_prefill(state, B())
+        assert any("prompt ingested" in l for l in state.logger.lines), state.logger.lines[-2:]
+        assert state.mtp_cache[0].offset == len(prefill_toks)   # suffix pairs only
+    finally:
+        _detach(model)
