@@ -280,10 +280,19 @@ def _tiny_model():
 
 
 class _GreedyPolicySampler:
-    """argmax sampler carrying the explicit policy the MTP loop keys on."""
+    """Sampler carrying the explicit policy the MTP loop keys on. greedy=True
+    -> argmax; greedy=False -> the pin's make_sampler chain (temperature,
+    top_p, min_p, top_k), exactly what exo's ExoSampler wraps in prod."""
 
-    def __init__(self, greedy=True, logprobs=False, raise_on_call=False):
+    def __init__(self, greedy=True, logprobs=False, raise_on_call=False,
+                 temperature=0.0, top_p=1.0, min_p=0.0, top_k=0):
+        from mlx_lm.sample_utils import make_sampler
+
         self.greedy, self.logprobs, self.raise_on_call = greedy, logprobs, raise_on_call
+        self.temperature = 0.0 if greedy else float(temperature)
+        self.top_p, self.min_p, self.top_k = float(top_p), float(min_p), int(top_k)
+        self.fn = (None if greedy else
+                   make_sampler(temp=self.temperature, top_p=top_p, min_p=min_p, top_k=top_k))
         self.calls = 0
 
     def __call__(self, lp):
@@ -291,7 +300,7 @@ class _GreedyPolicySampler:
         if self.raise_on_call and self.calls > 1:
             # exactly one call is allowed per request: the seed step (P1.2)
             raise AssertionError("sampler must not be called on the battle path")
-        return mx.argmax(lp, axis=-1)
+        return mx.argmax(lp, axis=-1) if self.greedy else self.fn(lp)
 
 
 def _run_bg(model, prompt, max_tokens, sampler=None, processors=None):
@@ -826,12 +835,13 @@ def test_policy_unknown_sampler_fails_closed(off_stream, sidecar):
     assert toks == ref
 
 
-def test_policy_temperature_not_greedy(off_stream, sidecar):
-    model, ref = off_stream
-    samp = _GreedyPolicySampler(greedy=False)  # argmax fn, but declared sampling
-    state, toks, _ = _run_on(model, sidecar, N_GEN, None, k=1, sampler=samp)
-    assert state.last_battle is False and state.cycles == 0
-    assert toks == ref
+def test_policy_temperature_routes_to_rs(off_stream, sidecar):
+    model, _ = off_stream
+    samp = _GreedyPolicySampler(greedy=False, temperature=0.7, min_p=0.05)
+    mx.random.seed(3)
+    state, toks, last = _run_on(model, sidecar, N_GEN, None, k=1, sampler=samp)
+    assert state.last_battle is True and state.cycles > 0
+    assert last.finish_reason == "length"
 
 
 def test_policy_logprobs_excluded(off_stream, sidecar):
@@ -1084,3 +1094,86 @@ def test_corpus_sizer_exact_and_empty():
     assert tok == 37
     with pytest.raises(ValueError):
         mod.PromptSizer(Tok(), corpus="   \n").build(20)
+
+
+
+# ---------------------------------------------------------------------------
+# M2: speculative sampling for temperature > 0
+# ---------------------------------------------------------------------------
+
+
+def test_rs_kernel_matches_target_distribution():
+    """Greedy draft + accept w.p. p(d) + residual on reject must reproduce the
+    exact target distribution (Leviathan et al., q = one-hot)."""
+    from exo.worker.engines.mlx.patches.glm52_mtp import _rs_residual_logits, _target_logits
+
+    mx.random.seed(0)
+    V, N = 97, 20000
+    row = mx.log(mx.softmax(mx.random.normal((1, V)) * 2.5, axis=-1))
+    pol = {"temperature": 0.7, "top_p": 1.0, "min_p": 0.05, "top_k": 0}
+    z = _target_logits(row, pol)
+    p = mx.softmax(z, axis=-1).reshape(-1)
+    order = mx.argsort(-p)                                   # draft = 2nd most likely (p(d) > 0)
+    d = order[1:2].astype(mx.int32)
+    pd = p[d.item()]
+    us = mx.random.uniform(shape=(N,))
+    accept = us < pd
+    res = mx.random.categorical(mx.broadcast_to(_rs_residual_logits(z, d), (N, V)))
+    toks = mx.where(accept, d.reshape(1).astype(res.dtype), res)
+    counts = mx.zeros((V,)).at[toks].add(mx.ones((N,)))
+    emp = counts / N
+    tv = 0.5 * float(mx.sum(mx.abs(emp - p)).item())
+    assert tv < 0.02, tv
+    assert 0.0 < float(mx.mean(accept).item()) < 1.0
+
+
+def _run_rs(model, sidecar, n, k, seed, draft_override=None, temperature=0.5, min_p=0.0):
+    samp = _GreedyPolicySampler(greedy=False, temperature=temperature, min_p=min_p)
+    mx.random.seed(seed)
+    return _run_on(model, sidecar, n, draft_override, k=k, sampler=samp)
+
+
+@pytest.mark.parametrize("k", [1, 2])
+def test_rs_pipeline_deterministic_and_consistent(off_stream, sidecar, k):
+    model, _ = off_stream
+    st1, toks1, last1 = _run_rs(model, sidecar, 40, k, seed=11,
+                                draft_override=lambda h: _oracle_draftk(h, k))
+    st2, toks2, last2 = _run_rs(model, sidecar, 40, k, seed=11,
+                                draft_override=lambda h: _oracle_draftk(h, k))
+    assert st1.cycles > 0 and st1.accepted > 0, (st1.cycles, st1.accepted)
+    assert toks1 == toks2, "same seed -> identical stream (replicated RNG)"
+    assert last1.finish_reason == "length"
+    assert last1.prompt_cache[0][0].offset == len(last1.all_tokens)
+    assert last1.prompt_cache[0][1].offset == last1.prompt_cache[0][0].offset
+
+
+def test_rs_second_token_matches_exact_target(off_stream, sidecar):
+    """Pipeline-level distribution gate: the second generated token (first
+    produced by the RS cycle) must follow the exact target distribution
+    conditioned on the first (seed-step) token."""
+    from exo.worker.engines.mlx.patches.glm52_mtp import _target_logits
+
+    model, _ = off_stream
+    # low temperature keeps both positions peaked so the empirical estimate
+    # converges with a few hundred samples (the tiny random model is flat).
+    pol = {"temperature": 0.15, "top_p": 1.0, "min_p": 0.0, "top_k": 0}
+    pairs = []
+    for seed in range(300):
+        _, toks, _ = _run_rs(model, sidecar, 2, 1, seed=seed, temperature=0.15)
+        pairs.append((toks[0], toks[1]))
+    from collections import Counter
+    first = Counter(t1 for t1, _ in pairs).most_common(1)[0][0]
+    second = [t2 for t1, t2 in pairs if t1 == first]
+    assert len(second) >= 40, len(second)
+    # exact target for the second token given the first
+    _detach(model)
+    cache = model.make_cache()
+    lg = model(mx.array([PROMPT + [first]], dtype=mx.uint32), cache=cache)
+    row = lg[:, -1, :] - mx.logsumexp(lg[:, -1, :], axis=-1, keepdims=True)
+    p = mx.softmax(_target_logits(row, pol), axis=-1).reshape(-1)
+    counts = Counter(second)
+    emp = mx.zeros((p.shape[0],))
+    for t, c in counts.items():
+        emp = emp.at[t].add(c / len(second))
+    tv = 0.5 * float(mx.sum(mx.abs(emp - p)).item())
+    assert tv < 0.2, (tv, len(second))

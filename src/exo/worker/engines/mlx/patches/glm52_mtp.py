@@ -262,6 +262,8 @@ class _MTPState:
         self.win: list[bool] = []
         # battle fields
         self.request_battle: bool | None = None
+        self.request_sampling = False
+        self.policy: dict[str, Any] | None = None
         self.shadow_disabled = False
         self.prev_ran = False   # exactly-once guard for the real step
         self.last_battle: bool | None = None  # last per-request decision (diagnostics)
@@ -288,6 +290,8 @@ class _MTPState:
         self.matches = 0
         self.win = []
         self.request_battle = None
+        self.request_sampling = False
+        self.policy = None
         self.shadow_disabled = False
         self.buffer = []
         self.h_last = None
@@ -354,6 +358,7 @@ class _MTPState:
             a3 = self.acc_pos[2] / max(self.acc_pos[1], 1)
             self.logger.info(
                 f"[MTP] uid={self.uid} cycles={self.cycles} k={self.draft_k} "
+                f"mode={'rs' if self.request_sampling else 'greedy'} "
                 f"proposed={self.proposed} accepted={self.accepted} "
                 f"accept_rate={self.accepted / self.proposed:.3f} "
                 f"a1={a1:.3f} a2={a2:.3f} a3={a3:.3f} out={self.out_tokens} "
@@ -368,6 +373,7 @@ class _MTPState:
             a3 = self.acc_pos[2] / max(self.acc_pos[1], 1)
             self.logger.info(
                 f"[MTP_SUMMARY] ({why}) uid={self.uid} req_cycles={self.cycles} "
+                f"mode={'rs' if self.request_sampling else 'greedy'} "
                 f"k={self.draft_k} proposed={self.proposed} accepted={self.accepted} "
                 f"accept_rate={self.accepted / max(self.proposed, 1):.3f} "
                 f"a1={a1:.3f} a2={a2:.3f} a3={a3:.3f} out={self.out_tokens} "
@@ -439,7 +445,55 @@ def _request_policy(batch: Any) -> dict[str, bool] | None:
     greedy = getattr(sampler, "greedy", None)
     if greedy is None:
         return None
-    return {"greedy": bool(greedy), "logprobs": bool(getattr(sampler, "logprobs", False))}
+    return {
+        "greedy": bool(greedy),
+        "logprobs": bool(getattr(sampler, "logprobs", False)),
+        "temperature": float(getattr(sampler, "temperature", 0.0)),
+        "top_p": float(getattr(sampler, "top_p", 1.0)),
+        "min_p": float(getattr(sampler, "min_p", 0.0)),
+        "top_k": int(getattr(sampler, "top_k", 0)),
+    }
+
+
+def _target_logits(row_logprobs: mx.array, pol: dict[str, Any]) -> mx.array:
+    """Tempered, filtered logits whose softmax is exactly the distribution the
+    normal step samples from: make_sampler applies top_p -> min_p -> top_k to
+    the (untempered) logprobs and then categorical(logits / temp)."""
+    from mlx_lm.sample_utils import apply_min_p, apply_top_k, apply_top_p
+
+    x = row_logprobs
+    top_p, min_p, top_k, temp = pol["top_p"], pol["min_p"], pol["top_k"], pol["temperature"]
+    if 0.0 < top_p < 1.0:
+        x = apply_top_p(x, top_p)
+    if min_p != 0.0:
+        x = apply_min_p(x, min_p, 1)
+    if top_k > 0:
+        x = apply_top_k(x, top_k)
+    return x * (1.0 / temp)
+
+
+def _rs_accepts(zs: list[mx.array], drafts: list[mx.array], us: list[mx.array]) -> list[mx.array]:
+    """Speculative sampling with a deterministic (greedy) draft: position j is
+    accepted with probability p_j(d_j) (Leviathan et al. with q = one-hot);
+    acceptance is a prefix. Returns the lazy prefix-accept flags."""
+    accs: list[mx.array] = []
+    prev = None
+    for j, d in enumerate(drafts):
+        pj = mx.softmax(zs[j], axis=-1)
+        pd = mx.take_along_axis(pj, d.reshape(1, 1).astype(mx.int32), axis=-1).reshape(1)
+        hit = us[j] < pd
+        prev = hit if prev is None else mx.logical_and(prev, hit)
+        accs.append(prev)
+    return accs
+
+
+def _rs_residual_logits(z: mx.array, d: mx.array) -> mx.array:
+    """Distribution to sample from after rejecting greedy draft d at this
+    position: the target with d removed and renormalized (max(0, p - q) for a
+    one-hot q), expressed as logits for categorical()."""
+    vocab = z.shape[-1]
+    mask = mx.arange(vocab) == d.reshape(-1)[0:1].astype(mx.int32)
+    return mx.where(mask, mx.array(-float("inf"), dtype=z.dtype), z)
 
 
 def _dist_group() -> Any | None:
@@ -492,7 +546,8 @@ def _validate_cycle(state: _MTPState, batch: Any, m: int, base: int | None = Non
     if grp is None:
         return
     mtp_off = _cur(state.mtp_cache[0]) if state.mtp_cache is not None else 0
-    vec = mx.array([m, off00, mtp_off, len(state.buffer)], dtype=mx.int32)
+    pend = int(batch._next_tokens.reshape(-1)[0].item()) if batch._next_tokens is not None else -1
+    vec = mx.array([m, off00, mtp_off, len(state.buffer), pend], dtype=mx.int32)
     total = mx.distributed.all_sum(vec, group=grp)
     mx.eval(total)
     expected = vec * grp.size()
@@ -677,18 +732,15 @@ def _battle_step(state: _MTPState, prev_step: Any, batch: Any):
     # ---- request-level eligibility, decided once from explicit policy -----
     if state.request_battle is None:
         pol = _request_policy(batch)
-        state.request_battle = bool(pol and pol["greedy"] and not pol["logprobs"])
+        state.request_battle = bool(pol and not pol["logprobs"])
+        state.request_sampling = bool(pol and not pol["greedy"])
+        state.policy = pol
         state.last_battle = state.request_battle
         if not state.request_battle:
-            why = (
-                "unknown sampler policy" if pol is None
-                else "logprobs requested" if pol["logprobs"]
-                else "non-greedy request"
-            )
+            why = "unknown sampler policy" if pol is None else "logprobs requested"
             _warn_once(
                 state.logger, f"nobattle:{why}",
-                f"[MTP] {why} under mode=on: running shadow for it "
-                "(M2 rejection sampling lands in phase 3)",
+                f"[MTP] {why} under mode=on: running shadow for it",
             )
     if not state.request_battle:
         return _shadow_step(state, prev_step, batch)
@@ -745,12 +797,21 @@ def _battle_step(state: _MTPState, prev_step: Any, batch: Any):
     lp2 = logits2 - mx.logsumexp(logits2, axis=-1, keepdims=True)
     t_all = mx.argmax(lp2, axis=-1)                       # (1, k+1)
     t1 = t_all[:, 0]
-    accs = []
-    prev = None
-    for i in range(k):
-        hit = mx.equal(drafts[i].astype(mx.int64), t_all[:, i].astype(mx.int64))
-        prev = hit if prev is None else mx.logical_and(prev, hit)
-        accs.append(prev)
+    zs = None
+    if state.request_sampling:
+        # M2: speculative sampling — accept d_j w.p. p_j(d_j) under the exact
+        # target distribution (temperature/top_p/min_p/top_k of the request);
+        # the uniforms are drawn in program order from the replicated RNG.
+        zs = [_target_logits(lp2[:, j, :], state.policy) for j in range(k + 1)]
+        us = [mx.random.uniform(shape=(1,)) for _ in range(k)]
+        accs = _rs_accepts(zs, drafts, us)
+    else:
+        accs = []
+        prev = None
+        for i in range(k):
+            hit = mx.equal(drafts[i].astype(mx.int64), t_all[:, i].astype(mx.int64))
+            prev = hit if prev is None else mx.logical_and(prev, hit)
+            accs.append(prev)
     acc1 = accs[0]
 
     if state.prof:
@@ -802,7 +863,16 @@ def _battle_step(state: _MTPState, prev_step: Any, batch: Any):
         for c in batch.prompt_cache:
             c.trim(k - m)
 
-    batch._next_tokens = t_all[:, m].astype(y.dtype)
+    if zs is not None:
+        # pending token: bonus from the target at position m when every draft
+        # was accepted, else from the residual of the rejecting position.
+        if m == k:
+            pend = mx.random.categorical(zs[k])
+        else:
+            pend = mx.random.categorical(_rs_residual_logits(zs[m], drafts[m]))
+        batch._next_tokens = pend.reshape(1).astype(y.dtype)
+    else:
+        batch._next_tokens = t_all[:, m].astype(y.dtype)
     batch._next_logprobs = lp2[:, m]
     state.h_last = hv[:, m:m + 1, :]
     state.mtp_backlog = [(hv[:, i:i + 1, :], drafts[i]) for i in range(m)]
@@ -851,7 +921,12 @@ def _flush_buffered(state: _MTPState, batch: Any) -> None:
     kept = m - r                   # drafts already emitted stay committed
     for c in batch.prompt_cache:
         c.trim(r)
-    batch._next_tokens = t_all[:, kept].astype(batch._next_tokens.dtype)
+    if state.request_sampling and state.policy is not None:
+        z = _target_logits(lp2[:, kept, :], state.policy)
+        pend = mx.random.categorical(_rs_residual_logits(z, drafts[kept]))
+        batch._next_tokens = pend.reshape(1).astype(batch._next_tokens.dtype)
+    else:
+        batch._next_tokens = t_all[:, kept].astype(batch._next_tokens.dtype)
     batch._next_logprobs = lp2[:, kept]
     state.h_last = hv[:, kept:kept + 1, :]
     state.mtp_backlog = [(hv[:, i:i + 1, :], drafts[i]) for i in range(kept)]

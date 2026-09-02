@@ -23,12 +23,18 @@ class ExoSampler:
     with min_p filtering, cannot distinguish greedy from sampling.
     """
 
-    __slots__ = ("fn", "temperature", "logprobs")
+    __slots__ = ("fn", "temperature", "logprobs", "top_p", "min_p", "top_k")
 
-    def __init__(self, fn, *, temperature: float, logprobs: bool) -> None:
+    def __init__(
+        self, fn, *, temperature: float, logprobs: bool,
+        top_p: float = 1.0, min_p: float = 0.0, top_k: int = 0,
+    ) -> None:
         self.fn = fn
         self.temperature = float(temperature)
         self.logprobs = bool(logprobs)
+        self.top_p = float(top_p)
+        self.min_p = float(min_p)
+        self.top_k = int(top_k)
 
     @property
     def greedy(self) -> bool:
@@ -208,15 +214,19 @@ class ExoBatchGenerator:
         effective_temperature = (
             task_params.temperature if task_params.temperature is not None else 0.7
         )
+        eff_top_p = task_params.top_p if task_params.top_p is not None else 1.0
+        eff_min_p = task_params.min_p if task_params.min_p is not None else 0.05
+        eff_top_k = task_params.top_k if task_params.top_k is not None else 0
         sampler = ExoSampler(
             make_sampler(
                 temp=effective_temperature,
-                top_p=task_params.top_p if task_params.top_p is not None else 1.0,
-                min_p=task_params.min_p if task_params.min_p is not None else 0.05,
-                top_k=task_params.top_k if task_params.top_k is not None else 0,
+                top_p=eff_top_p,
+                min_p=eff_min_p,
+                top_k=eff_top_k,
             ),
             temperature=float(effective_temperature),
             logprobs=bool(task_params.logprobs),
+            top_p=eff_top_p, min_p=eff_min_p, top_k=eff_top_k,
         )
 
         vision_ctx = (
