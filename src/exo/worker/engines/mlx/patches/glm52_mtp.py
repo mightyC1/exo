@@ -64,6 +64,7 @@ _ENV_PREFILL_WINDOW = "EXO_GLM52_MTP_PREFILL_WINDOW"
 _ENV_PREFILL_CYCLES = "EXO_GLM52_MTP_PREFILL_CYCLES"
 _ENV_PROPOSAL = "EXO_GLM52_MTP_PROPOSAL"
 _ENV_CF = "EXO_GLM52_MTP_CF"
+_ENV_SPEC_DRAFT = "EXO_GLM52_MTP_SPEC_DRAFT"
 _PREFILL_SUBCHUNK = 256
 
 _LOG_EVERY = 64
@@ -279,6 +280,9 @@ class _MTPState:
         self.gen_pairs: list[tuple[mx.array, mx.array]] = []
         self.retired: list[Any] = []         # caches swapped out mid-request; freed at finish
         self.proposal = "argmax"             # draft proposal under sampling: argmax | sample
+        self.spec_draft = True               # M1.5-lite: next-cycle draft inside the verify train
+        self.spec_next: tuple | None = None  # (d1, h_mtp, zq) valid for the next cycle
+        self.cycle_spec_entries = 0          # MTP entries this cycle's spec left in the cache
         self.cf = False                      # counterfactual telemetry (alpha one-hot vs full-q)
         self.cf_acc: mx.array | None = None  # lazy (2,) accumulator [alpha_onehot, alpha_fullq]
         self.cf_n = 0
@@ -320,6 +324,8 @@ class _MTPState:
         self.retired = []                    # nothing in flight between requests: safe to free
         self.cf_acc = None
         self.cf_n = 0
+        self.spec_next = None
+        self.cycle_spec_entries = 0
         self.shadow_disabled = False
         self.buffer = []
         self.h_last = None
@@ -790,6 +796,8 @@ def _snapshot(state: _MTPState, batch: Any) -> dict[str, Any]:
         "backlog": list(state.mtp_backlog),
         "buffer": list(state.buffer),
         "cycle_pack": state.cycle_pack,
+        "spec_next": state.spec_next,
+        "cycle_spec_entries": state.cycle_spec_entries,
     }
 
 
@@ -821,6 +829,8 @@ def _rollback(state: _MTPState, batch: Any, snap: dict[str, Any]) -> None:
     state.mtp_backlog = snap["backlog"]
     state.buffer = snap["buffer"]
     state.cycle_pack = snap["cycle_pack"]
+    state.spec_next = snap["spec_next"]
+    state.cycle_spec_entries = snap["cycle_spec_entries"]
 
 
 def _history(state: _MTPState, batch: Any) -> mx.array:
@@ -940,10 +950,20 @@ def _battle_step(state: _MTPState, prev_step: Any, batch: Any):
     state.mtp_backlog = []
     if state.prompt_ctx:
         state.gen_pairs.extend(pairs)          # committed pairs, in cache order
-    res = state.draft_multi(pairs)
-    d1, h_mtp = res[0], res[1]
-    zq_rows = [res[2] if len(res) > 2 else None]
+    if state.spec_next is not None and not state.mtp_backlog and not pairs[:-1]:
+        # M1.5-lite hit: the previous cycle's verify train already drafted this
+        # cycle's step 1 (and ingested its pairs); the pending token is that
+        # cycle's pre-drawn bonus, so the speculative pairs are exactly right.
+        d1, h_mtp, zq1 = state.spec_next
+        state.spec_next = None
+    else:
+        state.spec_next = None
+        res = state.draft_multi(pairs)
+        d1, h_mtp = res[0], res[1]
+        zq1 = res[2] if len(res) > 2 else None
+    zq_rows = [zq1]
     drafts = [d1]
+    chain_before = _cur(state.mtp_cache[0]) if state.mtp_cache is not None else 0
     for _ in range(1, k):
         # chained proposal: the MTP block's own post-norm output stands in
         # for the (not yet computed) main-model hidden of the previous draft.
@@ -954,6 +974,14 @@ def _battle_step(state: _MTPState, prev_step: Any, batch: Any):
         zq_rows.append(res[2] if len(res) > 2 else None)
         drafts.append(d_next)
 
+    # The chained MTP entries (steps 2..k) were computed from the block's own
+    # hidden; drop them now (host-side bookkeeping only — the already-built
+    # chain graph keeps its own array versions) so the speculative next-cycle
+    # pairs land at the right positions.
+    if k >= 2 and state.mtp_cache is not None:
+        chain_entries = _cur(state.mtp_cache[0]) - chain_before
+        for c in state.mtp_cache.caches:
+            _trim_to_exact(c, _cur(c) - chain_entries)
     base_off = _cur(batch.prompt_cache[0][0]) if state.validate else None
     if state.validate:
         _validate_pre_verify(state, y, drafts)
@@ -992,6 +1020,26 @@ def _battle_step(state: _MTPState, prev_step: Any, batch: Any):
             prev = hit if prev is None else mx.logical_and(prev, hit)
             accs.append(prev)
     acc1 = accs[0]
+
+    # ---- M1.5-lite: draft the NEXT cycle's step 1 inside this verify's train,
+    # assuming full acceptance. Its pairs are (hv_i, d_i) for i<k plus
+    # (hv_k, bonus candidate); the bonus is drawn now (lazily) so both branches
+    # use the same program-order RNG. On a reject the extra MTP entries are
+    # trimmed and the draft is recomputed as before. The verify is never
+    # speculated. ---------------------------------------------------------
+    spec = None
+    spec_ok = (
+        state.spec_draft and hv is not None and hv.shape[1] >= k + 1
+        and state.mtp_cache is not None
+    )
+    if spec_ok:
+        bonus_c = (mx.random.categorical(zs[k]).reshape(1) if zs is not None
+                   else t_all[:, k].reshape(1)).astype(y.dtype)
+        pairs_spec = [(hv[:, i:i + 1, :], drafts[i]) for i in range(k)] + [(hv[:, k:k + 1, :], bonus_c)]
+        spec_before = _cur(state.mtp_cache[0])
+        res_s = state.draft_multi(pairs_spec)
+        spec_entries = _cur(state.mtp_cache[0]) - spec_before   # what actually landed
+        spec = (res_s[0], res_s[1], res_s[2] if len(res_s) > 2 else None, bonus_c, spec_entries)
 
     if state.prof:
         _t1 = time.perf_counter()
@@ -1036,36 +1084,65 @@ def _battle_step(state: _MTPState, prev_step: Any, batch: Any):
         # cycle-entry snapshot and runs the normal step exactly once.
         raise _MTPBail("verify hidden not captured")
 
-    # The chained MTP entries (steps 2..k) were computed from the block's own
-    # hidden; drop them — accepted positions re-enter through the backlog
-    # with the true main-model hidden from this verify.
-    if k >= 2 and state.mtp_cache is not None:
-        for c in state.mtp_cache.caches:
-            c.trim(k - 1)
     if k - m:
         for c in batch.prompt_cache:
             c.trim(k - m)
 
-    if zs is not None:
-        # pending token: bonus from the target at position m when every draft
-        # was accepted, else from the residual of the rejecting position.
+    spec_arrays: list[mx.array] = []
+    if spec is not None:
+        d1n, h_mtpn, zqn, bonus_c, spec_entries = spec
         if m == k:
-            pend = mx.random.categorical(zs[k])
-        elif full_q:
-            pend = mx.random.categorical(_rs_residual_logits_q(zs[m], zq_rows[m]))
+            # full accept: the speculative pairs are the committed ones, the
+            # pending token is the pre-drawn bonus, the next draft is ready.
+            batch._next_tokens = bonus_c
+            state.spec_next = (d1n, h_mtpn, zqn)
+            state.cycle_spec_entries = spec_entries
+            state.mtp_backlog = []
+            if state.prompt_ctx:
+                state.gen_pairs.extend(pairs_spec)
+            spec_arrays = [d1n, h_mtpn] + ([zqn] if zqn is not None else [])
         else:
-            pend = mx.random.categorical(_rs_residual_logits(zs[m], drafts[m]))
-        batch._next_tokens = pend.reshape(1).astype(y.dtype)
+            # reject at m: keep the m accepted pairs (already in the cache),
+            # drop the rest of the speculative entries and the draft.
+            # entries are in pair order: the first m are the accepted pairs
+            keep = min(m, spec_entries)
+            for c in state.mtp_cache.caches:
+                _trim_to_exact(c, _cur(c) - (spec_entries - keep))
+            state.spec_next = None
+            state.cycle_spec_entries = keep
+            # pairs that did not land in the cache (stubbed draft) go through the backlog
+            state.mtp_backlog = [] if spec_entries else [(hv[:, i:i + 1, :], drafts[i]) for i in range(m)]
+            if state.prompt_ctx:
+                state.gen_pairs.extend(pairs_spec[:m])
+            if zs is not None:
+                pend = (mx.random.categorical(_rs_residual_logits_q(zs[m], zq_rows[m])) if full_q
+                        else mx.random.categorical(_rs_residual_logits(zs[m], drafts[m])))
+                batch._next_tokens = pend.reshape(1).astype(y.dtype)
+            else:
+                batch._next_tokens = t_all[:, m].astype(y.dtype)
     else:
-        batch._next_tokens = t_all[:, m].astype(y.dtype)
+        state.spec_next = None
+        state.cycle_spec_entries = 0
+        if zs is not None:
+            # pending token: bonus from the target at position m when every
+            # draft was accepted, else from the residual of the rejecting position.
+            if m == k:
+                pend = mx.random.categorical(zs[k])
+            elif full_q:
+                pend = mx.random.categorical(_rs_residual_logits_q(zs[m], zq_rows[m]))
+            else:
+                pend = mx.random.categorical(_rs_residual_logits(zs[m], drafts[m]))
+            batch._next_tokens = pend.reshape(1).astype(y.dtype)
+        else:
+            batch._next_tokens = t_all[:, m].astype(y.dtype)
+        state.mtp_backlog = [(hv[:, i:i + 1, :], drafts[i]) for i in range(m)]
     batch._next_logprobs = lp2[:, m]
     state.h_last = hv[:, m:m + 1, :]
-    state.mtp_backlog = [(hv[:, i:i + 1, :], drafts[i]) for i in range(m)]
     state.buffer = [(drafts[i], lp2[:, i]) for i in range(m)]
     state.cycle_pack = (t_all, lp2, hv, drafts, m) if m else None
     state.flush_pack = None
     mx.async_eval(
-        batch._next_tokens, batch._next_logprobs, *drafts,
+        batch._next_tokens, batch._next_logprobs, *drafts, *spec_arrays,
         *_advance_chain_arrays(batch.prompt_cache),
         *state.mtp_cache_arrays(),
         *([state.hist_buf] if state.hist_buf is not None else []),
@@ -1116,9 +1193,21 @@ def _flush_buffered(state: _MTPState, batch: Any) -> None:
     # pending token; no new draw (a residual re-sample would exclude it and
     # skew the distribution whenever a merge lands after an accept).
     batch._next_tokens = drafts[kept].reshape(1).astype(batch._next_tokens.dtype)
+    if state.cycle_spec_entries:
+        # speculative MTP entries beyond the kept pairs are dropped; the kept
+        # pairs stay in the cache (no backlog replay for them)
+        if state.mtp_cache is not None:
+            for c in state.mtp_cache.caches:
+                _trim_to_exact(c, _cur(c) - max(state.cycle_spec_entries - kept, 0))
+        state.spec_next = None
+        state.cycle_spec_entries = 0
+        spec_kept = True
+    else:
+        spec_kept = False
     batch._next_logprobs = lp2[:, kept]
     state.h_last = hv[:, kept:kept + 1, :]
-    state.mtp_backlog = [(hv[:, i:i + 1, :], drafts[i]) for i in range(kept)]
+    # with the speculative draft the kept pairs are already in the MTP cache
+    state.mtp_backlog = [] if spec_kept else [(hv[:, i:i + 1, :], drafts[i]) for i in range(kept)]
     state.buffer = []
     state.cycle_pack = None
     state.flush_pack = None
@@ -1562,6 +1651,7 @@ def apply_glm52_mtp_patch(
     prefill_cycles = _env_int(_ENV_PREFILL_CYCLES, 64, 0, 1 << 20, logger)
     proposal = _env_choice(_ENV_PROPOSAL, "argmax", {"argmax", "sample"}, logger)
     cf = _env_int(_ENV_CF, 0, 0, 1, logger) == 1
+    spec_draft = _env_int(_ENV_SPEC_DRAFT, 1, 0, 1, logger) == 1
 
     mtp = None
     try:
@@ -1615,6 +1705,7 @@ def apply_glm52_mtp_patch(
     state.prefill_cycles = prefill_cycles
     state.proposal = proposal
     state.cf = cf
+    state.spec_draft = spec_draft
     state.group = grp
     if not _install_hooks(logger):
         return model
@@ -1622,7 +1713,7 @@ def apply_glm52_mtp_patch(
     logger.info(
         f"[MTP] enabled mode={mode} k={draft_k} hidden={hidden_mode} recycle={recycle_mode} "
         f"prompt_prefill={int(prefill_enabled)} prefill_window={prefill_window} "
-        f"prefill_cycles={prefill_cycles} proposal={proposal} cf={int(cf)} "
+        f"prefill_cycles={prefill_cycles} proposal={proposal} cf={int(cf)} spec_draft={int(spec_draft)} "
         f"fast_attn={int(fast_attn)} concat={concat} "
         f"validate={int(validate)} mtp_indexer_rope_fixed={int(rope_fixed)} "
         f"weights={weights_path.name} layer_idx={layer_idx}"
