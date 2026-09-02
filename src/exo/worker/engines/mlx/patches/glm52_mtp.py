@@ -61,6 +61,7 @@ _ENV_HIDDEN = "EXO_GLM52_MTP_HIDDEN"
 _ENV_RECYCLE = "EXO_GLM52_MTP_RECYCLE"
 _ENV_PREFILL = "EXO_GLM52_MTP_PREFILL"
 _ENV_PREFILL_WINDOW = "EXO_GLM52_MTP_PREFILL_WINDOW"
+_ENV_PREFILL_CYCLES = "EXO_GLM52_MTP_PREFILL_CYCLES"
 _PREFILL_SUBCHUNK = 256
 
 _LOG_EVERY = 64
@@ -271,6 +272,9 @@ class _MTPState:
         self.hist_len = 0
         self.prefill_enabled = True
         self.prefill_window = 2048           # last W prompt pairs (0 = whole prompt)
+        self.prefill_cycles = 64             # drop prompt context after N cycles (0 = keep)
+        self.prompt_ctx = False              # MTP cache currently holds prompt context
+        self.gen_pairs: list[tuple[mx.array, mx.array]] = []
         self.pending: dict[str, Any] | None = None  # MTP cache built during prompt prefill
         self.shadow_disabled = False
         self.prev_ran = False   # exactly-once guard for the real step
@@ -304,6 +308,8 @@ class _MTPState:
         self.policy = None
         self.hist_buf = None
         self.hist_len = 0
+        self.prompt_ctx = False
+        self.gen_pairs = []
         self.shadow_disabled = False
         self.buffer = []
         self.h_last = None
@@ -865,6 +871,8 @@ def _battle_step(state: _MTPState, prev_step: Any, batch: Any):
     k = state.draft_k
     pairs = state.mtp_backlog + [(state.h_last, y.reshape(-1)[0:1])]
     state.mtp_backlog = []
+    if state.prompt_ctx:
+        state.gen_pairs.extend(pairs)          # committed pairs, in cache order
     d1, h_mtp = state.draft_multi(pairs)
     drafts = [d1]
     for _ in range(1, k):
@@ -1004,6 +1012,8 @@ def _battle_step(state: _MTPState, prev_step: Any, batch: Any):
             )
             state.p_build = state.p_resolve = state.p_post = 0.0
     state.account_cycle(m)
+    if state.prompt_ctx and state.prefill_cycles > 0 and state.cycles >= state.prefill_cycles:
+        _drop_prompt_context(state)
     if state.validate:
         _validate_cycle(state, batch, m, base=base_off)
     return [ti], [_lp_row(y_lp)]
@@ -1291,6 +1301,35 @@ def mtp_prefill_chunk(model: Any, chunk_tokens: list[int]) -> None:
         state.pending = None
 
 
+def _drop_prompt_context(state: _MTPState) -> None:
+    """The head drafts better once it has its own context (measured: prompt
+    context lifts the first window but lowers steady state). Rebuild the MTP
+    cache from the committed generated pairs only. Never raises: on failure
+    the prompt-backed cache simply stays."""
+    from mlx_lm.models.cache import CacheList, KVCache
+
+    try:
+        pairs = state.gen_pairs
+        fresh = CacheList(KVCache(), KVCache())
+        if pairs:
+            h_seq = mx.concatenate([h for h, _ in pairs], axis=1)
+            t_seq = mx.concatenate([t.reshape(1, 1).astype(mx.uint32) for _, t in pairs], axis=1)
+            for a in range(0, len(pairs), _PREFILL_SUBCHUNK):
+                b = min(a + _PREFILL_SUBCHUNK, len(pairs))
+                state.ingest(fresh, h_seq[:, a:b, :], t_seq[:, a:b])
+        mx.eval(*[arr for c in fresh.caches for arr in (c.keys, c.values) if arr is not None])
+        state.mtp_cache = fresh
+        state.logger.info(
+            f"[MTP] uid={state.uid} prompt context dropped after {state.cycles} cycles "
+            f"(re-ingested {len(pairs)} generated pairs)"
+        )
+    except Exception:
+        state.logger.opt(exception=True).warning("[MTP] prompt context drop failed; keeping it")
+    finally:
+        state.prompt_ctx = False
+        state.gen_pairs = []
+
+
 def _adopt_prefill(state: _MTPState, batch: Any) -> None:
     """At request start: attach the prompt-prefilled MTP cache if it belongs
     to this request's prompt, ingesting the final carried pair."""
@@ -1330,6 +1369,8 @@ def _adopt_prefill(state: _MTPState, batch: Any) -> None:
             mx.array([[last_tok]], dtype=mx.uint32),
         )
         state.mtp_cache = pend["cache"]
+        state.prompt_ctx = True
+        state.gen_pairs = []
         state.logger.info(
             f"[MTP] uid={state.uid} prompt ingested: {pend['ingested'] + 1} pairs "
             f"(mtp_offset={_cur(state.mtp_cache[0])}) in {time.perf_counter() - pend['t0']:.1f}s"
@@ -1427,6 +1468,7 @@ def apply_glm52_mtp_patch(
     recycle_mode = _env_choice(_ENV_RECYCLE, "post", {"post", "pre"}, logger)
     prefill_enabled = _env_int(_ENV_PREFILL, 1, 0, 1, logger) == 1
     prefill_window = _env_int(_ENV_PREFILL_WINDOW, 2048, 0, 1 << 20, logger)
+    prefill_cycles = _env_int(_ENV_PREFILL_CYCLES, 64, 0, 1 << 20, logger)
 
     mtp = None
     try:
@@ -1477,6 +1519,7 @@ def apply_glm52_mtp_patch(
     state.recycle = recycle_mode
     state.prefill_enabled = prefill_enabled
     state.prefill_window = prefill_window
+    state.prefill_cycles = prefill_cycles
     state.group = grp
     if not _install_hooks(logger):
         return model
@@ -1484,6 +1527,7 @@ def apply_glm52_mtp_patch(
     logger.info(
         f"[MTP] enabled mode={mode} k={draft_k} hidden={hidden_mode} recycle={recycle_mode} "
         f"prompt_prefill={int(prefill_enabled)} prefill_window={prefill_window} "
+        f"prefill_cycles={prefill_cycles} "
         f"fast_attn={int(fast_attn)} concat={concat} "
         f"validate={int(validate)} mtp_indexer_rope_fixed={int(rope_fixed)} "
         f"weights={weights_path.name} layer_idx={layer_idx}"

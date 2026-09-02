@@ -1508,3 +1508,37 @@ def test_prompt_ingest_window_keeps_last_pairs(off_stream, sidecar):
         assert mx.allclose(st2.pending["cache"][0].keys[..., :5, :], st3.mtp_cache[0].keys[..., :5, :], atol=1e-5).item()
     finally:
         _detach(model)
+
+
+def test_prompt_context_dropped_after_n_cycles(off_stream, sidecar):
+    from exo.worker.engines.mlx.patches import glm52_mtp as gm
+    from mlx_lm.generate import BatchGenerator
+
+    model, ref = off_stream
+    prefix = PROMPT[:-1]
+    state = _battle_state(model, sidecar, k=1)
+    state.prefill_cycles = 4
+    _attach(model, state)
+    try:
+        gm.mtp_prefill_begin(model, 0, len(prefix))
+        _capture_prompt_hidden(model, prefix)
+        gm.mtp_prefill_chunk(model, prefix)
+        bg = BatchGenerator(model, stop_tokens=None, prefill_step_size=64,
+                            completion_batch_size=4, prefill_batch_size=2)
+        bg.insert([list(PROMPT)], max_tokens=[N_GEN], samplers=[_GreedyPolicySampler()])
+        toks, last = [], None
+        for _ in range(N_GEN * 3 + 32):
+            out = bg.next()
+            rs = out[1] if isinstance(out, tuple) else out
+            for r in rs or []:
+                toks.append(r.token); last = r
+            if last is not None and last.finish_reason is not None:
+                break
+    finally:
+        _detach(model)
+    assert any("prompt ingested" in l for l in state.logger.lines)
+    assert any("prompt context dropped after 4 cycles" in l for l in state.logger.lines), state.logger.lines
+    assert not state.prompt_ctx
+    line = next(l for l in state.logger.lines if "prompt context dropped" in l)
+    assert "re-ingested 4 generated pairs" in line, line   # one committed pair per cycle (k=1)
+    assert toks == ref                                    # mechanics untouched
