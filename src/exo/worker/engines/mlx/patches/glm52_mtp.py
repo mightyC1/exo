@@ -1293,7 +1293,11 @@ def mtp_prefill_chunk(model: Any, chunk_tokens: list[int]) -> None:
         for a in range(0, n_pairs, _PREFILL_SUBCHUNK):
             b = min(a + _PREFILL_SUBCHUNK, n_pairs)
             state.ingest(pend["cache"], h_seq[:, a:b, :], tok_seq[:, a:b])
-            mx.eval(*[arr for c in pend["cache"].caches for arr in (c.keys, c.values) if arr is not None])
+            # Keep the graph shallow without a host-side sync inside exo's
+            # prefill loop (the chunk's TP all-reduce is in flight on the
+            # comm stream under --fast-sync); materialization happens at the
+            # seed step.
+            mx.async_eval(*[arr for c in pend["cache"].caches for arr in (c.keys, c.values) if arr is not None])
         pend["carry_h"] = h[:, -1:, :]
         pend["n"] += L
         pend["ingested"] += n_pairs
@@ -1319,7 +1323,7 @@ def _drop_prompt_context(state: _MTPState) -> None:
             for a in range(0, len(pairs), _PREFILL_SUBCHUNK):
                 b = min(a + _PREFILL_SUBCHUNK, len(pairs))
                 state.ingest(fresh, h_seq[:, a:b, :], t_seq[:, a:b])
-        mx.eval(*[arr for c in fresh.caches for arr in (c.keys, c.values) if arr is not None])
+        mx.async_eval(*[arr for c in fresh.caches for arr in (c.keys, c.values) if arr is not None])
         # Do not free the prompt-backed cache mid-request: an async train and
         # the TP collectives are in flight; keep it referenced until finish().
         if state.mtp_cache is not None:
