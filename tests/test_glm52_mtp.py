@@ -1444,3 +1444,35 @@ def test_prompt_ingest_skipped_on_prefix_hit_or_mismatch(off_stream, sidecar):
         assert any("prompt mismatch" in line for line in state.logger.lines)
     finally:
         _detach(model)
+
+
+def test_prompt_ingest_adopts_with_prod_two_token_insert(off_stream, sidecar):
+    """exo inserts only the last two prompt tokens after its own prefill:
+    tokens[0] is a one-token tail at the seed step; adoption must still
+    match structurally (suffix + main cache position + pending token)."""
+    from exo.worker.engines.mlx.patches import glm52_mtp as gm
+    from mlx_lm.models.cache import CacheList, KVCache
+
+    model, _ = off_stream
+    prompt = list(PROMPT)
+    prefix = prompt[:-1]
+    state = _battle_state(model, sidecar, k=1); _attach(model, state)
+    try:
+        gm.mtp_prefill_begin(model, 0, len(prefix))
+        _capture_prompt_hidden(model, prefix)
+        gm.mtp_prefill_chunk(model, prefix)
+        n = state.pending["n"]
+        main = CacheList(KVCache(), KVCache())
+        main.caches[0].offset = n
+        main.caches[1].offset = n
+
+        class B:
+            tokens = [[prompt[-2]]]                            # exo's two-token insert, one committed
+            _next_tokens = mx.array([prompt[-1]], dtype=mx.uint32)
+            prompt_cache = [main]
+        state.start_request(uid=3)
+        gm._adopt_prefill(state, B())
+        assert any("prompt ingested" in line for line in state.logger.lines), state.logger.lines[-2:]
+        assert state.mtp_cache[0].offset == len(prompt) - 1
+    finally:
+        _detach(model)

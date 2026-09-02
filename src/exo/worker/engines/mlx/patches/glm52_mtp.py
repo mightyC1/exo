@@ -1285,19 +1285,31 @@ def _adopt_prefill(state: _MTPState, batch: Any) -> None:
     state.pending = None
     if pend is None or pend["carry_h"] is None:
         return
-    prompt = list(batch.tokens[0])
+    t = list(batch.tokens[0])
     n = pend["n"]
-    # At the seed step the pin has committed prompt[:n] and holds the last
-    # prompt token as the pending input (_next_tokens); some paths already
-    # list it in tokens. Either way the final pair token is prompt[n].
-    if len(prompt) == n + 1:
-        last_tok = int(prompt[n])
-    elif len(prompt) == n and batch._next_tokens is not None:
+    toks = pend["toks"]
+    # Structural match. exo prefills prompt[:-1] itself and inserts only the
+    # last two tokens into the generator, so at the seed step tokens[0] is a
+    # short tail (prod) or the full prefix (pin harness); either way it must
+    # be a suffix of what we ingested, the main cache must sit at position n
+    # (prompt[:n] committed), and the last prompt token is either listed or
+    # pending as _next_tokens.
+    try:
+        main_pos = _cur(batch.prompt_cache[0][0])
+    except Exception:
+        main_pos = None
+    if len(t) == n + 1:
+        tail_ok, last_tok = (t[:n] == toks), int(t[n])
+    elif 0 < len(t) <= n and batch._next_tokens is not None:
+        tail_ok = toks[n - len(t):] == t
         last_tok = int(batch._next_tokens.reshape(-1)[0].item())
     else:
-        last_tok = None
-    if last_tok is None or prompt[:n] != pend["toks"]:
-        state.logger.info("[MTP] prompt ingest discarded: prompt mismatch")
+        tail_ok, last_tok = False, None
+    if last_tok is None or not tail_ok or (main_pos is not None and main_pos != n):
+        state.logger.info(
+            f"[MTP] prompt ingest discarded: prompt mismatch "
+            f"(tokens={len(t)} n={n} main_pos={main_pos})"
+        )
         return
     try:
         state.ingest(
