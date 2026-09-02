@@ -62,6 +62,8 @@ _ENV_RECYCLE = "EXO_GLM52_MTP_RECYCLE"
 _ENV_PREFILL = "EXO_GLM52_MTP_PREFILL"
 _ENV_PREFILL_WINDOW = "EXO_GLM52_MTP_PREFILL_WINDOW"
 _ENV_PREFILL_CYCLES = "EXO_GLM52_MTP_PREFILL_CYCLES"
+_ENV_PROPOSAL = "EXO_GLM52_MTP_PROPOSAL"
+_ENV_CF = "EXO_GLM52_MTP_CF"
 _PREFILL_SUBCHUNK = 256
 
 _LOG_EVERY = 64
@@ -276,6 +278,10 @@ class _MTPState:
         self.prompt_ctx = False              # MTP cache currently holds prompt context
         self.gen_pairs: list[tuple[mx.array, mx.array]] = []
         self.retired: list[Any] = []         # caches swapped out mid-request; freed at finish
+        self.proposal = "argmax"             # draft proposal under sampling: argmax | sample
+        self.cf = False                      # counterfactual telemetry (alpha one-hot vs full-q)
+        self.cf_acc: mx.array | None = None  # lazy (2,) accumulator [alpha_onehot, alpha_fullq]
+        self.cf_n = 0
         self.pending: dict[str, Any] | None = None  # MTP cache built during prompt prefill
         self.shadow_disabled = False
         self.prev_ran = False   # exactly-once guard for the real step
@@ -312,6 +318,8 @@ class _MTPState:
         self.prompt_ctx = False
         self.gen_pairs = []
         self.retired = []                    # nothing in flight between requests: safe to free
+        self.cf_acc = None
+        self.cf_n = 0
         self.shadow_disabled = False
         self.buffer = []
         self.h_last = None
@@ -379,6 +387,7 @@ class _MTPState:
             self.logger.info(
                 f"[MTP] uid={self.uid} cycles={self.cycles} k={self.draft_k} "
                 f"mode={'rs' if self.request_sampling else 'greedy'} "
+                f"{self._cf_str()}"
                 f"proposed={self.proposed} accepted={self.accepted} "
                 f"accept_rate={self.accepted / self.proposed:.3f} "
                 f"a1={a1:.3f} a2={a2:.3f} a3={a3:.3f} out={self.out_tokens} "
@@ -393,7 +402,8 @@ class _MTPState:
             a3 = self.acc_pos[2] / max(self.acc_pos[1], 1)
             self.logger.info(
                 f"[MTP_SUMMARY] ({why}) uid={self.uid} req_cycles={self.cycles} "
-                f"mode={'rs' if self.request_sampling else 'greedy'} "
+                f"mode={'rs' if self.request_sampling else 'greedy'} proposal={self.proposal} "
+                f"{self._cf_str()}"
                 f"k={self.draft_k} proposed={self.proposed} accepted={self.accepted} "
                 f"accept_rate={self.accepted / max(self.proposed, 1):.3f} "
                 f"a1={a1:.3f} a2={a2:.3f} a3={a3:.3f} out={self.out_tokens} "
@@ -434,12 +444,44 @@ class _MTPState:
         # our measured-better pre-norm *target* hidden). A/B via env.
         h_raw = y[:, -1:, :]
         h_post = self.mtp.head_norm(h_raw)
-        logits = self.lm_head(h_post)
+        logits = self.lm_head(h_post)[..., -1, :]                  # (1, V)
         h_rec = h_post if self.recycle == "post" else h_raw
-        return mx.argmax(logits[..., -1, :], axis=-1).reshape(1), h_rec
+        if self.proposal == "sample" and self.request_sampling and self.policy is not None:
+            # Full-q proposal: draft ~ q = the head's own distribution under the
+            # request's sampling transform; acceptance becomes 1 - TV(p, q).
+            zq = _target_logits(logits - mx.logsumexp(logits, axis=-1, keepdims=True), self.policy)
+            return mx.random.categorical(zq).reshape(1), h_rec, zq
+        return mx.argmax(logits, axis=-1).reshape(1), h_rec, logits
+
+    def _cf_str(self) -> str:
+        if not self.cf or self.cf_acc is None or self.cf_n == 0:
+            return ""
+        try:
+            a, b = (float(x) / self.cf_n for x in self.cf_acc.tolist())
+            return f"cf_onehot={a:.3f} cf_fullq={b:.3f} "
+        except Exception:
+            return ""
 
     def draft(self, h_last: mx.array, next_tok: mx.array) -> mx.array:
         return self.draft_multi([(h_last, next_tok)])[0]
+
+    def cf_update(self, zp: mx.array, zq_raw: mx.array | None, d: mx.array) -> None:
+        """Counterfactual telemetry: alpha_onehot = p(argmax q) (what the
+        one-hot proposal accepts) and alpha_fullq = sum(min(p, q)) (what the
+        full-q proposal would). zp: target logits (1, V); zq_raw: head logits
+        (1, V) in whichever form draft_multi returned (raw or transformed)."""
+        if zq_raw is None or self.policy is None:
+            return
+        p = mx.softmax(zp, axis=-1)
+        zq = zq_raw if self.proposal == "sample" else _target_logits(
+            zq_raw - mx.logsumexp(zq_raw, axis=-1, keepdims=True), self.policy
+        )
+        q = mx.softmax(zq, axis=-1)
+        a_onehot = mx.take_along_axis(p, mx.argmax(q, axis=-1, keepdims=True), axis=-1).reshape(1)
+        a_fullq = mx.sum(mx.minimum(p, q), axis=-1).reshape(1)
+        upd = mx.concatenate([a_onehot, a_fullq]).astype(mx.float32)
+        self.cf_acc = upd if self.cf_acc is None else self.cf_acc + upd
+        self.cf_n += 1
 
     def ingest(self, cache: Any, h_seq: mx.array, tok_seq: mx.array) -> None:
         """Feed (h_i, t_{i+1}) pairs through the MTP block into ``cache`` with
@@ -533,6 +575,29 @@ def _rs_accepts_vec(z_rows: mx.array, drafts: list[mx.array], u: mx.array) -> li
     hits = (mx.log(u) < log_pd).astype(mx.int32)
     prefix = mx.cumprod(hits)
     return [prefix[j:j + 1].astype(mx.bool_) for j in range(k)]
+
+
+def _rs_accepts_q(z_rows: mx.array, zq_rows: list[mx.array], drafts: list[mx.array], u: mx.array) -> list[mx.array]:
+    """Speculative sampling with proposal q: accept d_j w.p. min(1, p_j(d_j)/q_j(d_j))."""
+    k = len(drafts)
+    d = mx.concatenate([x.reshape(1).astype(mx.int32) for x in drafts]).reshape(k, 1)
+    zk = z_rows[:k]
+    log_p = mx.take_along_axis(zk, d, axis=-1).reshape(k) - mx.logsumexp(zk, axis=-1)
+    zq = mx.concatenate([z.reshape(1, -1) for z in zq_rows[:k]], axis=0)
+    log_q = mx.take_along_axis(zq, d, axis=-1).reshape(k) - mx.logsumexp(zq, axis=-1)
+    thresh = mx.minimum(log_p - log_q, mx.array(0.0, dtype=log_p.dtype))
+    hits = (mx.log(u) < thresh).astype(mx.int32)
+    prefix = mx.cumprod(hits)
+    return [prefix[j:j + 1].astype(mx.bool_) for j in range(k)]
+
+
+def _rs_residual_logits_q(zp: mx.array, zq: mx.array) -> mx.array:
+    """Logits of norm(max(p - q, 0)) — the distribution to sample from after
+    rejecting a draft proposed from q (-inf where p <= q)."""
+    p = mx.softmax(zp, axis=-1)
+    q = mx.softmax(zq.reshape(p.shape), axis=-1)
+    r = mx.maximum(p - q, 0.0)
+    return mx.where(r > 0, mx.log(mx.maximum(r, 1e-30)), mx.array(-float("inf"), dtype=r.dtype))
 
 
 def _rs_residual_logits(z: mx.array, d: mx.array) -> mx.array:
@@ -875,14 +940,18 @@ def _battle_step(state: _MTPState, prev_step: Any, batch: Any):
     state.mtp_backlog = []
     if state.prompt_ctx:
         state.gen_pairs.extend(pairs)          # committed pairs, in cache order
-    d1, h_mtp = state.draft_multi(pairs)
+    res = state.draft_multi(pairs)
+    d1, h_mtp = res[0], res[1]
+    zq_rows = [res[2] if len(res) > 2 else None]
     drafts = [d1]
     for _ in range(1, k):
         # chained proposal: the MTP block's own post-norm output stands in
         # for the (not yet computed) main-model hidden of the previous draft.
         # GLM-5 trains the head with 3 parameter-shared steps, so the chain
         # is in-distribution up to k=3.
-        d_next, h_mtp = state.draft_multi([(h_mtp, drafts[-1])])
+        res = state.draft_multi([(h_mtp, drafts[-1])])
+        d_next, h_mtp = res[0], res[1]
+        zq_rows.append(res[2] if len(res) > 2 else None)
         drafts.append(d_next)
 
     base_off = _cur(batch.prompt_cache[0][0]) if state.validate else None
@@ -908,7 +977,13 @@ def _battle_step(state: _MTPState, prev_step: Any, batch: Any):
         z_rows = _target_logits(lp2[0], state.policy)          # (k+1, V) in one pass
         zs = [z_rows[j:j + 1] for j in range(k + 1)]
         u = mx.random.uniform(shape=(k,))
-        accs = _rs_accepts_vec(z_rows, drafts, u)
+        full_q = state.proposal == "sample" and all(z is not None for z in zq_rows)
+        if full_q:
+            accs = _rs_accepts_q(z_rows, zq_rows, drafts, u)
+        else:
+            accs = _rs_accepts_vec(z_rows, drafts, u)
+        if state.cf:
+            state.cf_update(zs[0], zq_rows[0], drafts[0])
     else:
         accs = []
         prev = None
@@ -976,6 +1051,8 @@ def _battle_step(state: _MTPState, prev_step: Any, batch: Any):
         # was accepted, else from the residual of the rejecting position.
         if m == k:
             pend = mx.random.categorical(zs[k])
+        elif full_q:
+            pend = mx.random.categorical(_rs_residual_logits_q(zs[m], zq_rows[m]))
         else:
             pend = mx.random.categorical(_rs_residual_logits(zs[m], drafts[m]))
         batch._next_tokens = pend.reshape(1).astype(y.dtype)
@@ -992,6 +1069,7 @@ def _battle_step(state: _MTPState, prev_step: Any, batch: Any):
         *_advance_chain_arrays(batch.prompt_cache),
         *state.mtp_cache_arrays(),
         *([state.hist_buf] if state.hist_buf is not None else []),
+        *([state.cf_acc] if state.cf_acc is not None else []),
     )
 
     batch._current_tokens = y
@@ -1482,6 +1560,8 @@ def apply_glm52_mtp_patch(
     prefill_enabled = _env_int(_ENV_PREFILL, 1, 0, 1, logger) == 1
     prefill_window = _env_int(_ENV_PREFILL_WINDOW, 2048, 0, 1 << 20, logger)
     prefill_cycles = _env_int(_ENV_PREFILL_CYCLES, 64, 0, 1 << 20, logger)
+    proposal = _env_choice(_ENV_PROPOSAL, "argmax", {"argmax", "sample"}, logger)
+    cf = _env_int(_ENV_CF, 0, 0, 1, logger) == 1
 
     mtp = None
     try:
@@ -1533,6 +1613,8 @@ def apply_glm52_mtp_patch(
     state.prefill_enabled = prefill_enabled
     state.prefill_window = prefill_window
     state.prefill_cycles = prefill_cycles
+    state.proposal = proposal
+    state.cf = cf
     state.group = grp
     if not _install_hooks(logger):
         return model
@@ -1540,7 +1622,7 @@ def apply_glm52_mtp_patch(
     logger.info(
         f"[MTP] enabled mode={mode} k={draft_k} hidden={hidden_mode} recycle={recycle_mode} "
         f"prompt_prefill={int(prefill_enabled)} prefill_window={prefill_window} "
-        f"prefill_cycles={prefill_cycles} "
+        f"prefill_cycles={prefill_cycles} proposal={proposal} cf={int(cf)} "
         f"fast_attn={int(fast_attn)} concat={concat} "
         f"validate={int(validate)} mtp_indexer_rope_fixed={int(rope_fixed)} "
         f"weights={weights_path.name} layer_idx={layer_idx}"

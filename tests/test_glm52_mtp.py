@@ -764,7 +764,7 @@ def test_chain_recycles_post_norm(sidecar):
                  store={}, logger=_StubLogger(), draft_k=2)
     st.start_request(uid=1)
     h = mx.random.normal((1, 1, HID)).astype(mx.bfloat16)
-    _, h_rec = st.draft_multi([(h, mx.array([5], dtype=mx.uint32))])
+    _, h_rec, _ = st.draft_multi([(h, mx.array([5], dtype=mx.uint32))])
     # re-run the block computation manually on a fresh state to compare
     st2 = _State2(mode="on", concat="eh", mtp=m, embed=embed, lm_head=lm_head,
                   store={}, logger=_StubLogger(), draft_k=2)
@@ -1127,10 +1127,22 @@ def test_rs_kernel_matches_target_distribution():
     assert 0.0 < float(mx.mean(accept).item()) < 1.0
 
 
-def _run_rs(model, sidecar, n, k, seed, draft_override=None, temperature=0.5, min_p=0.0):
+def _run_rs(model, sidecar, n, k, seed, draft_override=None, temperature=0.5, min_p=0.0,
+            proposal="argmax"):
     samp = _GreedyPolicySampler(greedy=False, temperature=temperature, min_p=min_p)
     mx.random.seed(seed)
-    return _run_on(model, sidecar, n, draft_override, k=k, sampler=samp)
+    holder = []
+    state = _battle_state(model, sidecar, draft_override=None, k=k)
+    state.proposal = proposal
+    if draft_override is not None:
+        state.draft_multi = draft_override(holder)  # type: ignore[method-assign]
+    holder.append(state)
+    _attach(model, state)
+    try:
+        _, toks, last = _run_bg(model, PROMPT, n, sampler=samp, processors=None)
+    finally:
+        _detach(model)
+    return state, toks, last
 
 
 @pytest.mark.parametrize("k", [1, 2])
@@ -1147,10 +1159,11 @@ def test_rs_pipeline_deterministic_and_consistent(off_stream, sidecar, k):
     assert last1.prompt_cache[0][1].offset == last1.prompt_cache[0][0].offset
 
 
-def test_rs_second_token_matches_exact_target(off_stream, sidecar):
+@pytest.mark.parametrize("proposal", ["argmax", "sample"])
+def test_rs_second_token_matches_exact_target(off_stream, sidecar, proposal):
     """Pipeline-level distribution gate: the second generated token (first
     produced by the RS cycle) must follow the exact target distribution
-    conditioned on the first (seed-step) token."""
+    conditioned on the first (seed-step) token — for both proposals."""
     from exo.worker.engines.mlx.patches.glm52_mtp import _target_logits
 
     model, _ = off_stream
@@ -1159,7 +1172,7 @@ def test_rs_second_token_matches_exact_target(off_stream, sidecar):
     pol = {"temperature": 0.15, "top_p": 1.0, "min_p": 0.0, "top_k": 0}
     pairs = []
     for seed in range(300):
-        _, toks, _ = _run_rs(model, sidecar, 2, 1, seed=seed, temperature=0.15)
+        _, toks, _ = _run_rs(model, sidecar, 2, 1, seed=seed, temperature=0.15, proposal=proposal)
         pairs.append((toks[0], toks[1]))
     from collections import Counter
     first = Counter(t1 for t1, _ in pairs).most_common(1)[0][0]
@@ -1582,3 +1595,68 @@ def test_prompt_ingest_after_prefix_cache_hit(off_stream, sidecar):
         assert state.mtp_cache[0].offset == len(prefill_toks)   # suffix pairs only
     finally:
         _detach(model)
+
+
+
+# ---------------------------------------------------------------------------
+# 0041: full-q proposal (draft ~ q, accept min(1, p/q), residual max(p-q, 0))
+# ---------------------------------------------------------------------------
+
+
+def test_rs_kernel_full_q_matches_target_distribution():
+    from exo.worker.engines.mlx.patches.glm52_mtp import (
+        _rs_accepts_q, _rs_residual_logits_q, _target_logits,
+    )
+
+    mx.random.seed(1)
+    V, N = 97, 20000
+    pol = {"temperature": 0.8, "top_p": 1.0, "min_p": 0.0, "top_k": 0}
+    zp = _target_logits(mx.log(mx.softmax(mx.random.normal((1, V)) * 2.0, axis=-1)), pol)
+    zq = _target_logits(mx.log(mx.softmax(mx.random.normal((1, V)) * 2.0 + 0.3 * zp, axis=-1)), pol)
+    p = mx.softmax(zp, axis=-1).reshape(-1)
+    d = mx.random.categorical(mx.broadcast_to(zq, (N, V)))            # draft ~ q
+    u = mx.random.uniform(shape=(N,))
+    accs = [_rs_accepts_q(zp, [zq], [d[i:i + 1]], u[i:i + 1])[0] for i in range(0)]  # (per-trial API check below)
+    # vectorized acceptance identical to _rs_accepts_q's math
+    log_p = mx.take_along_axis(mx.broadcast_to(zp, (N, V)), d.reshape(N, 1), axis=-1).reshape(N) - mx.logsumexp(zp, axis=-1)
+    log_q = mx.take_along_axis(mx.broadcast_to(zq, (N, V)), d.reshape(N, 1), axis=-1).reshape(N) - mx.logsumexp(zq, axis=-1)
+    accept = mx.log(u) < mx.minimum(log_p - log_q, mx.array(0.0))
+    res = mx.random.categorical(mx.broadcast_to(_rs_residual_logits_q(zp, zq), (N, V)))
+    toks = mx.where(accept, d.astype(res.dtype), res)
+    emp = mx.zeros((V,)).at[toks].add(mx.ones((N,))) / N
+    tv = 0.5 * float(mx.sum(mx.abs(emp - p)).item())
+    assert tv < 0.02, tv
+    # the per-trial kernel agrees with the vectorized math on a few draws
+    for i in range(50):
+        a = bool(_rs_accepts_q(zp, [zq], [d[i:i + 1]], u[i:i + 1])[0].item())
+        assert a == bool(accept[i].item()), i
+    alpha = float(mx.mean(accept).item())
+    assert 0.2 < alpha < 1.0, alpha
+
+
+@pytest.mark.parametrize("k", [1, 2])
+def test_rs_full_q_pipeline_deterministic_and_consistent(off_stream, sidecar, k):
+    model, _ = off_stream
+    st1, toks1, last1 = _run_rs(model, sidecar, 40, k, seed=17, temperature=0.7, proposal="sample")
+    st2, toks2, last2 = _run_rs(model, sidecar, 40, k, seed=17, temperature=0.7, proposal="sample")
+    assert st1.cycles > 0 and st1.accepted > 0
+    assert toks1 == toks2
+    assert last1.finish_reason == "length"
+    assert last1.prompt_cache[0][0].offset == len(last1.all_tokens)
+
+
+def test_cf_telemetry_accumulates(off_stream, sidecar):
+    model, _ = off_stream
+    samp = _GreedyPolicySampler(greedy=False, temperature=0.7)
+    mx.random.seed(5)
+    state = _battle_state(model, sidecar, k=1)
+    state.cf = True
+    _attach(model, state)
+    try:
+        _run_bg(model, PROMPT, 20, sampler=samp)
+    finally:
+        _detach(model)
+    line = next(l for l in state.logger.lines if "MTP_SUMMARY" in l)
+    assert "cf_onehot=" in line and "cf_fullq=" in line, line
+    vals = {kv.split("=")[0]: float(kv.split("=")[1]) for kv in line.split() if kv.startswith("cf_")}
+    assert 0.0 <= vals["cf_onehot"] <= 1.0 and 0.0 <= vals["cf_fullq"] <= 1.0
