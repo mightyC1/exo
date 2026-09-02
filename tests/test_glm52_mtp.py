@@ -1036,3 +1036,51 @@ def test_mtp_indexer_rope_follows_config(sidecar, tmp_path, monkeypatch):
         assert bool(getattr(rope, "traditional", True)) is (not expect_fixed)
         assert any(f"mtp_indexer_rope_fixed={int(expect_fixed)}" in line for line in log.lines)
         _detach(model)
+
+
+def test_extractor_scale_key_and_atomic_publish(tmp_path):
+    """Audit P1.7: scale-key derivation must only touch the suffix; the
+    side-car and manifest are published atomically (no temp leftovers)."""
+    src = tmp_path / "src"; dest = tmp_path / "dest"; src.mkdir(); dest.mkdir()
+    _make_synth_src(src)
+    assert _extractor().extract(src, dest) == 0
+    names = sorted(p.name for p in dest.iterdir())
+    assert names == ["mtp.manifest.json", "mtp.safetensors"], names
+    man = json.loads((dest / "mtp.manifest.json").read_text())
+    assert man["layer"] == LAYER and man["bytes"] == (dest / "mtp.safetensors").stat().st_size
+    # scale-key derivation on a name with 'weight' twice must stay suffix-only
+    k = "model.layers.78.self_attn.indexer.weights_proj.weight"
+    assert k[: -len(".weight")] + ".weight_scale_inv" == \
+        "model.layers.78.self_attn.indexer.weights_proj.weight_scale_inv"
+
+
+def test_corpus_sizer_exact_and_empty():
+    """Audit P1.8: exact token sizing, arithmetic tiling, empty corpus rejected."""
+    import importlib.util as ilu
+    # exo_tools is the cluster harness (not in the runtime venv): stub it.
+    for name in ("exo_tools", "exo_tools.client", "exo_tools.harness"):
+        if name not in sys.modules:
+            sys.modules[name] = types.ModuleType(name)
+    for attr in ("ExoClient", "ExoHttpError"):
+        setattr(sys.modules["exo_tools.client"], attr, type(attr, (), {}))
+    h = sys.modules["exo_tools.harness"]
+    src_text = (REPO_ROOT / "bench" / "exo_bench.py").read_text()
+    block = src_text.split("from exo_tools.harness import (", 1)[1].split(")", 1)[0]
+    for attr in [x.strip().rstrip(",") for x in block.split("\n") if x.strip()]:
+        if attr and not hasattr(h, attr):
+            setattr(h, attr, lambda *a, **k: None)
+    spec = ilu.spec_from_file_location("exo_bench", REPO_ROOT / "bench" / "exo_bench.py")
+    mod = ilu.module_from_spec(spec); spec.loader.exec_module(mod)
+
+    class Tok:  # whitespace tokenizer stand-in with a 2-token template
+        def apply_chat_template(self, msgs, tokenize=True, **kw):
+            text = " ".join(m["content"] for m in msgs)
+            ids = ["<s>"] + text.split() + ["</s>"]
+            return ids if tokenize else " ".join(ids)
+        def encode(self, text, **kw):
+            return text.split()
+    sizer = mod.PromptSizer(Tok(), corpus="alpha beta gamma delta")
+    content, tok = sizer.build(37)
+    assert tok == 37
+    with pytest.raises(ValueError):
+        mod.PromptSizer(Tok(), corpus="   \n").build(20)

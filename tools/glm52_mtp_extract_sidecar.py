@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -129,7 +130,7 @@ def _dequant_all(raw: dict[str, mx.array]) -> dict[str, mx.array]:
     for k, v in raw.items():
         if k.endswith("weight_scale_inv"):
             continue
-        sk = k.replace("weight", "weight_scale_inv") if k.endswith(".weight") else None
+        sk = k[: -len(".weight")] + ".weight_scale_inv" if k.endswith(".weight") else None
         if sk is not None and sk in raw:
             out[k] = dequant_block_fp8(v, raw[sk])
             n_fp8 += 1
@@ -258,6 +259,7 @@ def extract(src: Path, dest: Path) -> int:
 
     dest.mkdir(parents=True, exist_ok=True)
     out_path = dest / "mtp.safetensors"
+    tmp_path = dest / ".mtp.partial.safetensors"
     meta = {
         "format": "mlx-mtp-sidecar-v1",
         "source": str(src),
@@ -265,7 +267,12 @@ def extract(src: Path, dest: Path) -> int:
         "quant": json.dumps({"group_size": GROUP_SIZE, "bits": BITS,
                              "mode": "affine"}),
     }
-    mx.save_safetensors(str(out_path), final, metadata=meta)
+    # Atomic publish: write+fsync a temp file, then os.replace, so an
+    # interrupted run never leaves a partial side-car under the final name.
+    mx.save_safetensors(str(tmp_path), final, metadata=meta)
+    with open(tmp_path, "rb+") as fh:
+        os.fsync(fh.fileno())
+    os.replace(tmp_path, out_path)
 
     sha = hashlib.sha256()
     with open(out_path, "rb") as fh:
@@ -273,6 +280,7 @@ def extract(src: Path, dest: Path) -> int:
             sha.update(chunk)
     manifest = {
         "file": out_path.name,
+        "layer": MTP_LAYER,
         "sha256": sha.hexdigest(),
         "bytes": out_path.stat().st_size,
         "tensors": len(final),
@@ -285,7 +293,12 @@ def extract(src: Path, dest: Path) -> int:
         },
         "source": str(src),
     }
-    (dest / "mtp.manifest.json").write_text(json.dumps(manifest, indent=2))
+    man_tmp = dest / "mtp.manifest.json.tmp"
+    with open(man_tmp, "w") as fh:
+        fh.write(json.dumps(manifest, indent=2))
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(man_tmp, dest / "mtp.manifest.json")
     print(
         f"[MTP-SIDE-CAR] OK dest={out_path} tensors={len(final)} "
         f"quantized={n_q} bf16/f32={n_bf16} "

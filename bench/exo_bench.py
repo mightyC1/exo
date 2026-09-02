@@ -361,10 +361,15 @@ def run_one_completion(
 
 
 def _corpus_build(sizer: "PromptSizer", target: int) -> tuple[str, int]:
-    text = sizer.corpus or ""
-    # Tile the document until a full-corpus prompt overshoots the target.
-    while sizer.count_fn(text + sizer.tail) < target:
-        text += "\n\n" + (sizer.corpus or "")
+    corpus = (sizer.corpus or "").strip()
+    if not corpus:
+        raise ValueError("--prompt-corpus file is empty")
+    # Tile arithmetically (no repeated re-tokenization of a growing string).
+    one = sizer.count_fn(corpus + sizer.tail)
+    reps = max(1, -(-target // max(one - sizer.base_tokens, 1)) + 1)
+    text = "\n\n".join([corpus] * reps)
+    if sizer.count_fn(text + sizer.tail) < target:
+        raise RuntimeError("corpus tiling could not reach the target token count")
     lo, hi = 0, len(text)
     while lo < hi:
         mid = (lo + hi) // 2
@@ -372,7 +377,19 @@ def _corpus_build(sizer: "PromptSizer", target: int) -> tuple[str, int]:
             lo = mid + 1
         else:
             hi = mid
-    content = text[:lo] + sizer.tail
+    # BPE token counts are not strictly monotone in character count: scan a
+    # small window around the binary-search answer for an exact hit.
+    best = None
+    for n in range(max(0, lo - 8), min(len(text), lo + 8) + 1):
+        if sizer.count_fn(text[:n] + sizer.tail) == target:
+            best = n
+            break
+    if best is None:
+        raise RuntimeError(
+            f"could not size the corpus prompt to exactly {target} tokens "
+            f"(closest {sizer.count_fn(text[:lo] + sizer.tail)})"
+        )
+    content = text[:best] + sizer.tail
     tok = sizer.count_fn(content)
     logger.info(f"{tok=} (corpus mode)")
     return content, tok
