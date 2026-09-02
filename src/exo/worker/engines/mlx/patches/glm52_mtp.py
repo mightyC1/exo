@@ -200,7 +200,7 @@ class _PreNormCapture(nn.RMSNorm):
     plain callable in that slot would drop the norm from the module tree.
     """
 
-    def __init__(self, orig: nn.RMSNorm, store: dict[str, Any], mode: str = "post") -> None:
+    def __init__(self, orig: nn.RMSNorm, store: dict[str, Any], mode: str = "pre") -> None:
         nn.Module.__init__(self)
         self.weight = orig.weight
         self.eps = orig.eps
@@ -1093,7 +1093,11 @@ def apply_glm52_mtp_patch(
     trace_n = _env_int(_ENV_TRACE, 0, 0, 4096, logger)
     prof = _env_int(_ENV_PROF, 0, 0, 1, logger) == 1
     draft_k = _env_int(_ENV_DRAFT_K, 1, 1, 3, logger)
-    hidden_mode = _env_choice(_ENV_HIDDEN, "post", {"post", "pre"}, logger)
+    # Measured on GLM-5.3-8bit-idxbf16 (kv=49k, code+docs corpus, k=1, warm
+    # slots): target hidden PRE-final-norm a1=0.816 vs POST 0.741. vLLM's
+    # post-norm convention loses on this head/quant; keep 'post' as the A/B
+    # knob. (The chained-step recycle stays post-norm — measured separately.)
+    hidden_mode = _env_choice(_ENV_HIDDEN, "pre", {"post", "pre"}, logger)
 
     try:
         mtp = load_mtp_module(
