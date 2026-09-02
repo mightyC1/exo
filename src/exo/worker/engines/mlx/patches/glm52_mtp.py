@@ -60,6 +60,7 @@ _ENV_PROF = "EXO_GLM52_MTP_PROF"
 _ENV_HIDDEN = "EXO_GLM52_MTP_HIDDEN"
 _ENV_RECYCLE = "EXO_GLM52_MTP_RECYCLE"
 _ENV_PREFILL = "EXO_GLM52_MTP_PREFILL"
+_ENV_PREFILL_WINDOW = "EXO_GLM52_MTP_PREFILL_WINDOW"
 _PREFILL_SUBCHUNK = 256
 
 _LOG_EVERY = 64
@@ -269,6 +270,7 @@ class _MTPState:
         self.hist_buf: mx.array | None = None   # committed tokens (int32), amortized growth
         self.hist_len = 0
         self.prefill_enabled = True
+        self.prefill_window = 2048           # last W prompt pairs (0 = whole prompt)
         self.pending: dict[str, Any] | None = None  # MTP cache built during prompt prefill
         self.shadow_disabled = False
         self.prev_ran = False   # exactly-once guard for the real step
@@ -1238,9 +1240,13 @@ def mtp_prefill_begin(model: Any, start_offset: int, n_tokens: int) -> None:
         return
     from mlx_lm.models.cache import CacheList, KVCache
 
+    # pair i = (h_i, t_{i+1}); the last prompt pair is i = n_tokens-2 (the
+    # carried one is completed at adoption). A window keeps only the last W.
+    start = 0 if state.prefill_window <= 0 else max(0, n_tokens - 1 - state.prefill_window)
     state.pending = {
         "cache": CacheList(KVCache(), KVCache()), "carry_h": None,
         "n": 0, "ingested": 0, "toks": [], "t0": time.perf_counter(),
+        "start": start,
     }
 
 
@@ -1258,12 +1264,19 @@ def mtp_prefill_chunk(model: Any, chunk_tokens: list[int]) -> None:
         if h is None or h.shape[0] != 1 or h.shape[1] != L:
             raise RuntimeError(f"prefill capture mismatch: h={None if h is None else h.shape} L={L}")
         toks = mx.array(chunk_tokens, dtype=mx.uint32)
+        s0 = pend["n"]                                   # position of chunk_tokens[0]
         if pend["carry_h"] is not None:
             h_seq = mx.concatenate([pend["carry_h"], h[:, :-1, :]], axis=1)   # h_{s-1}..h_{e-2}
             tok_seq = toks.reshape(1, L)                                        # t_s..t_{e-1}
+            first_pair = s0 - 1
         else:
             h_seq = h[:, :-1, :]                                                # h_s..h_{e-2}
             tok_seq = toks[1:].reshape(1, L - 1)                                # t_{s+1}..t_{e-1}
+            first_pair = s0
+        # window: drop pairs below the start index (they are before the last W)
+        skip = max(0, pend["start"] - first_pair)
+        if skip:
+            h_seq, tok_seq = h_seq[:, skip:, :], tok_seq[:, skip:]
         n_pairs = tok_seq.shape[1]
         for a in range(0, n_pairs, _PREFILL_SUBCHUNK):
             b = min(a + _PREFILL_SUBCHUNK, n_pairs)
@@ -1413,6 +1426,7 @@ def apply_glm52_mtp_patch(
     hidden_mode = _env_choice(_ENV_HIDDEN, "pre", {"post", "pre"}, logger)
     recycle_mode = _env_choice(_ENV_RECYCLE, "post", {"post", "pre"}, logger)
     prefill_enabled = _env_int(_ENV_PREFILL, 1, 0, 1, logger) == 1
+    prefill_window = _env_int(_ENV_PREFILL_WINDOW, 2048, 0, 1 << 20, logger)
 
     mtp = None
     try:
@@ -1462,13 +1476,15 @@ def apply_glm52_mtp_patch(
     )
     state.recycle = recycle_mode
     state.prefill_enabled = prefill_enabled
+    state.prefill_window = prefill_window
     state.group = grp
     if not _install_hooks(logger):
         return model
     model._exo_glm52_mtp_state = state
     logger.info(
         f"[MTP] enabled mode={mode} k={draft_k} hidden={hidden_mode} recycle={recycle_mode} "
-        f"prompt_prefill={int(prefill_enabled)} fast_attn={int(fast_attn)} concat={concat} "
+        f"prompt_prefill={int(prefill_enabled)} prefill_window={prefill_window} "
+        f"fast_attn={int(fast_attn)} concat={concat} "
         f"validate={int(validate)} mtp_indexer_rope_fixed={int(rope_fixed)} "
         f"weights={weights_path.name} layer_idx={layer_idx}"
     )

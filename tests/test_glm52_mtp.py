@@ -1476,3 +1476,35 @@ def test_prompt_ingest_adopts_with_prod_two_token_insert(off_stream, sidecar):
         assert state.mtp_cache[0].offset == len(prompt) - 1
     finally:
         _detach(model)
+
+
+def test_prompt_ingest_window_keeps_last_pairs(off_stream, sidecar):
+    from exo.worker.engines.mlx.patches import glm52_mtp as gm
+
+    model, _ = off_stream
+    mx.random.seed(9)
+    prompt = [int(x) for x in mx.random.randint(0, 97, (30,)).tolist()]
+    prefix = prompt[:-1]                          # 29 tokens -> pairs 0..27, carry h_28
+    state = _battle_state(model, sidecar, k=1); _attach(model, state)
+    try:
+        # reference: full ingest, then compare the tail of its cache with a windowed ingest
+        state.prefill_window = 0
+        gm.mtp_prefill_begin(model, 0, len(prefix))
+        _capture_prompt_hidden(model, prefix)
+        h = state.store.pop("h"); state.store["h"] = h
+        gm.mtp_prefill_chunk(model, prefix)
+        assert state.pending["ingested"] == 28
+        st2 = _battle_state(model, sidecar, k=1); _attach(model, st2)
+        st2.prefill_window = 5
+        gm.mtp_prefill_begin(model, 0, len(prefix))
+        for a, b in ((0, 10), (10, 20), (20, 29)):     # chunked, window starts inside chunk 3
+            st2.store["h"] = h[:, a:b, :]
+            gm.mtp_prefill_chunk(model, prefix[a:b])
+        assert st2.pending["ingested"] == 5 and st2.pending["start"] == 29 - 1 - 5
+        assert st2.pending["cache"][0].offset == 5
+        # the windowed pairs are exactly pairs 23..27: verify via a fresh sequential ingest
+        st3 = _battle_state(model, sidecar, k=1); st3.start_request(uid=7)
+        st3.ingest(st3.mtp_cache, h[:, 23:28, :], mx.array([prefix[24:29]], dtype=mx.uint32))
+        assert mx.allclose(st2.pending["cache"][0].keys[..., :5, :], st3.mtp_cache[0].keys[..., :5, :], atol=1e-5).item()
+    finally:
+        _detach(model)
