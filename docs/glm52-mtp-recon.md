@@ -366,8 +366,12 @@ EXO_MODELS_DIRS="/Volumes/Models:/Volumes/Models2" .venv/bin/exo --fast-sync
 | `EXO_GLM52_MTP_PREFILL_WINDOW` | `2048` | 0 = весь промпт | сколько последних пар промпта глотать |
 | `EXO_GLM52_MTP_PREFILL_CYCLES` | `64` | 0 = не сбрасывать | после скольких циклов заменить контекст промпта своим |
 | `EXO_GLM52_MTP_VALIDATE` | `0` | 0/1 | канарейка: кросс-ранговые проверки токенов/офсетов каждый цикл (~1–2% скорости) |
-| `EXO_GLM52_MTP_PROF` | `0` | 0/1 | `[MTP_PROF]` build/resolve/post каждые 64 цикла |
-| `EXO_GLM52_MTP_CF` | `0` | 0/1 | телеметрия «сколько принял бы другой proposal» |
+| `EXO_GLM52_MTP_CACHE_WINDOW` | `512` | 0 = не перекатывать | сколько последних пар ответа держит кэш головы (цена драфта растёт с его длиной; accept не зависит) |
+| `EXO_GLM52_MTP_PROF` | `0` | 0/1/2 | 1 — `[MTP_PROF]` build/resolve/post каждые 64 цикла; 2 — плюс `drain/draft_block/draft_head` (синхронно, −1–2 мс/цикл, только для измерений) |
+| `EXO_GLM52_MTP_CF` | `0` | 0/1 | телеметрия без изменения генерации: `cf_onehot/cf_fullq/cf_top2/cf_top4` и `cf_q0.7/0.85/1.2` (overlap при других температурах драфта) |
+| `EXO_GLM52_MTP_Q_TEMPERATURE` | как у target | число | своя температура драфта (корректность не зависит; на чате/доках выигрыша не дало) |
+| `EXO_GLM52_MTP_VERIFY_PAD` | `0` | 0–2 | измерение: n пустых строк в verify (цена sibling-строки: +12 мс) — не для работы |
+| `EXO_GLM52_MTP_MOE_SORT_MIN` | `64` | ≥1 | измерение: порог сортировки token-expert пар в verify (1 — на 1–1.5 мс хуже) — не для работы |
 | `EXO_GLM52_MTP_TRACE` | `0` | N | подробный трейс первых N циклов |
 | `EXO_GLM52_MTP_SPEC_DRAFT` | `0` | 0/1 | M1.5-lite; на MLX не окупается |
 | `EXO_GLM52_MTP_CONCAT` | `eh` | `eh` / `he` | порядок конкатенации в eh_proj (eh верен по vLLM) |
