@@ -37,6 +37,7 @@ Consistency hooks (installed with the step wrapper):
 
 from __future__ import annotations
 
+import collections
 import hashlib
 import json
 import os
@@ -67,6 +68,8 @@ _ENV_CF = "EXO_GLM52_MTP_CF"
 _ENV_SPEC_DRAFT = "EXO_GLM52_MTP_SPEC_DRAFT"
 _ENV_VERIFY_PAD = "EXO_GLM52_MTP_VERIFY_PAD"
 _ENV_MOE_SORT_MIN = "EXO_GLM52_MTP_MOE_SORT_MIN"
+_ENV_CACHE_WINDOW = "EXO_GLM52_MTP_CACHE_WINDOW"
+_CACHE_WINDOW_SLACK = 256
 _ENV_Q_TEMP = "EXO_GLM52_MTP_Q_TEMPERATURE"
 _PREFILL_SUBCHUNK = 256
 
@@ -281,6 +284,10 @@ class _MTPState:
         self.prefill_cycles = 64             # drop prompt context after N cycles (0 = keep)
         self.prompt_ctx = False              # MTP cache currently holds prompt context
         self.gen_pairs: list[tuple[mx.array, mx.array]] = []
+        self.cache_window = 2048             # roll the MTP cache to the last W pairs (0 = never)
+        self.cache_slack = _CACHE_WINDOW_SLACK
+        self.recent: collections.deque = collections.deque(maxlen=2048 + _CACHE_WINDOW_SLACK)
+        self.rolls = 0
         self.retired: list[Any] = []         # caches swapped out mid-request; freed at finish
         self.proposal = "sample"             # draft proposal under sampling: sample (measured +0.04) | argmax
         self.spec_draft = False              # M1.5-lite: measured net-zero/negative on MLX; opt-in
@@ -330,6 +337,8 @@ class _MTPState:
         self.hist_len = 0
         self.prompt_ctx = False
         self.gen_pairs = []
+        self.recent.clear()
+        self.rolls = 0
         self.retired = []                    # nothing in flight between requests: safe to free
         self.cf_acc = None
         self.cf_n = 0
@@ -993,6 +1002,8 @@ def _battle_step(state: _MTPState, prev_step: Any, batch: Any):
     state.mtp_backlog = []
     if state.prompt_ctx:
         state.gen_pairs.extend(pairs)          # committed pairs, in cache order
+    if state.cache_window > 0:
+        state.recent.extend(pairs)             # rolling window of committed pairs
     if state.spec_next is not None and not state.mtp_backlog and not pairs[:-1]:
         # M1.5-lite hit: the previous cycle's verify train already drafted this
         # cycle's step 1 (and ingested its pairs); the pending token is that
@@ -1246,6 +1257,8 @@ def _battle_step(state: _MTPState, prev_step: Any, batch: Any):
     state.account_cycle(m)
     if state.prompt_ctx and state.prefill_cycles > 0 and state.cycles >= state.prefill_cycles:
         _drop_prompt_context(state)
+    elif state.cache_window > 0:
+        _roll_mtp_cache(state)
     if state.validate:
         _validate_cycle(state, batch, m, base=base_off)
     return [ti], [_lp_row(y_lp)]
@@ -1564,6 +1577,44 @@ def mtp_prefill_chunk(model: Any, chunk_tokens: list[int]) -> None:
         state.pending = None
 
 
+def _rebuild_mtp_cache(state: _MTPState, pairs: list, why: str) -> bool:
+    """Replace the MTP cache with one rebuilt from `pairs` (committed (h, t)
+    pairs, in order). Never raises; the old cache is retired until finish()."""
+    from mlx_lm.models.cache import CacheList, KVCache
+
+    try:
+        fresh = CacheList(KVCache(), KVCache())
+        if pairs:
+            h_seq = mx.concatenate([h for h, _ in pairs], axis=1)
+            t_seq = mx.concatenate([t.reshape(1, 1).astype(mx.uint32) for _, t in pairs], axis=1)
+            for a in range(0, len(pairs), _PREFILL_SUBCHUNK):
+                b = min(a + _PREFILL_SUBCHUNK, len(pairs))
+                state.ingest(fresh, h_seq[:, a:b, :], t_seq[:, a:b])
+        mx.async_eval(*[arr for c in fresh.caches for arr in (c.keys, c.values) if arr is not None])
+        if state.mtp_cache is not None:
+            state.retired.append(state.mtp_cache)
+        state.mtp_cache = fresh
+        state.logger.info(f"[MTP] uid={state.uid} {why} (re-ingested {len(pairs)} pairs)")
+        return True
+    except Exception:
+        state.logger.opt(exception=True).warning(f"[MTP] {why}: rebuild failed; keeping the cache")
+        return False
+
+
+def _roll_mtp_cache(state: _MTPState) -> None:
+    """The head's attention over its own cache gets ~3.5x more expensive once
+    it exceeds index_topk (measured: draft block 2.5ms -> 9ms past ~2048
+    generated positions), and the head does not need long context. Keep the
+    cache at the last `cache_window` committed pairs."""
+    if state.mtp_cache is None or state.spec_next is not None or state.mtp_backlog:
+        return
+    if _cur(state.mtp_cache[0]) <= state.cache_window + state.cache_slack:
+        return
+    pairs = list(state.recent)[-state.cache_window:]
+    if _rebuild_mtp_cache(state, pairs, f"mtp cache rolled at cycle {state.cycles}"):
+        state.rolls += 1
+
+
 def _drop_prompt_context(state: _MTPState) -> None:
     """The head drafts better once it has its own context (measured: prompt
     context lifts the first window but lowers steady state). Rebuild the MTP
@@ -1780,6 +1831,7 @@ def apply_glm52_mtp_patch(
     spec_draft = _env_int(_ENV_SPEC_DRAFT, 0, 0, 1, logger) == 1
     verify_pad = _env_int(_ENV_VERIFY_PAD, 0, 0, 2, logger)
     moe_sort_min = _env_int(_ENV_MOE_SORT_MIN, 64, 1, 1 << 20, logger)
+    cache_window = _env_int(_ENV_CACHE_WINDOW, 2048, 0, 1 << 20, logger)
     if moe_sort_min != 64:
         from exo.worker.engines.mlx.patches.glm52_indexshare import install_moe_sort_override
 
@@ -1842,6 +1894,8 @@ def apply_glm52_mtp_patch(
     state.spec_draft = spec_draft
     state.verify_pad = verify_pad
     state.prof_draft = prof_level >= 2
+    state.cache_window = cache_window
+    state.recent = collections.deque(maxlen=cache_window + _CACHE_WINDOW_SLACK) if cache_window > 0 else collections.deque(maxlen=1)
     state.q_temperature = q_temperature
     state.group = grp
     if not _install_hooks(logger):
@@ -1851,7 +1905,7 @@ def apply_glm52_mtp_patch(
         f"[MTP] enabled mode={mode} k={draft_k} hidden={hidden_mode} recycle={recycle_mode} "
         f"prompt_prefill={int(prefill_enabled)} prefill_window={prefill_window} "
         f"prefill_cycles={prefill_cycles} proposal={proposal} cf={int(cf)} spec_draft={int(spec_draft)} "
-        f"verify_pad={verify_pad} moe_sort_min={moe_sort_min} q_temp={q_temperature if q_temperature is not None else 'target'} "
+        f"verify_pad={verify_pad} moe_sort_min={moe_sort_min} cache_window={cache_window} q_temp={q_temperature if q_temperature is not None else 'target'} "
         f"fast_attn={int(fast_attn)} concat={concat} "
         f"validate={int(validate)} mtp_indexer_rope_fixed={int(rope_fixed)} "
         f"weights={weights_path.name} layer_idx={layer_idx}"

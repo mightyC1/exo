@@ -1838,3 +1838,24 @@ def test_moe_sort_override_keeps_greedy_parity(off_stream, sidecar, monkeypatch)
         assert toks == ref
     finally:
         gi._MOE_SORT_MIN.reset(tok)
+
+
+def test_mtp_cache_rolls_to_window(off_stream, sidecar):
+    """The MTP cache is rebuilt from the last W committed pairs once it
+    exceeds W + slack; the emitted stream stays byte-identical to OFF."""
+    from exo.worker.engines.mlx.patches import glm52_mtp as gm
+
+    model, _ = off_stream
+    _detach(model)
+    _, ref, _ = _run_bg(model, PROMPT, 60)
+    state = _battle_state(model, sidecar, k=1)     # real draft: the cache really grows
+    state.cache_window, state.cache_slack = 8, 4
+    state.recent = __import__("collections").deque(maxlen=12)
+    _attach(model, state)
+    try:
+        _, toks, _ = _run_bg(model, PROMPT, 60)
+    finally:
+        _detach(model)
+    assert toks == ref
+    rolled = [l for l in state.logger.lines if "mtp cache rolled" in l]
+    assert rolled, state.logger.lines[-3:]
