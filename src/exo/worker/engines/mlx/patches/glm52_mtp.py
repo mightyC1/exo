@@ -66,6 +66,7 @@ _ENV_PROPOSAL = "EXO_GLM52_MTP_PROPOSAL"
 _ENV_CF = "EXO_GLM52_MTP_CF"
 _ENV_SPEC_DRAFT = "EXO_GLM52_MTP_SPEC_DRAFT"
 _ENV_VERIFY_PAD = "EXO_GLM52_MTP_VERIFY_PAD"
+_ENV_MOE_SORT_MIN = "EXO_GLM52_MTP_MOE_SORT_MIN"
 _ENV_Q_TEMP = "EXO_GLM52_MTP_Q_TEMPERATURE"
 _PREFILL_SUBCHUNK = 256
 
@@ -1761,6 +1762,11 @@ def apply_glm52_mtp_patch(
     cf = _env_int(_ENV_CF, 0, 0, 1, logger) == 1
     spec_draft = _env_int(_ENV_SPEC_DRAFT, 0, 0, 1, logger) == 1
     verify_pad = _env_int(_ENV_VERIFY_PAD, 0, 0, 2, logger)
+    moe_sort_min = _env_int(_ENV_MOE_SORT_MIN, 64, 1, 1 << 20, logger)
+    if moe_sort_min != 64:
+        from exo.worker.engines.mlx.patches.glm52_indexshare import install_moe_sort_override
+
+        install_moe_sort_override(moe_sort_min, logger)
     q_temp_raw = os.environ.get(_ENV_Q_TEMP, "").strip()
     q_temperature = float(q_temp_raw) if q_temp_raw else None
 
@@ -1827,7 +1833,7 @@ def apply_glm52_mtp_patch(
         f"[MTP] enabled mode={mode} k={draft_k} hidden={hidden_mode} recycle={recycle_mode} "
         f"prompt_prefill={int(prefill_enabled)} prefill_window={prefill_window} "
         f"prefill_cycles={prefill_cycles} proposal={proposal} cf={int(cf)} spec_draft={int(spec_draft)} "
-        f"verify_pad={verify_pad} q_temp={q_temperature if q_temperature is not None else 'target'} "
+        f"verify_pad={verify_pad} moe_sort_min={moe_sort_min} q_temp={q_temperature if q_temperature is not None else 'target'} "
         f"fast_attn={int(fast_attn)} concat={concat} "
         f"validate={int(validate)} mtp_indexer_rope_fixed={int(rope_fixed)} "
         f"weights={weights_path.name} layer_idx={layer_idx}"

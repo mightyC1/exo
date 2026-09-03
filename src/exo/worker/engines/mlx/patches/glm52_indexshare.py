@@ -55,6 +55,49 @@ _MTP_VERIFY_CTX: contextvars.ContextVar[bool] = contextvars.ContextVar(
 )
 
 
+_MOE_SORT_MIN: contextvars.ContextVar[int] = contextvars.ContextVar("exo_glm52_moe_sort_min", default=64)
+_MOE_SORT_PATCHED = False
+
+
+def install_moe_sort_override(sort_min: int, logger: Any = default_logger) -> bool:
+    """Experiment (audit #3 §14): the pinned SwitchGLU sorts token-expert pairs
+    only when there are >= 64 of them, so an L=2..4 verify (16-32 pairs)
+    gathers experts unsorted. Inside mtp_verify_context() the threshold
+    becomes `sort_min`; everything else keeps the pin's 64."""
+    global _MOE_SORT_PATCHED
+    if _MOE_SORT_PATCHED:
+        return True
+    try:
+        from mlx_lm.models import switch_layers as sl
+    except Exception:
+        logger.warning("[EXO][GLM-5.2] switch_layers unavailable; MoE sort override not installed")
+        return False
+    orig = sl.SwitchGLU.__call__
+
+    def _call(self, x, indices):
+        thr = _MOE_SORT_MIN.get()
+        if thr == 64 or not _MTP_VERIFY_CTX.get():
+            return orig(self, x, indices)
+        x = mx.expand_dims(x, (-2, -3))
+        do_sort = indices.size >= thr
+        idx = indices
+        inv_order = None
+        if do_sort:
+            x, idx, inv_order = sl._gather_sort(x, indices)
+        x_up = self.up_proj(x, idx, sorted_indices=do_sort)
+        x_gate = self.gate_proj(x, idx, sorted_indices=do_sort)
+        x = self.down_proj(self.activation(x_up, x_gate), idx, sorted_indices=do_sort)
+        if do_sort:
+            x = sl._scatter_unsort(x, inv_order, indices.shape)
+        return x.squeeze(-2)
+
+    sl.SwitchGLU.__call__ = _call
+    _MOE_SORT_MIN.set(int(sort_min))
+    _MOE_SORT_PATCHED = True
+    logger.info(f"[EXO][GLM-5.2] MoE sort override installed: sort_min={sort_min} (verify context only)")
+    return True
+
+
 class mtp_verify_context:
     """Marks the enclosed model call as an MTP verify forward (B==1, L<=4)."""
 

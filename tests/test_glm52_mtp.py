@@ -1821,3 +1821,20 @@ def test_reset_terminal_clears_parked_packages(off_stream, sidecar):
         assert not state.ready and state.pending is None and state.uid is None
     finally:
         _detach(model)
+
+
+def test_moe_sort_override_keeps_greedy_parity(off_stream, sidecar, monkeypatch):
+    """Sorting token-expert pairs inside the verify must not change the
+    emitted tokens (greedy byte parity) — the kernels compute the same
+    per-token matmuls."""
+    from exo.worker.engines.mlx.patches import glm52_indexshare as gi
+
+    model, ref = off_stream
+    gi.install_moe_sort_override(1, _StubLogger())
+    tok = gi._MOE_SORT_MIN.set(1)
+    try:
+        state, toks, _ = _run_on(model, sidecar, N_GEN, None, k=1)
+        assert state.cycles > 0
+        assert toks == ref
+    finally:
+        gi._MOE_SORT_MIN.reset(tok)
