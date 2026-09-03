@@ -285,6 +285,9 @@ class _MTPState:
         self.proposal = "sample"             # draft proposal under sampling: sample (measured +0.04) | argmax
         self.spec_draft = False              # M1.5-lite: measured net-zero/negative on MLX; opt-in
         self.verify_pad = 0                  # measurement only: extra dummy rows in the verify
+        self.prof_draft = False              # PROF=2: synchronous draft block/head timing
+        self.p_draft_block = 0.0
+        self.p_draft_head = 0.0
         self.q_temperature: float | None = None  # proposal temperature override (None = target's)
         self.spec_next: tuple | None = None  # (d1, h_mtp, zq) valid for the next cycle
         self.cycle_spec_entries = 0          # MTP entries this cycle's spec left in the cache
@@ -1003,6 +1006,16 @@ def _battle_step(state: _MTPState, prev_step: Any, batch: Any):
         zq1 = res[2] if len(res) > 2 else None
     zq_rows = [zq1]
     drafts = [d1]
+    if state.prof_draft:
+        # PROF=2: synchronous draft timing (adds one sync per cycle; measurement only).
+        # Splits the draft into block (hidden) and LM head (+ sampling) costs.
+        _td0 = time.perf_counter()
+        mx.eval(h_mtp)
+        _td1 = time.perf_counter()
+        mx.eval(d1)
+        _td2 = time.perf_counter()
+        state.p_draft_block += _td1 - _td0
+        state.p_draft_head += _td2 - _td1
     chain_before = _cur(state.mtp_cache[0]) if state.mtp_cache is not None else 0
     for _ in range(1, k):
         # chained proposal: the MTP block's own post-norm output stands in
@@ -1225,8 +1238,11 @@ def _battle_step(state: _MTPState, prev_step: Any, batch: Any):
                 f"build_ms={1e3 * state.p_build / n:.2f} "
                 f"resolve_ms={1e3 * state.p_resolve / n:.2f} "
                 f"post_ms={1e3 * state.p_post / n:.2f}"
+                + (f" draft_block_ms={1e3 * state.p_draft_block / n:.2f} "
+                   f"draft_head_ms={1e3 * state.p_draft_head / n:.2f}" if state.prof_draft else "")
             )
             state.p_build = state.p_resolve = state.p_post = 0.0
+            state.p_draft_block = state.p_draft_head = 0.0
     state.account_cycle(m)
     if state.prompt_ctx and state.prefill_cycles > 0 and state.cycles >= state.prefill_cycles:
         _drop_prompt_context(state)
@@ -1747,7 +1763,8 @@ def apply_glm52_mtp_patch(
     concat = _env_choice(_ENV_CONCAT, "eh", {"eh", "he"}, logger)
     validate = _env_int(_ENV_VALIDATE, 0, 0, 1, logger) == 1
     trace_n = _env_int(_ENV_TRACE, 0, 0, 4096, logger)
-    prof = _env_int(_ENV_PROF, 0, 0, 1, logger) == 1
+    prof_level = _env_int(_ENV_PROF, 0, 0, 2, logger)
+    prof = prof_level >= 1
     draft_k = _env_int(_ENV_DRAFT_K, 1, 1, 3, logger)
     # Measured on GLM-5.3-8bit-idxbf16 (kv=49k, code+docs corpus, k=1, warm
     # slots): target hidden PRE-final-norm a1=0.816 vs POST 0.741. vLLM's
@@ -1824,6 +1841,7 @@ def apply_glm52_mtp_patch(
     state.cf = cf
     state.spec_draft = spec_draft
     state.verify_pad = verify_pad
+    state.prof_draft = prof_level >= 2
     state.q_temperature = q_temperature
     state.group = grp
     if not _install_hooks(logger):
