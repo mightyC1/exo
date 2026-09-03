@@ -463,8 +463,8 @@ class _MTPState:
         if not self.cf or self.cf_acc is None or self.cf_n == 0:
             return ""
         try:
-            a, b = (float(x) / self.cf_n for x in self.cf_acc.tolist())
-            return f"cf_onehot={a:.3f} cf_fullq={b:.3f} "
+            a, b, c, d = (float(x) / self.cf_n for x in self.cf_acc.tolist())
+            return f"cf_onehot={a:.3f} cf_fullq={b:.3f} cf_top2={c:.3f} cf_top4={d:.3f} "
         except Exception:
             return ""
 
@@ -485,7 +485,16 @@ class _MTPState:
         q = mx.softmax(zq, axis=-1)
         a_onehot = mx.take_along_axis(p, mx.argmax(q, axis=-1, keepdims=True), axis=-1).reshape(1)
         a_fullq = mx.sum(mx.minimum(p, q), axis=-1).reshape(1)
-        upd = mx.concatenate([a_onehot, a_fullq]).astype(mx.float32)
+        # breadth ceiling: target mass on the head's top-2 / top-4 candidates
+        # (= greedy tree acceptance at position 1 with 2 / 4 branches)
+        top4 = mx.argpartition(-q, kth=3, axis=-1)[..., :4]
+        p_top4 = mx.take_along_axis(p, top4, axis=-1)
+        q_top4 = mx.take_along_axis(q, top4, axis=-1)
+        order = mx.argsort(-q_top4, axis=-1)
+        p_sorted = mx.take_along_axis(p_top4, order, axis=-1)
+        a_top2 = mx.sum(p_sorted[..., :2], axis=-1).reshape(1)
+        a_top4 = mx.sum(p_sorted, axis=-1).reshape(1)
+        upd = mx.concatenate([a_onehot, a_fullq, a_top2, a_top4]).astype(mx.float32)
         self.cf_acc = upd if self.cf_acc is None else self.cf_acc + upd
         self.cf_n += 1
 

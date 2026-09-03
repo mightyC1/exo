@@ -1660,3 +1660,4 @@ def test_cf_telemetry_accumulates(off_stream, sidecar):
     assert "cf_onehot=" in line and "cf_fullq=" in line, line
     vals = {kv.split("=")[0]: float(kv.split("=")[1]) for kv in line.split() if kv.startswith("cf_")}
     assert 0.0 <= vals["cf_onehot"] <= 1.0 and 0.0 <= vals["cf_fullq"] <= 1.0
+    assert vals["cf_onehot"] <= vals["cf_top2"] + 1e-6 <= vals["cf_top4"] + 1e-6
