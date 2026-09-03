@@ -65,6 +65,8 @@ _ENV_PREFILL_CYCLES = "EXO_GLM52_MTP_PREFILL_CYCLES"
 _ENV_PROPOSAL = "EXO_GLM52_MTP_PROPOSAL"
 _ENV_CF = "EXO_GLM52_MTP_CF"
 _ENV_SPEC_DRAFT = "EXO_GLM52_MTP_SPEC_DRAFT"
+_ENV_VERIFY_PAD = "EXO_GLM52_MTP_VERIFY_PAD"
+_ENV_Q_TEMP = "EXO_GLM52_MTP_Q_TEMPERATURE"
 _PREFILL_SUBCHUNK = 256
 
 _LOG_EVERY = 64
@@ -281,6 +283,8 @@ class _MTPState:
         self.retired: list[Any] = []         # caches swapped out mid-request; freed at finish
         self.proposal = "sample"             # draft proposal under sampling: sample (measured +0.04) | argmax
         self.spec_draft = False              # M1.5-lite: measured net-zero/negative on MLX; opt-in
+        self.verify_pad = 0                  # measurement only: extra dummy rows in the verify
+        self.q_temperature: float | None = None  # proposal temperature override (None = target's)
         self.spec_next: tuple | None = None  # (d1, h_mtp, zq) valid for the next cycle
         self.cycle_spec_entries = 0          # MTP entries this cycle's spec left in the cache
         self.cf = False                      # counterfactual telemetry (alpha one-hot vs full-q)
@@ -455,8 +459,10 @@ class _MTPState:
         h_rec = h_post if self.recycle == "post" else h_raw
         if self.proposal == "sample" and self.request_sampling and self.policy is not None:
             # Full-q proposal: draft ~ q = the head's own distribution under the
-            # request's sampling transform; acceptance becomes 1 - TV(p, q).
-            zq = _target_logits(logits - mx.logsumexp(logits, axis=-1, keepdims=True), self.policy)
+            # request's sampling transform (optionally its own temperature —
+            # any q is valid, acceptance is 1 - TV(p, q)).
+            pol_q = self.policy if self.q_temperature is None else dict(self.policy, temperature=self.q_temperature)
+            zq = _target_logits(logits - mx.logsumexp(logits, axis=-1, keepdims=True), pol_q)
             return mx.random.categorical(zq).reshape(1), h_rec, zq
         return mx.argmax(logits, axis=-1).reshape(1), h_rec, logits
 
@@ -464,8 +470,9 @@ class _MTPState:
         if not self.cf or self.cf_acc is None or self.cf_n == 0:
             return ""
         try:
-            a, b, c, d = (float(x) / self.cf_n for x in self.cf_acc.tolist())
-            return f"cf_onehot={a:.3f} cf_fullq={b:.3f} cf_top2={c:.3f} cf_top4={d:.3f} "
+            a, b, c, d, q07, q085, q12 = (float(x) / self.cf_n for x in self.cf_acc.tolist())
+            return (f"cf_onehot={a:.3f} cf_fullq={b:.3f} cf_top2={c:.3f} cf_top4={d:.3f} "
+                    f"cf_q0.7={q07:.3f} cf_q0.85={q085:.3f} cf_q1.2={q12:.3f} ")
         except Exception:
             return ""
 
@@ -495,7 +502,17 @@ class _MTPState:
         p_sorted = mx.take_along_axis(p_top4, order, axis=-1)
         a_top2 = mx.sum(p_sorted[..., :2], axis=-1).reshape(1)
         a_top4 = mx.sum(p_sorted, axis=-1).reshape(1)
-        upd = mx.concatenate([a_onehot, a_fullq, a_top2, a_top4]).astype(mx.float32)
+        # proposal-temperature calibration sweep: overlap with q at T = policy_T * f
+        sweep = []
+        base_logq = zq_raw - mx.logsumexp(zq_raw, axis=-1, keepdims=True)
+        for f in (0.7, 0.85, 1.2):
+            if self.proposal == "sample":
+                # zq_raw is already transformed at T; undo by rescaling logits
+                zq_f = zq_raw * (1.0 / f)
+            else:
+                zq_f = _target_logits(base_logq, dict(self.policy, temperature=self.policy["temperature"] * f))
+            sweep.append(mx.sum(mx.minimum(p, mx.softmax(zq_f, axis=-1)), axis=-1).reshape(1))
+        upd = mx.concatenate([a_onehot, a_fullq, a_top2, a_top4] + sweep).astype(mx.float32)
         self.cf_acc = upd if self.cf_acc is None else self.cf_acc + upd
         self.cf_n += 1
 
@@ -554,7 +571,9 @@ def _target_logits(row_logprobs: mx.array, pol: dict[str, Any]) -> mx.array:
     all k+1 verify rows are filtered in one pass."""
     from mlx_lm.sample_utils import apply_min_p, apply_top_k, apply_top_p
 
-    x = row_logprobs
+    # float32 throughout: p and q are compared and subtracted; bf16 loses the
+    # significant bits exactly where it matters (p ≈ q).
+    x = row_logprobs.astype(mx.float32)
     top_p, min_p, top_k, temp = pol["top_p"], pol["min_p"], pol["top_k"], pol["temperature"]
     if 0.0 < top_p < 1.0:
         x = apply_top_p(x, top_p)
@@ -609,11 +628,18 @@ def _rs_accepts_q(z_rows: mx.array, zq_rows: list[mx.array], drafts: list[mx.arr
 
 def _rs_residual_logits_q(zp: mx.array, zq: mx.array) -> mx.array:
     """Logits of norm(max(p - q, 0)) — the distribution to sample from after
-    rejecting a draft proposed from q (-inf where p <= q)."""
-    p = mx.softmax(zp, axis=-1)
-    q = mx.softmax(zq.reshape(p.shape), axis=-1)
-    r = mx.maximum(p - q, 0.0)
-    return mx.where(r > 0, mx.log(mx.maximum(r, 1e-30)), mx.array(-float("inf"), dtype=r.dtype))
+    rejecting a draft proposed from q. Computed in log space (float32):
+    log r = log p + log1p(-exp(log q - log p)) where p > q, -inf elsewhere.
+    If numerically nothing survives (p == q up to rounding), fall back to the
+    target itself — a valid sample of p and never an all-(-inf) categorical."""
+    zp = zp.astype(mx.float32)
+    zq = zq.reshape(zp.shape).astype(mx.float32)
+    logp = zp - mx.logsumexp(zp, axis=-1, keepdims=True)
+    logq = zq - mx.logsumexp(zq, axis=-1, keepdims=True)
+    delta = mx.minimum(logq - logp, mx.array(-1e-7, dtype=mx.float32))
+    logr = mx.where(logp > logq, logp + mx.log1p(-mx.exp(delta)), mx.array(-float("inf"), dtype=mx.float32))
+    alive = mx.any(logr > -float("inf"), axis=-1, keepdims=True)
+    return mx.where(alive, logr, logp)
 
 
 def _rs_residual_logits(z: mx.array, d: mx.array) -> mx.array:
@@ -621,8 +647,11 @@ def _rs_residual_logits(z: mx.array, d: mx.array) -> mx.array:
     position: the target with d removed and renormalized (max(0, p - q) for a
     one-hot q), expressed as logits for categorical()."""
     vocab = z.shape[-1]
+    z = z.astype(mx.float32)
     mask = mx.arange(vocab) == d.reshape(-1)[0:1].astype(mx.int32)
-    return mx.where(mask, mx.array(-float("inf"), dtype=z.dtype), z)
+    out = mx.where(mask, mx.array(-float("inf"), dtype=mx.float32), z)
+    alive = mx.any(out > -float("inf"), axis=-1, keepdims=True)
+    return mx.where(alive, out, z)   # single-survivor target: d was that token, keep p
 
 
 def _dist_group() -> Any | None:
@@ -995,15 +1024,25 @@ def _battle_step(state: _MTPState, prev_step: Any, batch: Any):
     base_off = _cur(batch.prompt_cache[0][0]) if state.validate else None
     if state.validate:
         _validate_pre_verify(state, y, drafts)
+    pad = state.verify_pad
     verify_in = mx.concatenate(
         [y.reshape(-1)[0:1]] + [x.astype(y.dtype).reshape(-1)[0:1] for x in drafts]
-    ).reshape(1, k + 1)
+        + [drafts[-1].astype(y.dtype).reshape(-1)[0:1]] * pad
+    ).reshape(1, k + 1 + pad)
     from exo.worker.engines.mlx.patches.glm52_indexshare import mtp_verify_context
 
     with mtp_verify_context():
         logits2 = batch.model(verify_in, cache=batch.prompt_cache)
     hv = state.store.pop("h", None)
+    if pad:
+        # measurement rows: drop them from logits/hidden, and from every cache
+        logits2 = logits2[:, : k + 1, :]
+        if hv is not None:
+            hv = hv[:, : k + 1, :]
+        for c in batch.prompt_cache:
+            c.trim(pad)
     logits2 = _apply_processors_rows(batch, logits2, [y] + drafts, state)
+    logits2 = logits2.astype(mx.float32)       # normalize in float32, not bf16
     lp2 = logits2 - mx.logsumexp(logits2, axis=-1, keepdims=True)
     t_all = mx.argmax(lp2, axis=-1)                       # (1, k+1)
     t1 = t_all[:, 0]
@@ -1612,15 +1651,31 @@ def _adopt_prefill(state: _MTPState, batch: Any) -> None:
         state.logger.opt(exception=True).warning("[MTP] prompt ingest adopt failed; head starts cold")
 
 
+def _reset_terminal(state: _MTPState) -> None:
+    """close(): drop everything, including parked/in-flight prompt packages
+    and retired caches (reset() keeps parked packages for their requests)."""
+    state.finish(why="close")
+    state.pending = None
+    state.ready = []
+    state.retired = []
+    state.gen_pairs = []
+    state.spec_next = None
+
+
 def finalize_glm52_mtp_request(model: Any, uid: int | None, *, reason: str) -> None:
     """Terminal teardown of the MTP state for a request that exo removes from
     the generator (custom text stop, cancel, close). The generator drops the
     request's cache wholesale, so only the state needs finalizing; uid=None
     finalizes whatever request is active."""
     state = getattr(model, "_exo_glm52_mtp_state", None)
-    if state is None or state.uid is None:
+    if state is None:
         return
-    if uid is None or state.uid == uid:
+    if uid is None:               # close(): terminal
+        _reset_terminal(state)
+        return
+    if state.uid is None:
+        return
+    if state.uid == uid:
         if state.buffer:
             state.out_tokens = max(state.out_tokens - len(state.buffer), 0)
             state.accepted = max(state.accepted - len(state.buffer), 0)
@@ -1705,6 +1760,9 @@ def apply_glm52_mtp_patch(
     proposal = _env_choice(_ENV_PROPOSAL, "sample", {"argmax", "sample"}, logger)
     cf = _env_int(_ENV_CF, 0, 0, 1, logger) == 1
     spec_draft = _env_int(_ENV_SPEC_DRAFT, 0, 0, 1, logger) == 1
+    verify_pad = _env_int(_ENV_VERIFY_PAD, 0, 0, 2, logger)
+    q_temp_raw = os.environ.get(_ENV_Q_TEMP, "").strip()
+    q_temperature = float(q_temp_raw) if q_temp_raw else None
 
     mtp = None
     try:
@@ -1759,6 +1817,8 @@ def apply_glm52_mtp_patch(
     state.proposal = proposal
     state.cf = cf
     state.spec_draft = spec_draft
+    state.verify_pad = verify_pad
+    state.q_temperature = q_temperature
     state.group = grp
     if not _install_hooks(logger):
         return model
@@ -1767,6 +1827,7 @@ def apply_glm52_mtp_patch(
         f"[MTP] enabled mode={mode} k={draft_k} hidden={hidden_mode} recycle={recycle_mode} "
         f"prompt_prefill={int(prefill_enabled)} prefill_window={prefill_window} "
         f"prefill_cycles={prefill_cycles} proposal={proposal} cf={int(cf)} spec_draft={int(spec_draft)} "
+        f"verify_pad={verify_pad} q_temp={q_temperature if q_temperature is not None else 'target'} "
         f"fast_attn={int(fast_attn)} concat={concat} "
         f"validate={int(validate)} mtp_indexer_rope_fixed={int(rope_fixed)} "
         f"weights={weights_path.name} layer_idx={layer_idx}"

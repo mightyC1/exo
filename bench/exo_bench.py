@@ -27,7 +27,7 @@ import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from statistics import mean
+from statistics import mean, median
 from typing import Any
 
 from exo_tools.client import ExoClient, ExoHttpError
@@ -923,14 +923,18 @@ def main() -> int:
                                     for x, _ in batch_results
                                     if x["stats"]["generation_tps"] > 0
                                 ]
-                                per_req_tps = (
-                                    max(valid_gen_tps) if valid_gen_tps else 0.0
+                                per_req_tps = median(valid_gen_tps) if valid_gen_tps else 0.0
+                                gen_tok_sum = sum(
+                                    int(x["stats"].get("generation_tokens") or 0) for x, _ in batch_results
                                 )
-                                agg_gen_tps = per_req_tps * concurrency
+                                # aggregate = tokens completed over the shared wall time
+                                # (includes TTFT; honest, unlike max * concurrency)
+                                agg_gen_tps = gen_tok_sum / batch_wall_s if batch_wall_s > 0 else 0.0
                                 logger.info(
                                     f"[concurrent {concurrency}x]  "
-                                    f"agg_gen_tps={agg_gen_tps:.2f}  "
-                                    f"per_req_tps={per_req_tps:.2f}  "
+                                    f"aggregate_e2e_tps={agg_gen_tps:.2f}  "
+                                    f"median_per_req_tps={per_req_tps:.2f}  "
+                                    f"best_per_req_tps={max(valid_gen_tps) if valid_gen_tps else 0.0:.2f}  "
                                     f"wall_s={batch_wall_s:.2f}  "
                                     f"errors={batch_errors}"
                                 )
@@ -942,8 +946,27 @@ def main() -> int:
                             for x in runs
                             if x["stats"]["generation_tps"] > 0
                         ]
-                        per_req_tps = max(valid_gen) if valid_gen else 0.0
-                        gen_tps = per_req_tps * concurrency
+                        short = [
+                            (int(x["tg"]), int(x["stats"].get("generation_tokens") or 0))
+                            for x in runs
+                            if int(x["stats"].get("generation_tokens") or 0) != int(x["tg"])
+                        ]
+                        if short:
+                            raise SystemExit(
+                                f"[exo-bench] FAIL: short/long runs (expected tg, got): {short[:5]}"
+                            )
+                        # headline = median over repeats (max would report the luckiest run)
+                        per_req_tps = median(valid_gen) if valid_gen else 0.0
+                        gen_tps = per_req_tps if concurrency == 1 else per_req_tps * concurrency
+                        srt = sorted(valid_gen)
+
+                        def _pct(q: float) -> float:
+                            return srt[round((len(srt) - 1) * q)] if srt else 0.0
+
+                        gen_stats = (
+                            f"n={len(srt)} p10={_pct(0.10):.2f} p90={_pct(0.90):.2f} "
+                            f"min={srt[0] if srt else 0.0:.2f} best={srt[-1] if srt else 0.0:.2f}"
+                        )
                         ptok = mean(x["stats"]["prompt_tokens"] for x in runs)
                         gtok = mean(x["stats"]["generation_tokens"] for x in runs)
 
@@ -953,7 +976,7 @@ def main() -> int:
 
                         peak = mean(_peak_bytes(x["stats"]) for x in runs)
                         summary = (
-                            f"prompt_tps={prompt_tps:.2f} gen_tps={gen_tps:.2f}    "
+                            f"prompt_tps={prompt_tps:.2f} gen_tps={gen_tps:.2f} [{gen_stats}]    "
                             f"prompt_tokens={ptok} gen_tokens={gtok}    "
                             f"peak_memory={format_peak_memory(peak)}"
                         )

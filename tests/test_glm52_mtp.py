@@ -1708,3 +1708,116 @@ def test_prompt_ingest_interleaved_prefills_match_their_requests(off_stream, sid
         assert len(state.ready) == 0
     finally:
         _detach(model)
+
+
+# ---------------------------------------------------------------------------
+# Audit #3: FP32 rejection-sampling edge cases
+# ---------------------------------------------------------------------------
+
+
+def _dist_logits(probs):
+    p = mx.array(probs, dtype=mx.float32)
+    return mx.log(mx.maximum(p / mx.sum(p), 1e-30)).reshape(1, -1)
+
+
+def _simulate_q(zp, zq, n=20000):
+    from exo.worker.engines.mlx.patches.glm52_mtp import _rs_residual_logits_q
+
+    V = zp.shape[-1]
+    d = mx.random.categorical(mx.broadcast_to(zq, (n, V)))
+    u = mx.random.uniform(shape=(n,))
+    logp = mx.take_along_axis(mx.broadcast_to(zp, (n, V)), d.reshape(n, 1), axis=-1).reshape(n) - mx.logsumexp(zp, axis=-1)
+    logq = mx.take_along_axis(mx.broadcast_to(zq, (n, V)), d.reshape(n, 1), axis=-1).reshape(n) - mx.logsumexp(zq, axis=-1)
+    accept = mx.log(u) < mx.minimum(logp - logq, mx.array(0.0))
+    res_logits = _rs_residual_logits_q(zp, zq)
+    assert not bool(mx.any(mx.isnan(res_logits)).item())
+    res = mx.random.categorical(mx.broadcast_to(res_logits, (n, V)))
+    toks = mx.where(accept, d.astype(res.dtype), res)
+    emp = mx.zeros((V,)).at[toks].add(mx.ones((n,))) / n
+    p = mx.softmax(zp, axis=-1).reshape(-1)
+    return float(mx.mean(accept).item()), 0.5 * float(mx.sum(mx.abs(emp - p)).item()), int(mx.max(toks).item())
+
+
+def test_rs_fp32_edge_p_equals_q():
+    mx.random.seed(11)
+    zp = _dist_logits([0.5, 0.3, 0.2, 0.0, 0.0])
+    acc, tv, _ = _simulate_q(zp, zp)                     # exactly p == q
+    assert acc == 1.0, acc                               # always accept, residual never used
+    assert tv < 0.02
+    zq = zp.astype(mx.bfloat16)                          # bf16-rounded copy: q != p by rounding
+    acc, tv, _ = _simulate_q(zp, zq)
+    assert acc > 0.995, acc                              # 1 - TV(p, q_bf16), no NaN / all-inf
+    assert tv < 0.02
+
+
+def test_rs_fp32_edge_near_equal():
+    mx.random.seed(12)
+    zp = _dist_logits([0.5, 0.3, 0.2, 0.0, 0.0])
+    zq = _dist_logits([0.5 + 1e-6, 0.3 - 1e-6, 0.2, 0.0, 0.0])
+    acc, tv, _ = _simulate_q(zp, zq)
+    assert acc > 0.99 and tv < 0.02
+
+
+def test_rs_fp32_edge_disjoint_support():
+    mx.random.seed(13)
+    zp = _dist_logits([0.6, 0.4, 0.0, 0.0])
+    zq = _dist_logits([0.0, 0.0, 0.5, 0.5])
+    acc, tv, _ = _simulate_q(zp, zq)
+    assert acc < 1e-3 and tv < 0.02                      # every draft rejected, residual == p
+
+
+def test_rs_fp32_edge_single_survivor():
+    from exo.worker.engines.mlx.patches.glm52_mtp import _rs_residual_logits, _target_logits
+
+    mx.random.seed(14)
+    # target: one token survives min_p; proposal draws elsewhere half the time
+    row = _dist_logits([0.97, 0.01, 0.01, 0.01])
+    pol = {"temperature": 1.0, "top_p": 1.0, "min_p": 0.5, "top_k": 0}
+    zp = _target_logits(row, pol)
+    zq = _dist_logits([0.5, 0.5, 0.0, 0.0])
+    acc, tv, mx_tok = _simulate_q(zp, zq)
+    assert tv < 0.02 and mx_tok == 0
+    # one-hot residual when the draft is the only survivor must not be all -inf
+    r = _rs_residual_logits(zp, mx.array([0]))
+    assert bool(mx.any(r > -float("inf")).item())
+
+
+def test_target_logits_are_float32():
+    from exo.worker.engines.mlx.patches.glm52_mtp import _target_logits
+
+    z = _target_logits(mx.zeros((2, 8), dtype=mx.bfloat16), {"temperature": 0.7, "top_p": 0.9, "min_p": 0.05, "top_k": 0})
+    assert z.dtype == mx.float32
+
+
+def test_verify_pad_rows_are_dropped(off_stream, sidecar):
+    model, ref = off_stream
+    for pad in (1, 2):
+        holder = []
+        state = _battle_state(model, sidecar, k=1)
+        state.verify_pad = pad
+        state.draft_multi = _oracle_draftk(holder, 1)  # type: ignore[method-assign]
+        holder.append(state)
+        _attach(model, state)
+        try:
+            _, toks, last = _run_bg(model, PROMPT, N_GEN)
+        finally:
+            _detach(model)
+        assert toks == ref, pad
+        assert last.prompt_cache[0][0].offset == len(last.all_tokens)
+
+
+def test_reset_terminal_clears_parked_packages(off_stream, sidecar):
+    from exo.worker.engines.mlx.patches import glm52_mtp as gm
+
+    model, _ = off_stream
+    state = _battle_state(model, sidecar, k=1); _attach(model, state)
+    try:
+        gm.mtp_prefill_begin(model, 0, 8)
+        _capture_prompt_hidden(model, PROMPT[:-1])
+        gm.mtp_prefill_chunk(model, PROMPT[:-1])
+        gm._park_pending(state)
+        assert state.ready
+        gm.finalize_glm52_mtp_request(model, None, reason="close")
+        assert not state.ready and state.pending is None and state.uid is None
+    finally:
+        _detach(model)
