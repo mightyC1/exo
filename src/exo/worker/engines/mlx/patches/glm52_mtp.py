@@ -1188,6 +1188,8 @@ def _battle_step(state: _MTPState, prev_step: Any, batch: Any):
             state.mtp_backlog = []
             if state.prompt_ctx:
                 state.gen_pairs.extend(pairs_spec)
+            if state.cache_window > 0 and spec_entries:
+                state.recent.extend(pairs_spec)
             spec_arrays = [d1n, h_mtpn] + ([zqn] if zqn is not None else [])
         else:
             # reject at m: keep the m accepted pairs (already in the cache),
@@ -1202,6 +1204,8 @@ def _battle_step(state: _MTPState, prev_step: Any, batch: Any):
             state.mtp_backlog = [] if spec_entries else [(hv[:, i:i + 1, :], drafts[i]) for i in range(m)]
             if state.prompt_ctx:
                 state.gen_pairs.extend(pairs_spec[:m])
+            if state.cache_window > 0 and spec_entries:
+                state.recent.extend(pairs_spec[:keep])
             if zs is not None:
                 pend = (mx.random.categorical(_rs_residual_logits_q(zs[m], zq_rows[m])) if full_q
                         else mx.random.categorical(_rs_residual_logits(zs[m], drafts[m])))
