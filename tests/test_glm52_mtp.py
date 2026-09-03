@@ -1451,10 +1451,13 @@ def test_prompt_ingest_skipped_on_prefix_hit_or_mismatch(off_stream, sidecar):
 
         class B:
             tokens = [[1, 2, 3, 4, 5, 6, 7, 8]]   # a different prompt
+            _next_tokens = mx.array([9], dtype=mx.uint32)
+            prompt_cache = []
         state.start_request(uid=9)
         gm._adopt_prefill(state, B())
         assert state.pending is None and state.mtp_cache[0].offset == 0
-        assert any("prompt mismatch" in line for line in state.logger.lines)
+        assert any("no matching package" in line for line in state.logger.lines)
+        assert len(state.ready) == 1          # the package stays parked for its own request
     finally:
         _detach(model)
 
@@ -1661,3 +1664,47 @@ def test_cf_telemetry_accumulates(off_stream, sidecar):
     vals = {kv.split("=")[0]: float(kv.split("=")[1]) for kv in line.split() if kv.startswith("cf_")}
     assert 0.0 <= vals["cf_onehot"] <= 1.0 and 0.0 <= vals["cf_fullq"] <= 1.0
     assert vals["cf_onehot"] <= vals["cf_top2"] + 1e-6 <= vals["cf_top4"] + 1e-6
+
+
+def test_prompt_ingest_interleaved_prefills_match_their_requests(off_stream, sidecar):
+    """Two prefills before either request starts: each request adopts its own
+    package (matched by main cache position + token tail), not the last one."""
+    from exo.worker.engines.mlx.patches import glm52_mtp as gm
+    from mlx_lm.models.cache import CacheList, KVCache
+
+    model, _ = off_stream
+    mx.random.seed(3)
+    pa = [int(x) for x in mx.random.randint(0, 97, (30,)).tolist()]
+    pb = [int(x) for x in mx.random.randint(0, 97, (14,)).tolist()]
+    state = _battle_state(model, sidecar, k=1); _attach(model, state)
+    try:
+        for prompt in (pa, pb):
+            prefix = prompt[:-1]
+            gm.mtp_prefill_begin(model, 0, len(prefix))
+            _capture_prompt_hidden(model, prefix)
+            gm.mtp_prefill_chunk(model, prefix)
+        gm._park_pending(state)
+        assert len(state.ready) == 2
+
+        def fake_batch(prompt):
+            main = CacheList(KVCache(), KVCache())
+            main.caches[0].offset = len(prompt) - 1
+            main.caches[1].offset = len(prompt) - 1
+
+            class B:
+                tokens = [[prompt[-2]]]
+                _next_tokens = mx.array([prompt[-1]], dtype=mx.uint32)
+                prompt_cache = [main]
+            return B()
+
+        # request A (the longer prompt) starts first — must get package A, not B
+        state.start_request(uid=1)
+        gm._adopt_prefill(state, fake_batch(pa))
+        assert state.mtp_cache[0].offset == len(pa) - 1, state.logger.lines[-2:]
+        assert len(state.ready) == 1
+        state.start_request(uid=2)
+        gm._adopt_prefill(state, fake_batch(pb))
+        assert state.mtp_cache[0].offset == len(pb) - 1
+        assert len(state.ready) == 0
+    finally:
+        _detach(model)

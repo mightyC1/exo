@@ -286,7 +286,8 @@ class _MTPState:
         self.cf = False                      # counterfactual telemetry (alpha one-hot vs full-q)
         self.cf_acc: mx.array | None = None  # lazy (2,) accumulator [alpha_onehot, alpha_fullq]
         self.cf_n = 0
-        self.pending: dict[str, Any] | None = None  # MTP cache built during prompt prefill
+        self.pending: dict[str, Any] | None = None  # package currently being filled by prefill
+        self.ready: list[dict[str, Any]] = []       # completed packages awaiting their request (≤4)
         self.shadow_disabled = False
         self.prev_ran = False   # exactly-once guard for the real step
         self.in_resolve = False # inside the target verify eval / collectives
@@ -352,7 +353,7 @@ class _MTPState:
         self.flush_pack = None
         self.cycle_pack = None
 
-    def finish(self) -> None:
+    def finish(self, why: str = "finish") -> None:
         if self.lazy_match is not None:  # materialize the last shadow comparison
             try:
                 self.account(bool(self.lazy_match.item()))
@@ -360,7 +361,7 @@ class _MTPState:
                 pass
             self.lazy_match = None
         if self.uid is not None and (self.steps or self.cycles):
-            self._summary("finish")
+            self._summary(why)
         self.reset()
 
     # -- shadow accounting ---------------------------------------------------
@@ -897,7 +898,7 @@ def _battle_step(state: _MTPState, prev_step: Any, batch: Any):
     )
 
     if len(batch.uids) != 1:
-        state.reset()
+        state.finish(why="batch-merge")   # MTP is B==1 only; the request continues in the batch
         return prev_step(batch)
     uid = batch.uids[0]
     if state.uid != uid:
@@ -1441,11 +1442,25 @@ def mtp_prefill_begin(model: Any, start_offset: int, n_tokens: int) -> None:
     # pair i = (h_i, t_{i+1}); the last prompt pair is i = n_tokens-2 (the
     # carried one is completed at adoption). A window keeps only the last W.
     start = 0 if state.prefill_window <= 0 else max(0, n_tokens - 1 - state.prefill_window)
+    _park_pending(state)
     state.pending = {
         "cache": CacheList(KVCache(), KVCache()), "carry_h": None,
         "n": 0, "ingested": 0, "toks": [], "t0": time.perf_counter(),
         "start": start, "base": int(start_offset),
     }
+
+
+def _park_pending(state: _MTPState) -> None:
+    """Prefills can interleave (a second request arrives while the first is
+    still being prefilled, or before it starts generating). Completed packages
+    are parked and matched to their request at the seed step instead of one
+    package overwriting the other."""
+    pend = state.pending
+    state.pending = None
+    if pend is not None and pend["carry_h"] is not None and pend["n"] > 0:
+        state.ready.append(pend)
+        if len(state.ready) > 4:
+            state.ready.pop(0)
 
 
 def mtp_prefill_chunk(model: Any, chunk_tokens: list[int]) -> None:
@@ -1529,11 +1544,31 @@ def _drop_prompt_context(state: _MTPState) -> None:
 def _adopt_prefill(state: _MTPState, batch: Any) -> None:
     """At request start: attach the prompt-prefilled MTP cache if it belongs
     to this request's prompt, ingesting the final carried pair."""
-    pend = state.pending
-    state.pending = None
-    if pend is None or pend["carry_h"] is None:
-        return
+    _park_pending(state)
     t = list(batch.tokens[0])
+    try:
+        main_pos = _cur(batch.prompt_cache[0][0])
+    except Exception:
+        main_pos = None
+    # pick the package whose (base + n) matches the main cache position and
+    # whose ingested tokens end with the committed tail
+    pend = None
+    for cand in reversed(state.ready):
+        base_n = cand.get("base", 0) + cand["n"]
+        if main_pos is not None and base_n != main_pos:
+            continue
+        toks_c, n_c = cand["toks"], cand["n"]
+        if (len(t) == n_c + 1 and t[:n_c] == toks_c) or (0 < len(t) <= n_c and toks_c[n_c - len(t):] == t):
+            pend = cand
+            break
+    if pend is None:
+        if state.ready:
+            state.logger.info(
+                f"[MTP] prompt ingest discarded: no matching package "
+                f"(tokens={len(t)} main_pos={main_pos} parked={[(c.get('base', 0), c['n']) for c in state.ready]})"
+            )
+        return
+    state.ready.remove(pend)
     n = pend["n"]
     toks = pend["toks"]
     # Structural match. exo prefills prompt[:-1] itself and inserts only the
