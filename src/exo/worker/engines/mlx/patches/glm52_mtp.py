@@ -284,7 +284,7 @@ class _MTPState:
         self.prefill_cycles = 64             # drop prompt context after N cycles (0 = keep)
         self.prompt_ctx = False              # MTP cache currently holds prompt context
         self.gen_pairs: list[tuple[mx.array, mx.array]] = []
-        self.cache_window = 2048             # roll the MTP cache to the last W pairs (0 = never)
+        self.cache_window = 512              # roll the MTP cache to the last W pairs (0 = never)
         self.cache_slack = _CACHE_WINDOW_SLACK
         self.recent: collections.deque = collections.deque(maxlen=2048 + _CACHE_WINDOW_SLACK)
         self.rolls = 0
@@ -1263,7 +1263,7 @@ def _battle_step(state: _MTPState, prev_step: Any, batch: Any):
     state.account_cycle(m)
     if state.prompt_ctx and state.prefill_cycles > 0 and state.cycles >= state.prefill_cycles:
         _drop_prompt_context(state)
-    elif state.cache_window > 0:
+    if state.cache_window > 0:
         _roll_mtp_cache(state)
     if state.validate:
         _validate_cycle(state, batch, m, base=base_off)
@@ -1614,6 +1614,8 @@ def _roll_mtp_cache(state: _MTPState) -> None:
     cache at the last `cache_window` committed pairs."""
     if state.mtp_cache is None or state.spec_next is not None or state.mtp_backlog:
         return
+    if state.prompt_ctx:
+        return   # the prompt context lives for prefill_cycles; its drop resets the window
     if _cur(state.mtp_cache[0]) <= state.cache_window + state.cache_slack:
         return
     pairs = list(state.recent)[-state.cache_window:]
@@ -1837,7 +1839,7 @@ def apply_glm52_mtp_patch(
     spec_draft = _env_int(_ENV_SPEC_DRAFT, 0, 0, 1, logger) == 1
     verify_pad = _env_int(_ENV_VERIFY_PAD, 0, 0, 2, logger)
     moe_sort_min = _env_int(_ENV_MOE_SORT_MIN, 64, 1, 1 << 20, logger)
-    cache_window = _env_int(_ENV_CACHE_WINDOW, 2048, 0, 1 << 20, logger)
+    cache_window = _env_int(_ENV_CACHE_WINDOW, 512, 0, 1 << 20, logger)
     if moe_sort_min != 64:
         from exo.worker.engines.mlx.patches.glm52_indexshare import install_moe_sort_override
 
