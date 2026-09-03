@@ -279,7 +279,7 @@ class _MTPState:
         self.prompt_ctx = False              # MTP cache currently holds prompt context
         self.gen_pairs: list[tuple[mx.array, mx.array]] = []
         self.retired: list[Any] = []         # caches swapped out mid-request; freed at finish
-        self.proposal = "argmax"             # draft proposal under sampling: argmax | sample
+        self.proposal = "sample"             # draft proposal under sampling: sample (measured +0.04) | argmax
         self.spec_draft = False              # M1.5-lite: measured net-zero/negative on MLX; opt-in
         self.spec_next: tuple | None = None  # (d1, h_mtp, zq) valid for the next cycle
         self.cycle_spec_entries = 0          # MTP entries this cycle's spec left in the cache
@@ -1658,7 +1658,7 @@ def apply_glm52_mtp_patch(
     prefill_enabled = _env_int(_ENV_PREFILL, 1, 0, 1, logger) == 1
     prefill_window = _env_int(_ENV_PREFILL_WINDOW, 2048, 0, 1 << 20, logger)
     prefill_cycles = _env_int(_ENV_PREFILL_CYCLES, 64, 0, 1 << 20, logger)
-    proposal = _env_choice(_ENV_PROPOSAL, "argmax", {"argmax", "sample"}, logger)
+    proposal = _env_choice(_ENV_PROPOSAL, "sample", {"argmax", "sample"}, logger)
     cf = _env_int(_ENV_CF, 0, 0, 1, logger) == 1
     spec_draft = _env_int(_ENV_SPEC_DRAFT, 0, 0, 1, logger) == 1
 
