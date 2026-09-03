@@ -295,6 +295,7 @@ class _MTPState:
         self.prof_draft = False              # PROF=2: synchronous draft block/head timing
         self.p_draft_block = 0.0
         self.p_draft_head = 0.0
+        self.p_drain = 0.0
         self.q_temperature: float | None = None  # proposal temperature override (None = target's)
         self.spec_next: tuple | None = None  # (d1, h_mtp, zq) valid for the next cycle
         self.cycle_spec_entries = 0          # MTP entries this cycle's spec left in the cache
@@ -1018,13 +1019,17 @@ def _battle_step(state: _MTPState, prev_step: Any, batch: Any):
     zq_rows = [zq1]
     drafts = [d1]
     if state.prof_draft:
-        # PROF=2: synchronous draft timing (adds one sync per cycle; measurement only).
-        # Splits the draft into block (hidden) and LM head (+ sampling) costs.
+        # PROF=2: synchronous draft timing (adds syncs; measurement only).
+        # drain = waiting for the previous cycle's async train (main-cache
+        # updates etc.) to finish; block / head = the draft's own cost.
+        _ts = time.perf_counter()
+        mx.synchronize()
         _td0 = time.perf_counter()
         mx.eval(h_mtp)
         _td1 = time.perf_counter()
         mx.eval(d1)
         _td2 = time.perf_counter()
+        state.p_drain += _td0 - _ts
         state.p_draft_block += _td1 - _td0
         state.p_draft_head += _td2 - _td1
     chain_before = _cur(state.mtp_cache[0]) if state.mtp_cache is not None else 0
@@ -1249,11 +1254,12 @@ def _battle_step(state: _MTPState, prev_step: Any, batch: Any):
                 f"build_ms={1e3 * state.p_build / n:.2f} "
                 f"resolve_ms={1e3 * state.p_resolve / n:.2f} "
                 f"post_ms={1e3 * state.p_post / n:.2f}"
-                + (f" draft_block_ms={1e3 * state.p_draft_block / n:.2f} "
+                + (f" drain_ms={1e3 * state.p_drain / n:.2f} "
+                   f"draft_block_ms={1e3 * state.p_draft_block / n:.2f} "
                    f"draft_head_ms={1e3 * state.p_draft_head / n:.2f}" if state.prof_draft else "")
             )
             state.p_build = state.p_resolve = state.p_post = 0.0
-            state.p_draft_block = state.p_draft_head = 0.0
+            state.p_draft_block = state.p_draft_head = state.p_drain = 0.0
     state.account_cycle(m)
     if state.prompt_ctx and state.prefill_cycles > 0 and state.cycles >= state.prefill_cycles:
         _drop_prompt_context(state)
