@@ -1045,6 +1045,15 @@ def _battle_step(state: _MTPState, prev_step: Any, batch: Any):
         _t1 = time.perf_counter()
     state.in_resolve = True
     try:
+        if spec is not None:
+            # Launch verify + speculative draft together: the host traversal
+            # of the draft graph then overlaps the GPU verify instead of
+            # landing in the post phase; the wait below returns as soon as
+            # the accept flags are ready while the draft keeps running.
+            mx.async_eval(
+                *accs, y, spec[0], spec[1], *([spec[2]] if spec[2] is not None else []),
+                *state.mtp_cache_arrays(),
+            )
         mx.eval(*accs, y)
     finally:
         state.in_resolve = False
