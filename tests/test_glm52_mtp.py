@@ -2086,3 +2086,97 @@ def test_sidecar_provenance_binding(sidecar, tmp_path):
     raw, why = gm._validate_sidecar(w, LAYER, quant=None, logger=log3, base_config_sha="a" * 64)
     assert raw is not None and why == "ok"
     assert not any("legacy manifest" in l for l in log3.lines)
+
+
+# ---------------------------------------------------------------------------
+# 0062: iteration KVShare/IndexShare
+# ---------------------------------------------------------------------------
+
+
+def test_iter_share_frozen_offsets_and_byte_equal(off_stream, sidecar):
+    """Share chain (dense regime on the tiny model): iterations >=1 write
+    nothing — lat/idx frozen, trim=0 — and the greedy stream stays
+    byte-identical to OFF (proposal-independence of the emitted tokens)."""
+    import re
+
+    from exo.worker.engines.mlx.patches import glm52_mtp as gm
+
+    model, ref = off_stream
+    st = _battle_state(model, sidecar, k=3)
+    assert gm._install_chain_tap(st, st.logger)
+    st.iter_share = True
+    st.chain_trace = True
+    _attach(model, st)
+    try:
+        _, toks, _ = _run_bg(model, PROMPT, N_GEN)
+    finally:
+        _detach(model)
+    assert toks == ref
+    assert not any("mixed chain for this cycle" in l for l in st.logger.lines)
+    lines = [l for l in st.logger.lines if "[MTP_CHAIN]" in l]
+    assert lines, st.logger.lines
+    row = re.compile(r"it=(\d+) lat=(\d+)->(\d+) idx=(\d+)->(\d+) topk=(\S+)")
+    checked = 0
+    for l in lines:
+        rows = row.findall(l)
+        if len(rows) != 3:
+            continue
+        assert "trim=0" in l, l
+        for it, lat0, lat1, idx0, idx1, tk in rows[1:]:
+            assert lat0 == lat1 and idx0 == idx1, l     # read-only iterations
+            assert tk == "dense", l                     # tiny cache: dense anchor
+        checked += 1
+    assert checked >= 3, lines[:4]
+
+
+def test_iter_share_sparse_reuses_topk(off_stream, sidecar):
+    """Past index_topk (=64 in tiny args): iteration 0 captures a real topk via
+    the tap; draft_share reuses it read-only — offsets frozen, digest of the
+    reused topk equals iteration 0's, output finite."""
+    from exo.worker.engines.mlx.patches import glm52_mtp as gm
+
+    model, _ = off_stream
+    st = _battle_state(model, sidecar, k=2)
+    assert gm._install_chain_tap(st, st.logger)
+    st.start_request(0)
+    mx.random.seed(3)
+    n = 70                                    # > index_topk=64 -> sparse
+    h_seq = mx.random.normal((1, n, HID)).astype(mx.bfloat16)
+    t_seq = (mx.arange(n) % 97).reshape(1, n).astype(mx.uint32)
+    st.ingest(st.mtp_cache, h_seq, t_seq)
+    mx.eval(*st.mtp_cache_arrays())
+    assert gm._cur(st.mtp_cache[0]) == n
+
+    st.share_capture = True
+    h0 = mx.random.normal((1, 1, HID)).astype(mx.bfloat16)
+    d0, hrec, _ = st.draft_multi([(h0, mx.array([5], dtype=mx.uint32))])
+    st.share_capture = False
+    cap = st.share_topk
+    assert cap is not None and cap[1] is not None, "sparse topk must be captured"
+    anchor = gm._cur(st.mtp_cache[0])
+    assert anchor == n + 1
+
+    d1, hrec1, lg1 = st.draft_share(hrec, d0, cap[1], anchor)
+    d2, hrec2, lg2 = st.draft_share(hrec1, d1, cap[1], anchor + 1)
+    mx.eval(d1, d2, lg1, lg2)
+    assert gm._cur(st.mtp_cache[0]) == anchor           # nothing written
+    assert gm._cur(st.mtp_cache[1]) == anchor           # indexer-K untouched
+    assert bool(mx.all(mx.isfinite(lg1.astype(mx.float32))).item())
+    assert bool(mx.all(mx.isfinite(lg2.astype(mx.float32))).item())
+    assert int(mx.sum(cap[1].astype(mx.int64)).item()) == int(mx.sum(cap[1].astype(mx.int64)).item())
+    st.finish(why="test")
+
+
+def test_iter_share_fallback_to_mixed_without_capture(off_stream, sidecar):
+    """iter_share on but no tap installed: every cycle falls back to the mixed
+    chain with a single warning; stream stays byte-identical to OFF."""
+    model, ref = off_stream
+    st = _battle_state(model, sidecar, k=2)
+    st.iter_share = True                       # tap NOT installed
+    _attach(model, st)
+    try:
+        _, toks, _ = _run_bg(model, PROMPT, N_GEN)
+    finally:
+        _detach(model)
+    assert toks == ref
+    assert any("mixed chain for this cycle" in l for l in st.logger.lines)

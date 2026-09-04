@@ -16,6 +16,10 @@ Env (default **off**, zero prod impact until enabled):
   EXO_GLM52_MTP_CHAIN_TRACE=0|1   observability: per-cycle [MTP_CHAIN] line with
                                   per-iteration latent/indexer cache offsets and
                                   topk/query digests (adds evals; measurement only).
+  EXO_GLM52_MTP_ITER_SHARE=off|on iteration KVShare/IndexShare (GLM-5.2/5.3
+                                  contract): chain iterations >=1 reuse the
+                                  first step's topk + target-derived latent
+                                  anchor read-only; forces SPEC_DRAFT off.
   EXO_GLM52_MTP_ROLL_PROBE=0|1    observability: first greedy draft after a cache
                                   roll is re-run on the retired cache; logs
                                   TV/argmax/top8 ([MTP_ROLL_PROBE]) and the 32-cycle
@@ -65,6 +69,7 @@ _ENV_VALIDATE = "EXO_GLM52_MTP_VALIDATE"
 _ENV_DRAFT_K = "EXO_GLM52_MTP_DRAFT_K"
 _ENV_CHAIN_TRACE = "EXO_GLM52_MTP_CHAIN_TRACE"
 _ENV_ROLL_PROBE = "EXO_GLM52_MTP_ROLL_PROBE"
+_ENV_ITER_SHARE = "EXO_GLM52_MTP_ITER_SHARE"
 _ENV_TRACE = "EXO_GLM52_MTP_TRACE"
 _ENV_PROF = "EXO_GLM52_MTP_PROF"
 _ENV_HIDDEN = "EXO_GLM52_MTP_HIDDEN"
@@ -303,6 +308,9 @@ class _MTPState:
         self.chain_iter: int | None = None   # draft-site tag: 0 = cycle draft, 1..k-1 = chain
         self.chain_rows: list[tuple] = []    # tap rows: (iter, topk_sum|None, qr_sum)
         self.chain_lat: list[tuple] = []     # loop rows: (iter, lat0, idx0, lat1, idx1)
+        self.iter_share = False              # 0062: KVShare/IndexShare chain
+        self.share_capture = False           # tap records iteration-0 topk when set
+        self.share_topk: tuple | None = None # ("ok", topk_or_None) captured at iter 0
         self.roll_probe = False              # [MTP_ROLL_PROBE]/[MTP_ROLL_ACCEPT]
         self.probe_pending = False
         self.acc_ring: collections.deque = collections.deque(maxlen=32)
@@ -376,6 +384,8 @@ class _MTPState:
         self.chain_lat = []
         self.chain_iter = None
         self.probe_pending = False
+        self.share_capture = False
+        self.share_topk = None
         self.acc_ring.clear()
         self.roll_mark = None
         self.roll_pre_acc = None
@@ -525,6 +535,33 @@ class _MTPState:
             # Full-q proposal: draft ~ q = the head's own distribution under the
             # request's sampling transform (optionally its own temperature —
             # any q is valid, acceptance is 1 - TV(p, q)).
+            pol_q = self.policy if self.q_temperature is None else dict(self.policy, temperature=self.q_temperature)
+            zq = _target_logits(logits - mx.logsumexp(logits, axis=-1, keepdims=True), pol_q)
+            return mx.random.categorical(zq).reshape(1), h_rec, zq
+        return mx.argmax(logits, axis=-1).reshape(1), h_rec, logits
+
+    def draft_share(self, h: mx.array, tok: mx.array, topk0: mx.array | None,
+                    q_offset: int) -> Any:
+        """Iteration KVShare/IndexShare (0062): read-only MTP forward for chain
+        iterations >=1. The query side is recomputed at position ``q_offset``;
+        K/V are the latent anchor as of iteration 0 (target-derived entries
+        only); iteration-0's topk is reused (None -> dense over the anchor).
+        Writes nothing: no latent append, no indexer-K, no topk recompute —
+        matching how the 5.2/5.3 head is trained and served."""
+        e = self.mtp.enorm(self.embed(tok.reshape(1, 1)))
+        hh = self.mtp.hnorm(h.astype(e.dtype))
+        x = mx.concatenate([e, hh] if self.concat == "eh" else [hh, e], axis=-1)
+        x = self.mtp.eh_proj(x)
+        blk = self.mtp.block
+        xi = blk.input_layernorm(x)
+        r = _share_attn(blk.self_attn, xi, self.mtp_cache, topk0, q_offset)
+        hres = x + r
+        y = hres + blk.mlp(blk.post_attention_layernorm(hres))
+        h_raw = y[:, -1:, :]
+        h_post = self.mtp.head_norm(h_raw)
+        logits = self.lm_head(h_post)[..., -1, :]
+        h_rec = h_post if self.recycle == "post" else h_raw
+        if self.proposal == "sample" and self.request_sampling and self.policy is not None:
             pol_q = self.policy if self.q_temperature is None else dict(self.policy, temperature=self.q_temperature)
             zq = _target_logits(logits - mx.logsumexp(logits, axis=-1, keepdims=True), pol_q)
             return mx.random.categorical(zq).reshape(1), h_rec, zq
@@ -984,6 +1021,38 @@ def _apply_processors_rows(
     return mx.stack(rows, axis=1)
 
 
+def _share_attn(attn: Any, x: mx.array, cache: Any, topk0: mx.array | None,
+                q_offset: int) -> mx.array:
+    """Read-only DSA attention for share iterations: mirrors the pinned L=1
+    decode path (query rope at ``q_offset``, topk gather, pe_scores as the
+    additive mask) but reads the latent anchor views instead of
+    update_and_fetch. The indexer is not invoked at all."""
+    from mlx_lm.models.base import scaled_dot_product_attention
+
+    B, L, _ = x.shape
+    qr = attn.q_a_layernorm(attn.q_a_proj(x))
+    q = attn.q_b_proj(qr)
+    q = q.reshape(B, L, attn.num_heads, attn.q_head_dim).transpose(0, 2, 1, 3)
+    q_nope, q_pe = mx.split(q, [attn.qk_nope_head_dim], axis=-1)
+    q_pe = attn.rope(q_pe, q_offset)
+    anchor = _cur(cache.caches[0])
+    kv_latent = cache.caches[0].keys[:, :, :anchor, :]
+    k_pe = cache.caches[0].values[:, :, :anchor, :]
+    if topk0 is not None:
+        idx = topk0[:, :, -1, :, None]      # last row of iteration-0's topk (L rows)
+        kv_latent = mx.take_along_axis(
+            kv_latent, mx.broadcast_to(idx, idx.shape[:-1] + (kv_latent.shape[-1],)), axis=2)
+        k_pe = mx.take_along_axis(
+            k_pe, mx.broadcast_to(idx, idx.shape[:-1] + (k_pe.shape[-1],)), axis=2)
+    pe_scores = (q_pe * attn.scale) @ k_pe.swapaxes(-1, -2)
+    q_nope = attn.embed_q(q_nope)
+    out = scaled_dot_product_attention(
+        q_nope, kv_latent, kv_latent, cache=cache, scale=attn.scale, mask=pe_scores)
+    out = attn.unembed_out(out)
+    out = out.transpose(0, 2, 1, 3).reshape(B, L, -1)
+    return attn.o_proj(out)
+
+
 def _chain_offs(state: _MTPState) -> tuple[int, int]:
     """(latent, indexer) cache offsets of the MTP CacheList; host ints, no sync."""
     c = state.mtp_cache
@@ -1116,6 +1185,7 @@ def _battle_step(state: _MTPState, prev_step: Any, batch: Any):
         return result
 
     k = state.draft_k
+    share = state.iter_share and k >= 2 and not state.spec_draft
     pairs = state.mtp_backlog + [(state.h_last, y.reshape(-1)[0:1])]
     state.mtp_backlog = []
     if state.prompt_ctx:
@@ -1133,10 +1203,22 @@ def _battle_step(state: _MTPState, prev_step: Any, batch: Any):
         if state.chain_trace:
             _lat0, _idx0 = _chain_offs(state)
             state.chain_iter = 0
+        if share:
+            state.share_topk = None
+            state.share_capture = True
         try:
-            res = state.draft_multi(pairs)
+            if share:
+                from exo.worker.engines.mlx.patches.glm52_indexshare import (
+                    mtp_verify_context as _vctx,
+                )
+
+                with _vctx():
+                    res = state.draft_multi(pairs)
+            else:
+                res = state.draft_multi(pairs)
         finally:
             state.chain_iter = None
+            state.share_capture = False
         if state.chain_trace:
             state.chain_lat.append((0, _lat0, _idx0, *_chain_offs(state)))
         d1, h_mtp = res[0], res[1]
@@ -1160,23 +1242,34 @@ def _battle_step(state: _MTPState, prev_step: Any, batch: Any):
         state.p_draft_block += _td1 - _td0
         state.p_draft_head += _td2 - _td1
     chain_before = _cur(state.mtp_cache[0]) if state.mtp_cache is not None else 0
+    if share and state.share_topk is None:
+        # tap bypassed (e.g. backlog L>4 would go tiled) — correctness first:
+        # fall back to the mixed chain for this cycle and say so once.
+        share = False
+        _warn_once(state.logger, "sharecap",
+                   "[MTP] iter-share: iteration-0 topk not captured; mixed chain for this cycle")
+    share_topk0 = state.share_topk[1] if share else None
+    share_anchor = _cur(state.mtp_cache[0]) if share else 0
     for _it in range(1, k):
         # chained proposal: the MTP block's own post-norm output stands in
         # for the (not yet computed) main-model hidden of the previous draft.
-        # NOTE (0060 audit): this chain is GLM-5.1 mixed-mode — every iteration
-        # writes its own latent-KV/indexer-K and recomputes topk. GLM-5.2/5.3
-        # train AND serve the head with iteration KVShare/IndexShare instead
-        # (reuse the first step's KV state + topk, later steps read-only, up
-        # to 7 recurrent steps), so depth>=2 here is out-of-distribution for
-        # the share-trained head. [MTP_CHAIN] documents it; the share path is
-        # 0062 (EXO_GLM52_MTP_ITER_SHARE).
+        # Mixed mode (share off) is GLM-5.1 semantics: every iteration writes
+        # its own KV/topk — OOD for the share-trained 5.2/5.3 head (audit P0).
+        # Share mode reuses iteration 0's topk + latent anchor read-only at
+        # position anchor-1+it, matching training (up to 7 recurrent steps).
         if state.chain_trace:
             _lat0, _idx0 = _chain_offs(state)
-            state.chain_iter = _it
-        try:
-            res = state.draft_multi([(h_mtp, drafts[-1])])
-        finally:
-            state.chain_iter = None
+        if share:
+            res = state.draft_share(h_mtp, drafts[-1], share_topk0, share_anchor + _it - 1)
+            if state.chain_trace:
+                _tk = None if share_topk0 is None else mx.sum(share_topk0.astype(mx.int64))
+                state.chain_rows.append((_it, _tk, mx.sum(res[1].astype(mx.float32))))
+        else:
+            state.chain_iter = _it if state.chain_trace else None
+            try:
+                res = state.draft_multi([(h_mtp, drafts[-1])])
+            finally:
+                state.chain_iter = None
         if state.chain_trace:
             state.chain_lat.append((_it, _lat0, _idx0, *_chain_offs(state)))
         d_next, h_mtp = res[0], res[1]
@@ -1936,9 +2029,12 @@ def _install_chain_tap(state: _MTPState, logger: Any) -> bool:
         def _traced_call(self, x, qr, mask, cache=None):
             out = base.__call__(self, x, qr, mask, cache=cache)
             st = getattr(self, "_mtp_chain_state", None)
-            if st is not None and st.chain_iter is not None:
-                tk = None if out is None else mx.sum(out.astype(mx.int64))
-                st.chain_rows.append((st.chain_iter, tk, mx.sum(qr.astype(mx.float32))))
+            if st is not None:
+                if st.share_capture:
+                    st.share_topk = ("ok", out)         # out may be None (dense)
+                if st.chain_iter is not None:
+                    tk = None if out is None else mx.sum(out.astype(mx.int64))
+                    st.chain_rows.append((st.chain_iter, tk, mx.sum(qr.astype(mx.float32))))
             return out
 
         idx.__class__ = type("_ChainTracedIndexer", (base,), {"__call__": _traced_call})
@@ -2032,6 +2128,10 @@ def apply_glm52_mtp_patch(
     proposal = _env_choice(_ENV_PROPOSAL, "sample", {"argmax", "sample"}, logger)
     cf = _env_int(_ENV_CF, 0, 0, 1, logger) == 1
     spec_draft = _env_int(_ENV_SPEC_DRAFT, 0, 0, 1, logger) == 1
+    iter_share = _env_choice(_ENV_ITER_SHARE, "off", {"off", "on"}, logger) == "on"
+    if iter_share and spec_draft:
+        logger.warning("[MTP] ITER_SHARE=on forces SPEC_DRAFT off (v1 incompatibility)")
+        spec_draft = False
     verify_pad = _env_int(_ENV_VERIFY_PAD, 0, 0, 7, logger)
     chain_trace = _env_int(_ENV_CHAIN_TRACE, 0, 0, 1, logger) == 1
     roll_probe = _env_int(_ENV_ROLL_PROBE, 0, 0, 1, logger) == 1
@@ -2103,7 +2203,11 @@ def apply_glm52_mtp_patch(
     state.recent = collections.deque(maxlen=cache_window + _CACHE_WINDOW_SLACK) if cache_window > 0 else collections.deque(maxlen=1)
     state.q_temperature = q_temperature
     state.roll_probe = roll_probe
-    state.chain_trace = chain_trace and _install_chain_tap(state, logger)
+    _tap_ok = _install_chain_tap(state, logger) if (chain_trace or iter_share) else False
+    state.chain_trace = chain_trace and _tap_ok
+    state.iter_share = iter_share and _tap_ok
+    if iter_share and not _tap_ok:
+        logger.warning("[MTP] ITER_SHARE disabled: indexer tap failed")
     state.group = grp
     # Structural invariant (audit 0061): MTP unavailable/off -> the model object
     # tree stays untouched. The final-norm wrapper goes in immediately before
@@ -2129,7 +2233,7 @@ def apply_glm52_mtp_patch(
         f"prompt_prefill={int(prefill_enabled)} prefill_window={prefill_window} "
         f"prefill_cycles={prefill_cycles} proposal={proposal} cf={int(cf)} spec_draft={int(spec_draft)} "
         f"verify_pad={verify_pad} moe_sort_min={moe_sort_min} cache_window={cache_window} q_temp={q_temperature if q_temperature is not None else 'target'} "
-        f"chain_trace={int(state.chain_trace)} roll_probe={int(roll_probe)} "
+        f"chain_trace={int(state.chain_trace)} roll_probe={int(roll_probe)} iter_share={int(state.iter_share)} "
         f"fast_attn={int(fast_attn)} concat={concat} "
         f"validate={int(validate)} mtp_indexer_rope_fixed={int(rope_fixed)} "
         f"weights={weights_path.name} layer_idx={layer_idx}"

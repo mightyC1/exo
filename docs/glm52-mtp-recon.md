@@ -388,6 +388,7 @@ EXO_MODELS_DIRS="/Volumes/Models:/Volumes/Models2" .venv/bin/exo --fast-sync
 | `EXO_GLM52_MTP_VERIFY_PAD` | `0` | 0–7 | измерение: n пустых строк в verify — кривая C(L) до L=k+1+7 (цена sibling-строки на 49k: +12 мс) — не для работы |
 | `EXO_GLM52_MTP_MOE_SORT_MIN` | `64` | ≥1 | измерение: порог сортировки token-expert пар в verify (1 — на 1–1.5 мс хуже) — не для работы |
 | `EXO_GLM52_MTP_CHAIN_TRACE` | `0` | 0/1 | наблюдаемость: `[MTP_CHAIN]` — per-iteration офсеты latent/indexer кэшей MTP и digest'ы topk/qr (первые 8 циклов, потом каждый 64-й; добавляет evals — только для измерений; для чистых трасс `SPEC_DRAFT=0`). База A/B для 0062: под share итерации ≥1 обязаны давать `lat=X->X idx=X->X` и topk == iter0 |
+| `EXO_GLM52_MTP_ITER_SHARE` | `off` | off/on | 0062: KVShare/IndexShare между MTP-итерациями — итерации ≥1 читают latent-anchor и topk итерации 0 read-only (позиция anchor-1+it), ничего не пишут (`[MTP_CHAIN]`: lat/idx `X->X`, trim=0, topk == iter0). Принудительно гасит SPEC_DRAFT; для чистого A/B выключай CACHE_WINDOW. Захват topk it0 — монолитный индексер (verify-ctx), L≤4; k>3 (0063) потребует расширить `_MICRO_DECODE_L` |
 | `EXO_GLM52_MTP_ROLL_PROBE` | `0` | 0/1 | наблюдаемость: первый greedy-драфт после перекатки повторяется на retired-кэше — `[MTP_ROLL_PROBE] tv/argmax_eq/top8` + `[MTP_ROLL_ACCEPT]` (accept-окно roll_acc_win=32 циклов до/после). RNG-free, эмиссия байт-в-байт |
 | `EXO_GLM52_MTP_TRACE` | `0` | N | подробный трейс первых N циклов |
 | `EXO_GLM52_MTP_SPEC_DRAFT` | `0` | 0/1 | M1.5-lite; на MLX не окупается |
