@@ -56,6 +56,11 @@ length). Текущая цепочка (каждая итерация пишет
    (ds32:565–599).
 3. int8 g64 affine: q_a/q_b/kv_a/o, embed_q/unembed_out, switch_mlp×3,
    shared_experts×3 (12 модулей).
+4. **Привязка к чекпойнту (0061):** манифест несёт `base_config_sha256` (+
+   `base_model_type`) исходного config.json; загрузчик сверяет с config.json
+   модели и отвергает чужой side-car (5.2↔5.3) до первого форварда, одинаково
+   на всех рангах (локальный fail → rank-consensus). Старый манифест без
+   ключа грузится с warning «legacy manifest» — перегнать экстрактором.
 4. bf16 навсегда: весь индексер (урок idxbf16), eh_proj и mlp.gate.weight
    (вслед за вендором; routing-чувствительно), все нормы;
    `e_score_correction_bias` — f32 (cast_predicate пина, ds32:666).

@@ -1586,13 +1586,14 @@ def _sha256_file(path: Path) -> str:
 
 def _validate_sidecar(
     weights_path: Path, layer_idx: int, *, quant: dict[str, Any] | None, logger: Any,
-    grp: Any = None,
+    grp: Any = None, base_config_sha: str | None = None,
 ) -> tuple[dict[str, mx.array] | None, str]:
     """Rank-safe wrapper: run the local checks, then ALWAYS join one collective
     with [ok, digest words]; a rank that failed locally still participates (with
     zeros), so no rank can be left waiting in all_sum. Every rank then makes the
     same decision."""
-    raw, reason, digest = _validate_sidecar_local(weights_path, layer_idx, quant=quant, logger=logger)
+    raw, reason, digest = _validate_sidecar_local(
+        weights_path, layer_idx, quant=quant, logger=logger, base_config_sha=base_config_sha)
     ok = raw is not None
     words = [int(digest[i:i + 8], 16) & 0x7FFFFFFF for i in range(0, 64, 8)] if ok else [0] * 8
     agree, total = _rank_consensus(grp, [1 if ok else 0] + words)
@@ -1605,7 +1606,8 @@ def _validate_sidecar(
 
 
 def _validate_sidecar_local(
-    weights_path: Path, layer_idx: int, *, quant: dict[str, Any] | None, logger: Any
+    weights_path: Path, layer_idx: int, *, quant: dict[str, Any] | None, logger: Any,
+    base_config_sha: str | None = None,
 ) -> tuple[dict[str, mx.array] | None, str, str]:
     """Fail-closed side-car validation: manifest present, byte size and
     SHA-256 match, policy fields agree with the model, required tensor
@@ -1632,6 +1634,14 @@ def _validate_sidecar_local(
         have = pol.get(key)
         if have is not None and int(have) != want:
             return None, f"manifest policy {key}={have} != model {want}", ""
+    want_cfg = manifest.get("base_config_sha256")
+    if want_cfg is None:
+        logger.warning("[MTP] legacy manifest without base-checkpoint binding; re-extract to bind the side-car")
+    elif base_config_sha is not None and str(want_cfg) != base_config_sha:
+        return None, (
+            f"side-car bound to another base checkpoint "
+            f"(manifest config sha {str(want_cfg)[:12]}… != model {base_config_sha[:12]}…)"
+        ), ""
     t0 = time.perf_counter()
     digest = _sha256_file(weights_path)
     if digest != str(manifest.get("sha256", "")):
@@ -1992,8 +2002,13 @@ def apply_glm52_mtp_patch(
     except Exception:
         logger.opt(exception=True).warning("[MTP] distributed group unavailable; patch not applied")
         return model
+    try:
+        base_cfg_sha = hashlib.sha256((model_path / "config.json").read_bytes()).hexdigest()
+    except Exception:
+        base_cfg_sha = None
     raw, reason = _validate_sidecar(
-        weights_path, layer_idx, quant=config.get("quantization"), logger=logger, grp=grp
+        weights_path, layer_idx, quant=config.get("quantization"), logger=logger, grp=grp,
+        base_config_sha=base_cfg_sha,
     )
     if raw is None:
         logger.warning(f"[MTP] {reason}; patch not applied")
@@ -2065,7 +2080,7 @@ def apply_glm52_mtp_patch(
         store = norm._store
         object.__setattr__(norm, "_mode", hidden_mode)
     elif isinstance(norm, nn.RMSNorm):
-        inner.norm = _PreNormCapture(norm, store, mode=hidden_mode)
+        pass                       # wrapped just before hook install (rollback window)
     else:
         logger.warning("[MTP] final norm is not RMSNorm; patch not applied")
         return model
@@ -2090,7 +2105,23 @@ def apply_glm52_mtp_patch(
     state.roll_probe = roll_probe
     state.chain_trace = chain_trace and _install_chain_tap(state, logger)
     state.group = grp
-    if not _install_hooks(logger):
+    # Structural invariant (audit 0061): MTP unavailable/off -> the model object
+    # tree stays untouched. The final-norm wrapper goes in immediately before
+    # the hook install; any failure of either restores the original norm.
+    _wrapped_norm = None
+    if not isinstance(inner.norm, _PreNormCapture):
+        inner.norm = _PreNormCapture(norm, store, mode=hidden_mode)
+        _wrapped_norm = norm
+    try:
+        _hooks_ok = _install_hooks(logger)
+    except Exception:
+        if _wrapped_norm is not None:
+            inner.norm = _wrapped_norm
+        logger.opt(exception=True).warning("[MTP] hook install failed; final norm restored, patch not applied")
+        return model
+    if not _hooks_ok:
+        if _wrapped_norm is not None:
+            inner.norm = _wrapped_norm
         return model
     model._exo_glm52_mtp_state = state
     logger.info(

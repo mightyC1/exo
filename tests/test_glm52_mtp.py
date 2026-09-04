@@ -973,7 +973,22 @@ def _model_dir_for(tmp_path, sidecar: Path, mutate=None) -> Path:
     }))
     if mutate:
         mutate(d)
+    try:
+        _bind_manifest_to(d)
+    except Exception:
+        pass          # mutated/absent manifest or config: leave it as the test made it
     return d
+
+
+def _bind_manifest_to(d: Path) -> None:
+    """Re-bind the copied manifest to this model dir's config.json — the test
+    simulates a side-car extracted from that very checkpoint (0061 binding)."""
+    import hashlib as _hl
+
+    man = d / "mtp.manifest.json"
+    mj = json.loads(man.read_text())
+    mj["base_config_sha256"] = _hl.sha256((d / "config.json").read_bytes()).hexdigest()
+    man.write_text(json.dumps(mj))
 
 
 def _apply_on_tiny(model, d, monkeypatch):
@@ -1996,3 +2011,78 @@ def test_roll_probe_logs_and_is_byte_neutral(off_stream, sidecar):
     acc = [l for l in st.logger.lines if "[MTP_ROLL_ACCEPT]" in l]
     assert acc and "pre" in acc[0] and "post" in acc[0], st.logger.lines[-6:]
     del ref_state
+
+
+# ---------------------------------------------------------------------------
+# 0061: fail-close hardening + side-car provenance binding
+# ---------------------------------------------------------------------------
+
+
+def _apply_model_dir(tmp_path, sidecar):
+    import shutil
+
+    mdir = tmp_path / "model"; mdir.mkdir()
+    (mdir / "config.json").write_text(json.dumps({
+        "model_type": "glm_moe_dsa", "num_nextn_predict_layers": 1,
+        "num_hidden_layers": LAYER,
+    }))
+    shutil.copy(sidecar, mdir / "mtp.safetensors")
+    shutil.copy(sidecar.with_name("mtp.manifest.json"), mdir / "mtp.manifest.json")
+    _bind_manifest_to(mdir)
+    return mdir
+
+
+def test_apply_restores_norm_on_hook_failure(sidecar, tmp_path, monkeypatch):
+    """Structural invariant: hooks fail (False OR exception) -> the model tree
+    is byte-identical to pre-apply: original norm object back in place, no
+    state attribute."""
+    from exo.worker.engines.mlx.patches import glm52_mtp as gm
+
+    mdir = _apply_model_dir(tmp_path, sidecar)
+    monkeypatch.setenv("EXO_GLM52_MTP", "on")
+    for fail in ("false", "raise"):
+        model = _tiny_model()
+        orig = model.model.norm
+        log = _StubLogger()
+        if fail == "false":
+            monkeypatch.setattr(gm, "_install_hooks", lambda logger: False)
+        else:
+            def _boom(logger):
+                raise RuntimeError("boom")
+            monkeypatch.setattr(gm, "_install_hooks", _boom)
+        assert gm.apply_glm52_mtp_patch(model, mdir, logger=log) is model
+        assert model.model.norm is orig, fail
+        assert not hasattr(model, "_exo_glm52_mtp_state"), fail
+        if fail == "raise":
+            assert any("final norm restored" in l for l in log.lines)
+
+
+def test_sidecar_provenance_binding(sidecar, tmp_path):
+    """Manifest bound to a base checkpoint: mismatch rejects before load;
+    legacy manifest (no key) loads with a warning; match loads clean."""
+    import shutil
+
+    from exo.worker.engines.mlx.patches import glm52_mtp as gm
+
+    d = tmp_path / "prov"; d.mkdir()
+    w = d / "mtp.safetensors"; shutil.copy(sidecar, w)
+    base = json.loads(sidecar.with_name("mtp.manifest.json").read_text())
+
+    mj = dict(base); mj.pop("base_config_sha256", None)
+    (d / "mtp.manifest.json").write_text(json.dumps(mj))
+    log = _StubLogger()
+    raw, why = gm._validate_sidecar(w, LAYER, quant=None, logger=log, base_config_sha="a" * 64)
+    assert raw is not None and why == "ok"
+    assert any("legacy manifest" in l for l in log.lines)
+
+    mj = dict(base); mj["base_config_sha256"] = "b" * 64
+    (d / "mtp.manifest.json").write_text(json.dumps(mj))
+    raw, why = gm._validate_sidecar(w, LAYER, quant=None, logger=_StubLogger(), base_config_sha="a" * 64)
+    assert raw is None and "another base checkpoint" in why
+
+    mj = dict(base); mj["base_config_sha256"] = "a" * 64
+    (d / "mtp.manifest.json").write_text(json.dumps(mj))
+    log3 = _StubLogger()
+    raw, why = gm._validate_sidecar(w, LAYER, quant=None, logger=log3, base_config_sha="a" * 64)
+    assert raw is not None and why == "ok"
+    assert not any("legacy manifest" in l for l in log3.lines)

@@ -34,6 +34,23 @@ Run with the EXO venv python (needs mlx + the pinned mlx-lm for --self-test):
 from __future__ import annotations
 
 import argparse
+
+
+def _base_provenance(src):
+    """Bind the side-car to the exact base checkpoint it was extracted from
+    (audit 0061): SHA-256 of the source config.json + model_type. Missing
+    config -> no binding keys (loader warns about a legacy manifest)."""
+    import hashlib as _hl
+    import json as _js
+    cfg = src / "config.json"
+    if not cfg.is_file():
+        return {}
+    out = {"base_config_sha256": _hl.sha256(cfg.read_bytes()).hexdigest()}
+    try:
+        out["base_model_type"] = str(_js.loads(cfg.read_text()).get("model_type", ""))
+    except Exception:
+        pass
+    return out
 import hashlib
 import json
 import os
@@ -282,6 +299,7 @@ def extract(src: Path, dest: Path) -> int:
         "file": out_path.name,
         "layer": MTP_LAYER,
         "sha256": sha.hexdigest(),
+        **_base_provenance(src),
         "bytes": out_path.stat().st_size,
         "tensors": len(final),
         "quantized_modules": n_q,
