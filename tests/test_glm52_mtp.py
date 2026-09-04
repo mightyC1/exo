@@ -1879,3 +1879,120 @@ def test_mtp_cache_rolls_with_spec_draft(off_stream, sidecar):
         _detach(model)
     assert toks == ref
     assert any("mtp cache rolled" in l for l in state.logger.lines)
+
+
+# ---------------------------------------------------------------------------
+# 0060: cross-iteration observability (chain trace, a1..a7, pad C(L), roll probe)
+# ---------------------------------------------------------------------------
+
+
+def test_chain_trace_documents_mixed_mode_and_is_byte_neutral(off_stream, sidecar):
+    """The [MTP_CHAIN] line must show the *current* mixed-mode signature —
+    every chain iteration advances both MTP sub-caches by one and is trimmed
+    back (trim=k-1) — with per-iteration query digests that differ, and the
+    trace must not perturb the emitted stream."""
+    import re
+
+    from exo.worker.engines.mlx.patches import glm52_mtp as gm
+
+    model, _ = off_stream
+    # reference: real draft, k=3, trace off
+    ref_state, ref_toks, _ = _run_on(model, sidecar, N_GEN, None, k=3)
+    # traced run
+    state, toks, _ = None, None, None
+    st = _battle_state(model, sidecar, k=3)
+    assert gm._install_chain_tap(st, st.logger)
+    st.chain_trace = True
+    _attach(model, st)
+    try:
+        _, toks, _ = _run_bg(model, PROMPT, N_GEN)
+    finally:
+        _detach(model)
+    assert toks == ref_toks
+    lines = [l for l in st.logger.lines if "[MTP_CHAIN]" in l]
+    assert lines, st.logger.lines
+    row = re.compile(r"it=(\d+) lat=(\d+)->(\d+) idx=(\d+)->(\d+) topk=(\S+) qr=(\S+)")
+    full = None
+    for l in lines:
+        rows = row.findall(l)
+        if len(rows) == 3:
+            full = (l, rows)
+            break
+    assert full is not None, lines[:3]
+    l, rows = full
+    for it, lat0, lat1, idx0, idx1, tk, qr in rows:
+        assert int(lat1) == int(lat0) + 1, l     # mixed mode: every iter writes latent
+        assert int(idx1) == int(idx0) + 1, l     # ... and indexer-K
+    assert rows[1][1] == rows[0][2] and rows[2][1] == rows[1][2], l  # contiguous
+    assert "trim=2" in l, l                      # chain entries dropped after the chain
+    qrs = [r[6] for r in rows]
+    assert len(set(qrs)) == 3, l                 # query side differs per iteration
+    # tiny model, tiny cache: the indexer short-circuits below index_topk
+    assert all(r[5] == "dense" for r in rows), l
+    del ref_state
+
+
+def test_acc_pos_tracks_depth7_conditionals(off_stream, sidecar):
+    model, _ = off_stream
+    st = _battle_state(model, sidecar, k=1)
+    st.draft_k = 7                                # counters only; no model run
+    for m in (7, 7, 3, 0):
+        st.account_cycle(m)
+    assert st.acc_pos == [3, 3, 3, 2, 2, 2, 2]
+    st._summary("test")
+    line = next(l for l in st.logger.lines if "MTP_SUMMARY" in l)
+    for frag in ("a1=0.750", "a2=1.000", "a4=0.667", "a7=1.000"):
+        assert frag in line, line
+
+
+def test_verify_pad_extended_range_byte_equal(off_stream, sidecar):
+    """C(L) measurement: pad up to 7 dummy verify rows must leave the stream
+    and every cache offset untouched."""
+    model, ref = off_stream
+    for pad in (5, 7):
+        holder = []
+        state = _battle_state(model, sidecar, k=1)
+        state.verify_pad = pad
+        state.draft_multi = _oracle_draftk(holder, 1)  # type: ignore[method-assign]
+        holder.append(state)
+        _attach(model, state)
+        try:
+            _, toks, last = _run_bg(model, PROMPT, N_GEN)
+        finally:
+            _detach(model)
+        assert toks == ref, pad
+        assert last.prompt_cache[0][0].offset == len(last.all_tokens)
+
+
+def test_roll_probe_logs_and_is_byte_neutral(off_stream, sidecar):
+    """First greedy draft after a roll is compared against the retired cache
+    ([MTP_ROLL_PROBE]); the 32-cycle accept window around the roll is logged
+    ([MTP_ROLL_ACCEPT]); the emitted stream is byte-identical to probe-off."""
+    import collections as _c
+
+    model, _ = off_stream
+    N = 60
+
+    def _one(probe):
+        st = _battle_state(model, sidecar, k=1)   # real draft: the cache really grows
+        st.cache_window, st.cache_slack = 8, 4
+        st.recent = _c.deque(maxlen=12)
+        st.roll_probe = probe
+        st.roll_acc_win = 3                   # test window 8 rolls every ~5 cycles
+        _attach(model, st)
+        try:
+            _, toks, _ = _run_bg(model, PROMPT, N)
+        finally:
+            _detach(model)
+        return st, toks
+
+    ref_state, ref_toks = _one(False)
+    st, toks = _one(True)
+    assert toks == ref_toks
+    assert any("mtp cache rolled" in l for l in st.logger.lines)
+    probe = [l for l in st.logger.lines if "[MTP_ROLL_PROBE]" in l]
+    assert probe and "tv=" in probe[0] and "top8=" in probe[0] and "argmax_eq=" in probe[0], \
+        st.logger.lines[-6:]
+    acc = [l for l in st.logger.lines if "[MTP_ROLL_ACCEPT]" in l]
+    assert acc and "pre" in acc[0] and "post" in acc[0], st.logger.lines[-6:]
+    del ref_state

@@ -30,10 +30,20 @@ MoE (256 routed + shared_experts + gate c e_score_correction_bias) +
 только в 5.2-конфиге — косметика двух прогонов конверта, рантайм-поведение
 presence-driven (наличие `<name>.scales`), side-load делаем так же.
 
-**Развилка индексера закрыта:** у MTP-слоя свой полный индексер → блок
-самодостаточен, top-k из главного прохода не пробрасываем;
-`index_share_for_mtp_iteration` в v1 игнорируем (семантика verify-итерации
-serving-движков). Vendor-тень `indexers_proj` в modules_to_not_convert —
+**Развилка индексера (исправлено по внешнему аудиту, 0060):** у MTP-слоя
+свой полный индексер → top-k *главного прохода* действительно не
+пробрасываем — эта половина v1 верна. Неверной была вторая:
+«`index_share_for_mtp_iteration` игнорируем (семантика verify-итерации
+serving-движков)». По опубликованной архитектуре 5.2 флаг описывает share
+МЕЖДУ MTP-итерациями: индексер работает на итерации 0, её topk и
+latent-KV (target-derived) переиспользуются итерациями 1..k-1 read-only,
+MTP-derived KV в кэш следующих итераций не пишется; так же голова и
+обучена (до 7 рекуррентных шагов, ablation вендора: +20% acceptance
+length). Текущая цепочка (каждая итерация пишет свой KV/topk и
+пересчитывает индексер) — mixed-mode GLM-5.1, OOD для share-обученной
+головы 5.2/5.3 — отсюда a2≈0.50–0.55. Подпись наблюдаема через
+`CHAIN_TRACE` (`[MTP_CHAIN]`); share-путь — 0062
+(`EXO_GLM52_MTP_ITER_SHARE`). Vendor-тень `indexers_proj` в modules_to_not_convert —
 опечатка, реальный тензор `indexer.weights_proj`.
 
 ## 2. Side-car политика (tools/glm52_mtp_extract_sidecar.py)
@@ -370,8 +380,10 @@ EXO_MODELS_DIRS="/Volumes/Models:/Volumes/Models2" .venv/bin/exo --fast-sync
 | `EXO_GLM52_MTP_PROF` | `0` | 0/1/2 | 1 — `[MTP_PROF]` build/resolve/post каждые 64 цикла; 2 — плюс `drain/draft_block/draft_head` (синхронно, −1–2 мс/цикл, только для измерений) |
 | `EXO_GLM52_MTP_CF` | `0` | 0/1 | телеметрия без изменения генерации: `cf_onehot/cf_fullq/cf_top2/cf_top4` и `cf_q0.7/0.85/1.2` (overlap при других температурах драфта) |
 | `EXO_GLM52_MTP_Q_TEMPERATURE` | как у target | число | своя температура драфта (корректность не зависит; на чате/доках выигрыша не дало) |
-| `EXO_GLM52_MTP_VERIFY_PAD` | `0` | 0–2 | измерение: n пустых строк в verify (цена sibling-строки: +12 мс) — не для работы |
+| `EXO_GLM52_MTP_VERIFY_PAD` | `0` | 0–7 | измерение: n пустых строк в verify — кривая C(L) до L=k+1+7 (цена sibling-строки на 49k: +12 мс) — не для работы |
 | `EXO_GLM52_MTP_MOE_SORT_MIN` | `64` | ≥1 | измерение: порог сортировки token-expert пар в verify (1 — на 1–1.5 мс хуже) — не для работы |
+| `EXO_GLM52_MTP_CHAIN_TRACE` | `0` | 0/1 | наблюдаемость: `[MTP_CHAIN]` — per-iteration офсеты latent/indexer кэшей MTP и digest'ы topk/qr (первые 8 циклов, потом каждый 64-й; добавляет evals — только для измерений; для чистых трасс `SPEC_DRAFT=0`). База A/B для 0062: под share итерации ≥1 обязаны давать `lat=X->X idx=X->X` и topk == iter0 |
+| `EXO_GLM52_MTP_ROLL_PROBE` | `0` | 0/1 | наблюдаемость: первый greedy-драфт после перекатки повторяется на retired-кэше — `[MTP_ROLL_PROBE] tv/argmax_eq/top8` + `[MTP_ROLL_ACCEPT]` (accept-окно roll_acc_win=32 циклов до/после). RNG-free, эмиссия байт-в-байт |
 | `EXO_GLM52_MTP_TRACE` | `0` | N | подробный трейс первых N циклов |
 | `EXO_GLM52_MTP_SPEC_DRAFT` | `0` | 0/1 | M1.5-lite; на MLX не окупается |
 | `EXO_GLM52_MTP_CONCAT` | `eh` | `eh` / `he` | порядок конкатенации в eh_proj (eh верен по vLLM) |

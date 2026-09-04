@@ -13,6 +13,13 @@ Env (default **off**, zero prod impact until enabled):
   EXO_GLM52_MTP_VALIDATE=0|1      canary: per-cycle cross-rank all_sum asserts
                                   on (m, offsets, buffer) + slot0/slot1 checks.
   EXO_GLM52_MTP_DRAFT_K=1         parsed and clamped; >1 is phase 4.
+  EXO_GLM52_MTP_CHAIN_TRACE=0|1   observability: per-cycle [MTP_CHAIN] line with
+                                  per-iteration latent/indexer cache offsets and
+                                  topk/query digests (adds evals; measurement only).
+  EXO_GLM52_MTP_ROLL_PROBE=0|1    observability: first greedy draft after a cache
+                                  roll is re-run on the retired cache; logs
+                                  TV/argmax/top8 ([MTP_ROLL_PROBE]) and the 32-cycle
+                                  accept window around the roll ([MTP_ROLL_ACCEPT]).
 
 Battle-step mapping onto the pinned ``GenerationBatch._step`` pipelining
 (entry: ``_next_tokens`` = pending token y; exit: emit y, set new pending):
@@ -56,6 +63,8 @@ _ENV_WEIGHTS = "EXO_GLM52_MTP_WEIGHTS"
 _ENV_CONCAT = "EXO_GLM52_MTP_CONCAT"
 _ENV_VALIDATE = "EXO_GLM52_MTP_VALIDATE"
 _ENV_DRAFT_K = "EXO_GLM52_MTP_DRAFT_K"
+_ENV_CHAIN_TRACE = "EXO_GLM52_MTP_CHAIN_TRACE"
+_ENV_ROLL_PROBE = "EXO_GLM52_MTP_ROLL_PROBE"
 _ENV_TRACE = "EXO_GLM52_MTP_TRACE"
 _ENV_PROF = "EXO_GLM52_MTP_PROF"
 _ENV_HIDDEN = "EXO_GLM52_MTP_HIDDEN"
@@ -258,7 +267,7 @@ class _MTPState:
         self.prof = prof
         self.draft_k = draft_k
         self.cycle_pack: tuple | None = None
-        self.acc_pos = [0, 0, 0]  # accepted at draft positions 1..3
+        self.acc_pos = [0] * 7  # accepted at draft positions 1..7 (conditional a_i)
         self.p_build = 0.0
         self.p_resolve = 0.0
         self.p_post = 0.0
@@ -289,6 +298,17 @@ class _MTPState:
         self.recent: collections.deque = collections.deque(maxlen=2048 + _CACHE_WINDOW_SLACK)
         self.rolls = 0
         self.retired: list[Any] = []         # caches swapped out mid-request; freed at finish
+        # observability (0060): all default-off, zero effect on the emitted stream
+        self.chain_trace = False             # [MTP_CHAIN] per-iteration offsets/digests
+        self.chain_iter: int | None = None   # draft-site tag: 0 = cycle draft, 1..k-1 = chain
+        self.chain_rows: list[tuple] = []    # tap rows: (iter, topk_sum|None, qr_sum)
+        self.chain_lat: list[tuple] = []     # loop rows: (iter, lat0, idx0, lat1, idx1)
+        self.roll_probe = False              # [MTP_ROLL_PROBE]/[MTP_ROLL_ACCEPT]
+        self.probe_pending = False
+        self.acc_ring: collections.deque = collections.deque(maxlen=32)
+        self.roll_acc_win = 32               # cycles of accept averaged around a roll (<=32)
+        self.roll_mark: int | None = None
+        self.roll_pre_acc: tuple[float, int] | None = None
         self.proposal = "sample"             # draft proposal under sampling: sample (measured +0.04) | argmax
         self.spec_draft = False              # M1.5-lite: measured net-zero/negative on MLX; opt-in
         self.verify_pad = 0                  # measurement only: extra dummy rows in the verify
@@ -351,7 +371,14 @@ class _MTPState:
         self.mtp_backlog = []
         self.flush_pack = None
         self.cycle_pack = None
-        self.acc_pos = [0, 0, 0]
+        self.acc_pos = [0] * 7
+        self.chain_rows = []
+        self.chain_lat = []
+        self.chain_iter = None
+        self.probe_pending = False
+        self.acc_ring.clear()
+        self.roll_mark = None
+        self.roll_pre_acc = None
         self.cycles = 0
         self.proposed = 0
         self.accepted = 0
@@ -403,35 +430,50 @@ class _MTPState:
         self.proposed += self.draft_k
         self.accepted += m
         self.out_tokens += m + 1
-        for i in range(min(m, 3)):
+        for i in range(min(m, len(self.acc_pos))):
             self.acc_pos[i] += 1
+        if self.roll_probe:
+            self.acc_ring.append(1 if m >= 1 else 0)
+            if self.roll_mark is not None and self.cycles - self.roll_mark >= self.roll_acc_win:
+                tail = list(self.acc_ring)[-self.roll_acc_win:]
+                post = sum(tail) / max(len(tail), 1)
+                pre, pn = self.roll_pre_acc or (float("nan"), 0)
+                self.logger.info(
+                    f"[MTP_ROLL_ACCEPT] uid={self.uid} roll_cycle={self.roll_mark} "
+                    f"pre{pn}={pre:.3f} post{len(tail)}={post:.3f}"
+                )
+                self.roll_mark = None
         if self.cycles % _LOG_EVERY == 0:
-            a1 = self.acc_pos[0] / max(self.cycles, 1)
-            a2 = self.acc_pos[1] / max(self.acc_pos[0], 1)
-            a3 = self.acc_pos[2] / max(self.acc_pos[1], 1)
             self.logger.info(
                 f"[MTP] uid={self.uid} cycles={self.cycles} k={self.draft_k} "
                 f"mode={'rs' if self.request_sampling else 'greedy'} "
                 f"{self._cf_str()}"
                 f"proposed={self.proposed} accepted={self.accepted} "
                 f"accept_rate={self.accepted / self.proposed:.3f} "
-                f"a1={a1:.3f} a2={a2:.3f} a3={a3:.3f} out={self.out_tokens} "
+                f"{self._acc_str()} out={self.out_tokens} "
                 f"eff_tokens_per_step={self.out_tokens / self.cycles:.3f}"
             )
+
+    def _acc_str(self) -> str:
+        """Conditional per-depth acceptance a1..a{k}: a_i = P(pos i accepted |
+        pos i-1 accepted); denominators chain cycles -> acc_pos[0] -> ..."""
+        depth = max(1, min(self.draft_k, len(self.acc_pos)))
+        base, out = self.cycles, []
+        for i in range(depth):
+            out.append(f"a{i + 1}={self.acc_pos[i] / max(base, 1):.3f}")
+            base = self.acc_pos[i]
+        return " ".join(out)
 
     def _summary(self, why: str) -> None:
         elapsed = max(time.perf_counter() - self.t0, 1e-9)
         if self.cycles:
-            a1 = self.acc_pos[0] / max(self.cycles, 1)
-            a2 = self.acc_pos[1] / max(self.acc_pos[0], 1)
-            a3 = self.acc_pos[2] / max(self.acc_pos[1], 1)
             self.logger.info(
                 f"[MTP_SUMMARY] ({why}) uid={self.uid} req_cycles={self.cycles} "
                 f"mode={'rs' if self.request_sampling else 'greedy'} proposal={self.proposal} "
                 f"{self._cf_str()}"
                 f"k={self.draft_k} proposed={self.proposed} accepted={self.accepted} "
                 f"accept_rate={self.accepted / max(self.proposed, 1):.3f} "
-                f"a1={a1:.3f} a2={a2:.3f} a3={a3:.3f} out={self.out_tokens} "
+                f"{self._acc_str()} out={self.out_tokens} "
                 f"eff_tokens_per_step={self.out_tokens / self.cycles:.3f} "
                 f"gen_tps={self.out_tokens / elapsed:.2f}"
             )
@@ -445,10 +487,16 @@ class _MTPState:
 
     # -- math ---------------------------------------------------------------
 
-    def draft_multi(self, pairs: list[tuple[mx.array, mx.array]]) -> mx.array:
+    def draft_multi(self, pairs: list[tuple[mx.array, mx.array]], cache: Any = None,
+                    probe: bool = False) -> Any:
         """MTP forward over (h, token) pairs; returns greedy draft for the
-        last position. Ingests every pair into the MTP cache (backlog+1)."""
+        last position. Ingests every pair into the MTP cache (backlog+1).
+        ``cache``/``probe`` are observability-only (roll probe): run against an
+        explicit cache object and return the raw head logits — no sampling,
+        no RNG draw, the live cache untouched."""
         from mlx_lm.models.base import create_attention_mask
+
+        cache = self.mtp_cache if cache is None else cache
 
         h_in = mx.concatenate([h for h, _ in pairs], axis=1)
         t_in = mx.concatenate([t.reshape(1, 1) for _, t in pairs], axis=1)
@@ -461,8 +509,8 @@ class _MTPState:
         x = self.mtp.eh_proj(x)
         mask = None
         if x.shape[1] > 1:
-            mask = create_attention_mask(x, self.mtp_cache[0], return_array=True)
-        y = self.mtp.block(x, mask=mask, cache=self.mtp_cache)
+            mask = create_attention_mask(x, cache[0], return_array=True)
+        y = self.mtp.block(x, mask=mask, cache=cache)
         # Hidden recycled into the next chained step: "post" = after
         # shared_head.norm (vLLM PR #47448, measured with a post-norm target
         # hidden); "pre" = the block's raw residual output (consistent with
@@ -470,6 +518,8 @@ class _MTPState:
         h_raw = y[:, -1:, :]
         h_post = self.mtp.head_norm(h_raw)
         logits = self.lm_head(h_post)[..., -1, :]                  # (1, V)
+        if probe:
+            return logits
         h_rec = h_post if self.recycle == "post" else h_raw
         if self.proposal == "sample" and self.request_sampling and self.policy is not None:
             # Full-q proposal: draft ~ q = the head's own distribution under the
@@ -934,6 +984,73 @@ def _apply_processors_rows(
     return mx.stack(rows, axis=1)
 
 
+def _chain_offs(state: _MTPState) -> tuple[int, int]:
+    """(latent, indexer) cache offsets of the MTP CacheList; host ints, no sync."""
+    c = state.mtp_cache
+    if c is None:
+        return -1, -1
+    return _cur(c.caches[0]), _cur(c.caches[1])
+
+
+def _chain_flush(state: _MTPState, k: int, trimmed: int) -> None:
+    """Emit the per-cycle [MTP_CHAIN] line (first 8 cycles, then every 64th).
+    Documents the current mixed-mode chain: under GLM-5.2/5.3 iteration
+    KVShare/IndexShare (0062) iterations >=1 must show lat=X->X idx=X->X and
+    a topk digest equal to iteration 0's."""
+    try:
+        if state.cycles < 8 or state.cycles % 64 == 0:
+            tap = {r[0]: r for r in state.chain_rows}
+            evs = [a for r in state.chain_rows for a in r[1:] if a is not None]
+            if evs:
+                mx.eval(*evs)
+            parts = []
+            for it, lat0, idx0, lat1, idx1 in state.chain_lat:
+                tk = qr = "?"
+                row = tap.get(it)
+                if row is not None:
+                    tk = "dense" if row[1] is None else str(int(row[1].item()))
+                    qr = f"{float(row[2].item()):.6g}"
+                parts.append(f"it={it} lat={lat0}->{lat1} idx={idx0}->{idx1} topk={tk} qr={qr}")
+            state.logger.info(
+                f"[MTP_CHAIN] uid={state.uid} c={state.cycles} k={k} "
+                + " | ".join(parts) + f" | trim={trimmed}"
+            )
+    finally:
+        state.chain_rows = []
+        state.chain_lat = []
+
+
+def _roll_probe(state: _MTPState, pairs: list, res: Any) -> None:
+    """First draft after a cache roll: re-run it on the retired (pre-roll)
+    cache and compare draft distributions (TV, argmax, top-8 overlap).
+    RNG-free; greedy requests only — the sampling path returns filtered zq,
+    not raw logits. The retired cache is mutated (probe ingest), which is
+    safe: it is never used again and in-flight graphs hold their own array
+    versions."""
+    state.probe_pending = False
+    if state.request_sampling or not state.retired:
+        _warn_once(state.logger, "rollprobe",
+                   "[MTP] roll probe skipped (sampling request or no retired cache)")
+        return
+    try:
+        old = state.draft_multi(pairs, cache=state.retired[-1], probe=True)
+        new = res[2]                                   # greedy path: raw head logits (1, V)
+        po = mx.softmax(old.astype(mx.float32), axis=-1)
+        pn = mx.softmax(new.astype(mx.float32), axis=-1)
+        tv = 0.5 * mx.sum(mx.abs(pn - po))
+        t8o = mx.argpartition(old, kth=-8, axis=-1)[..., -8:]
+        t8n = mx.argpartition(new, kth=-8, axis=-1)[..., -8:]
+        am_eq = mx.argmax(old, axis=-1) == mx.argmax(new, axis=-1)
+        mx.eval(tv, t8o, t8n, am_eq)
+        ov = len(set(t8o.reshape(-1).tolist()) & set(t8n.reshape(-1).tolist()))
+        state.logger.info(
+            f"[MTP_ROLL_PROBE] uid={state.uid} c={state.cycles} tv={float(tv.item()):.4f} "
+            f"argmax_eq={int(am_eq.reshape(-1)[0].item())} top8={ov}/8"
+        )
+    except Exception:
+        state.logger.opt(exception=True).warning("[MTP] roll probe failed; continuing")
+
+
 def _battle_step(state: _MTPState, prev_step: Any, batch: Any):
     from exo.worker.engines.mlx.patches.opt_batch_gen import (
         _advance_chain_arrays,
@@ -1013,9 +1130,19 @@ def _battle_step(state: _MTPState, prev_step: Any, batch: Any):
         state.spec_next = None
     else:
         state.spec_next = None
-        res = state.draft_multi(pairs)
+        if state.chain_trace:
+            _lat0, _idx0 = _chain_offs(state)
+            state.chain_iter = 0
+        try:
+            res = state.draft_multi(pairs)
+        finally:
+            state.chain_iter = None
+        if state.chain_trace:
+            state.chain_lat.append((0, _lat0, _idx0, *_chain_offs(state)))
         d1, h_mtp = res[0], res[1]
         zq1 = res[2] if len(res) > 2 else None
+        if state.probe_pending:
+            _roll_probe(state, pairs, res)
     zq_rows = [zq1]
     drafts = [d1]
     if state.prof_draft:
@@ -1033,12 +1160,25 @@ def _battle_step(state: _MTPState, prev_step: Any, batch: Any):
         state.p_draft_block += _td1 - _td0
         state.p_draft_head += _td2 - _td1
     chain_before = _cur(state.mtp_cache[0]) if state.mtp_cache is not None else 0
-    for _ in range(1, k):
+    for _it in range(1, k):
         # chained proposal: the MTP block's own post-norm output stands in
         # for the (not yet computed) main-model hidden of the previous draft.
-        # GLM-5 trains the head with 3 parameter-shared steps, so the chain
-        # is in-distribution up to k=3.
-        res = state.draft_multi([(h_mtp, drafts[-1])])
+        # NOTE (0060 audit): this chain is GLM-5.1 mixed-mode — every iteration
+        # writes its own latent-KV/indexer-K and recomputes topk. GLM-5.2/5.3
+        # train AND serve the head with iteration KVShare/IndexShare instead
+        # (reuse the first step's KV state + topk, later steps read-only, up
+        # to 7 recurrent steps), so depth>=2 here is out-of-distribution for
+        # the share-trained head. [MTP_CHAIN] documents it; the share path is
+        # 0062 (EXO_GLM52_MTP_ITER_SHARE).
+        if state.chain_trace:
+            _lat0, _idx0 = _chain_offs(state)
+            state.chain_iter = _it
+        try:
+            res = state.draft_multi([(h_mtp, drafts[-1])])
+        finally:
+            state.chain_iter = None
+        if state.chain_trace:
+            state.chain_lat.append((_it, _lat0, _idx0, *_chain_offs(state)))
         d_next, h_mtp = res[0], res[1]
         zq_rows.append(res[2] if len(res) > 2 else None)
         drafts.append(d_next)
@@ -1047,10 +1187,14 @@ def _battle_step(state: _MTPState, prev_step: Any, batch: Any):
     # hidden; drop them now (host-side bookkeeping only — the already-built
     # chain graph keeps its own array versions) so the speculative next-cycle
     # pairs land at the right positions.
+    _chain_trim = 0
     if k >= 2 and state.mtp_cache is not None:
         chain_entries = _cur(state.mtp_cache[0]) - chain_before
         for c in state.mtp_cache.caches:
             _trim_to_exact(c, _cur(c) - chain_entries)
+        _chain_trim = chain_entries
+    if state.chain_trace and state.chain_lat:
+        _chain_flush(state, k, _chain_trim)
     base_off = _cur(batch.prompt_cache[0][0]) if state.validate else None
     if state.validate:
         _validate_pre_verify(state, y, drafts)
@@ -1625,6 +1769,12 @@ def _roll_mtp_cache(state: _MTPState) -> None:
     pairs = list(state.recent)[-state.cache_window:]
     if _rebuild_mtp_cache(state, pairs, f"mtp cache rolled at cycle {state.cycles}"):
         state.rolls += 1
+        if state.roll_probe:
+            state.probe_pending = True
+            n = len(state.acc_ring)
+            state.roll_pre_acc = ((sum(state.acc_ring) / n) if n else float("nan"), n)
+            state.roll_mark = state.cycles
+            state.acc_ring.clear()
 
 
 def _drop_prompt_context(state: _MTPState) -> None:
@@ -1763,6 +1913,32 @@ def finalize_glm52_mtp_request(model: Any, uid: int | None, *, reason: str) -> N
         state.finish()
 
 
+def _install_chain_tap(state: _MTPState, logger: Any) -> bool:
+    """Class-swap the MTP block's DSA indexer so chain-tagged draft forwards
+    record (topk-sum, qr-sum) digests into ``state.chain_rows``. Only the
+    instance ``__class__`` changes: the instance dict, weights and module
+    tree stay byte-identical; untagged forwards (ingest/prefill/spec) pass
+    through untraced. Fail-soft: on any error CHAIN_TRACE stays off."""
+    try:
+        idx = state.mtp.block.self_attn.indexer
+        base = idx.__class__
+
+        def _traced_call(self, x, qr, mask, cache=None):
+            out = base.__call__(self, x, qr, mask, cache=cache)
+            st = getattr(self, "_mtp_chain_state", None)
+            if st is not None and st.chain_iter is not None:
+                tk = None if out is None else mx.sum(out.astype(mx.int64))
+                st.chain_rows.append((st.chain_iter, tk, mx.sum(qr.astype(mx.float32))))
+            return out
+
+        idx.__class__ = type("_ChainTracedIndexer", (base,), {"__call__": _traced_call})
+        object.__setattr__(idx, "_mtp_chain_state", state)
+        return True
+    except Exception:
+        logger.opt(exception=True).warning("[MTP] chain trace tap failed; CHAIN_TRACE disabled")
+        return False
+
+
 def apply_glm52_mtp_patch(
     model: Any,
     model_path: Path,
@@ -1841,7 +2017,9 @@ def apply_glm52_mtp_patch(
     proposal = _env_choice(_ENV_PROPOSAL, "sample", {"argmax", "sample"}, logger)
     cf = _env_int(_ENV_CF, 0, 0, 1, logger) == 1
     spec_draft = _env_int(_ENV_SPEC_DRAFT, 0, 0, 1, logger) == 1
-    verify_pad = _env_int(_ENV_VERIFY_PAD, 0, 0, 2, logger)
+    verify_pad = _env_int(_ENV_VERIFY_PAD, 0, 0, 7, logger)
+    chain_trace = _env_int(_ENV_CHAIN_TRACE, 0, 0, 1, logger) == 1
+    roll_probe = _env_int(_ENV_ROLL_PROBE, 0, 0, 1, logger) == 1
     moe_sort_min = _env_int(_ENV_MOE_SORT_MIN, 64, 1, 1 << 20, logger)
     cache_window = _env_int(_ENV_CACHE_WINDOW, 512, 0, 1 << 20, logger)
     if moe_sort_min != 64:
@@ -1909,6 +2087,8 @@ def apply_glm52_mtp_patch(
     state.cache_window = cache_window
     state.recent = collections.deque(maxlen=cache_window + _CACHE_WINDOW_SLACK) if cache_window > 0 else collections.deque(maxlen=1)
     state.q_temperature = q_temperature
+    state.roll_probe = roll_probe
+    state.chain_trace = chain_trace and _install_chain_tap(state, logger)
     state.group = grp
     if not _install_hooks(logger):
         return model
@@ -1918,6 +2098,7 @@ def apply_glm52_mtp_patch(
         f"prompt_prefill={int(prefill_enabled)} prefill_window={prefill_window} "
         f"prefill_cycles={prefill_cycles} proposal={proposal} cf={int(cf)} spec_draft={int(spec_draft)} "
         f"verify_pad={verify_pad} moe_sort_min={moe_sort_min} cache_window={cache_window} q_temp={q_temperature if q_temperature is not None else 'target'} "
+        f"chain_trace={int(state.chain_trace)} roll_probe={int(roll_probe)} "
         f"fast_attn={int(fast_attn)} concat={concat} "
         f"validate={int(validate)} mtp_indexer_rope_fixed={int(rope_fixed)} "
         f"weights={weights_path.name} layer_idx={layer_idx}"
